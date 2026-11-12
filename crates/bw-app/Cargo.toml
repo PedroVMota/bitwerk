@@ -1,0 +1,38 @@
+[package]
+name = "bw-app"
+description = "bitwerk desktop application"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "bitwerk"
+path = "src/main.rs"
+
+# Renders the app icon PNGs from code (`make icon`).
+[[bin]]
+name = "bw-icon"
+path = "src/bin/bw-icon.rs"
+
+[dependencies]
+bw-core.workspace = true
+bw-sim.workspace = true
+bw-render.workspace = true
+bw-io.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+wgpu.workspace = true
+muda.workspace = true
+rfd.workspace = true
+glam.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+crossbeam-channel.workspace = true
+# PNG encoding for `bw-icon` (already in the tree through eframe).
+image = { version = "0.25.10", default-features = false, features = ["png"] }

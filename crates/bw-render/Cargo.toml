@@ -1,0 +1,29 @@
+[package]
+name = "bw-render"
+description = "bitwerk wgpu canvas renderer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bw-core.workspace = true
+bw-io.workspace = true
+wgpu.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+rstar.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Same version wgpu uses internally; only for validating the WGSL in tests.
+naga = { version = "30.0.2", features = ["wgsl-in"] }
+pollster = "1.0.1"
+# PNG dump of the symbol smoke test (already in the tree through eframe).
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+bw-core.workspace = true
+bw-io.workspace = true
