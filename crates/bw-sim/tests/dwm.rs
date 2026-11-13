@@ -25,6 +25,19 @@ fn import(name: &str) -> Circuit {
     p.circuit
 }
 
+/// The fixture imported, or (`exported`) imported, exported as a `.dwm`
+/// again and that file imported: the round trip must keep the behaviour.
+fn load(name: &str, exported: bool) -> Circuit {
+    let c = import(name);
+    if !exported {
+        return c;
+    }
+    let project = bw_io::Project { name: name.into(), circuit: c };
+    let (bytes, _) = dwm::export_project(&project, name).unwrap();
+    let (p, _) = dwm::import_project(&bytes, name).unwrap();
+    p.circuit
+}
+
 fn sim(c: &Circuit) -> SimState {
     let mut s = SimState::new(Netlist::compile(c).unwrap(), c);
     s.reset().unwrap();
@@ -59,7 +72,16 @@ fn led(c: &Circuit, s: &SimState, id: ComponentId) -> u8 {
 
 #[test]
 fn xor_from_nand_gates() {
-    let c = import("xor-nand.dwm");
+    xor_from_nand_gates_in(false);
+}
+
+#[test]
+fn xor_from_nand_gates_after_export() {
+    xor_from_nand_gates_in(true);
+}
+
+fn xor_from_nand_gates_in(exported: bool) {
+    let c = load("xor-nand.dwm", exported);
     let ins = switches(&c, |p| (p.y, p.x));
     let outs = leds(&c, |p| (p.y, p.x));
     assert_eq!((ins.len(), outs.len()), (4, 2));
@@ -77,7 +99,16 @@ fn xor_from_nand_gates() {
 
 #[test]
 fn four_bit_equality_for_all_inputs() {
-    let c = import("equality-xor.dwm");
+    four_bit_equality_for_all_inputs_in(false);
+}
+
+#[test]
+fn four_bit_equality_for_all_inputs_after_export() {
+    four_bit_equality_for_all_inputs_in(true);
+}
+
+fn four_bit_equality_for_all_inputs_in(exported: bool) {
+    let c = load("equality-xor.dwm", exported);
     let ins = switches(&c, |p| (p.x, p.y));
     let out = leds(&c, |p| (p.x, p.y));
     assert_eq!((ins.len(), out.len()), (8, 1));
@@ -105,7 +136,16 @@ fn half_cycle(s: &mut SimState) {
 
 #[test]
 fn master_slave_jk_from_gates() {
-    let c = import("ms-jk.dwm");
+    master_slave_jk_from_gates_in(false);
+}
+
+#[test]
+fn master_slave_jk_from_gates_after_export() {
+    master_slave_jk_from_gates_in(true);
+}
+
+fn master_slave_jk_from_gates_in(exported: bool) {
+    let c = load("ms-jk.dwm", exported);
     let jk = switches(&c, |p| (p.y, p.x));
     let l = leds(&c, |p| (p.x, p.y));
     assert_eq!((jk.len(), l.len()), (2, 4), "J, K; master Q/Q̄, slave Q/Q̄");
@@ -196,7 +236,16 @@ fn shown(c: &Circuit, s: &SimState, displays: &[ComponentId]) -> u32 {
 
 #[test]
 fn counter_counts_on_the_seven_segment_displays() {
-    let c = import("counter.dwm");
+    counter_counts_on_the_seven_segment_displays_in(false);
+}
+
+#[test]
+fn counter_counts_on_the_seven_segment_displays_after_export() {
+    counter_counts_on_the_seven_segment_displays_in(true);
+}
+
+fn counter_counts_on_the_seven_segment_displays_in(exported: bool) {
+    let c = load("counter.dwm", exported);
     let displays = find(&c, |k| matches!(k, ComponentKind::SevenSeg { .. }), |p| (p.x, p.y));
     assert_eq!(displays.len(), 2);
     let mut s = sim(&c);
@@ -225,30 +274,34 @@ fn every_fixture_imports_and_settles() {
         "comparator.dwm",
         "clocked-d-latch.dwm",
     ] {
-        let c = import(name);
-        let mut s = SimState::new(Netlist::compile(&c).unwrap(), &c);
-        s.reset().unwrap_or_else(|e| panic!("{name}: {e}"));
-        for _ in 0..200 {
-            s.tick().unwrap_or_else(|e| panic!("{name}: {e}"));
+        for exported in [false, true] {
+            let c = load(name, exported);
+            let mut s = SimState::new(Netlist::compile(&c).unwrap(), &c);
+            s.reset().unwrap_or_else(|e| panic!("{name}: {e}"));
+            for _ in 0..200 {
+                s.tick().unwrap_or_else(|e| panic!("{name}: {e}"));
+            }
         }
     }
     // The bus contention sample: two tri-state drivers on a bus, each
     // enabled by a switch; enabling both halts with bus contention.
-    let c = import("bus-contention.dwm");
-    let sws = switches(&c, |p| (p.y, p.x));
-    let mut found = false;
-    for &a in &sws {
-        for &b in &sws {
-            let mut s = sim(&c);
-            let r = s.set_switch(a, true).and_then(|()| s.set_switch(b, true));
-            let r = r.and_then(|()| (0..40).try_for_each(|_| s.tick().map(|_| ())));
-            if matches!(r, Err(SimError::BusContention { .. })) {
-                found = true;
+    for exported in [false, true] {
+        let c = load("bus-contention.dwm", exported);
+        let sws = switches(&c, |p| (p.y, p.x));
+        let mut found = false;
+        for &a in &sws {
+            for &b in &sws {
+                let mut s = sim(&c);
+                let r = s.set_switch(a, true).and_then(|()| s.set_switch(b, true));
+                let r = r.and_then(|()| (0..40).try_for_each(|_| s.tick().map(|_| ())));
+                if matches!(r, Err(SimError::BusContention { .. })) {
+                    found = true;
+                }
             }
         }
+        eprintln!("bus contention switches: {}", sws.len());
+        assert!(found, "some switch setting makes the bus contention sample halt");
     }
-    eprintln!("bus contention switches: {}", sws.len());
-    assert!(found, "some switch setting makes the bus contention sample halt");
 }
 
 // ---------------------------------------------------------------- 74xx
@@ -264,8 +317,13 @@ struct Ic {
 }
 
 impl Ic {
-    fn new(name: &str) -> Self {
-        let (file, _) = dwm::import_macro(&fixture(name), name).unwrap();
+    fn new(name: &str, exported: bool) -> Self {
+        let (mut file, _) = dwm::import_macro(&fixture(name), name).unwrap();
+        if exported {
+            // As a Digital Works macro and back.
+            let (bytes, _) = dwm::export_macro(&file.table, file.root, name).unwrap();
+            file = dwm::import_macro(&bytes, name).unwrap().0;
+        }
         let mut c = Circuit::new();
         c.set_eval_mode(EvalMode::Sequential);
         let id = common::import(&mut c, &file.table, file.root);
@@ -307,7 +365,16 @@ impl Ic {
 
 #[test]
 fn ic_74hc00_quad_nand() {
-    let mut ic = Ic::new("74hc00.dwm");
+    ic_74hc00_quad_nand_in(false);
+}
+
+#[test]
+fn ic_74hc00_quad_nand_after_export() {
+    ic_74hc00_quad_nand_in(true);
+}
+
+fn ic_74hc00_quad_nand_in(exported: bool) {
+    let mut ic = Ic::new("74hc00.dwm", exported);
     let _ = &ic.c;
     for (a, b, y) in [(1, 2, 3), (4, 5, 6), (9, 10, 8), (12, 13, 11)] {
         for (va, vb) in [(false, false), (false, true), (true, false), (true, true)] {
@@ -320,7 +387,16 @@ fn ic_74hc00_quad_nand() {
 
 #[test]
 fn ic_74hc125_tristate_buffers() {
-    let mut ic = Ic::new("74hc125.dwm");
+    ic_74hc125_tristate_buffers_in(false);
+}
+
+#[test]
+fn ic_74hc125_tristate_buffers_after_export() {
+    ic_74hc125_tristate_buffers_in(true);
+}
+
+fn ic_74hc125_tristate_buffers_in(exported: bool) {
+    let mut ic = Ic::new("74hc125.dwm", exported);
     for (oe, a, y) in [(1, 2, 3), (4, 5, 6), (10, 9, 8), (13, 12, 11)] {
         ic.set(oe, true);
         assert_eq!(ic.get(y), 2, "disabled output floats");
@@ -335,7 +411,16 @@ fn ic_74hc125_tristate_buffers() {
 
 #[test]
 fn ic_74hc74_dual_d_flip_flop() {
-    let mut ic = Ic::new("74hc74.dwm");
+    ic_74hc74_dual_d_flip_flop_in(false);
+}
+
+#[test]
+fn ic_74hc74_dual_d_flip_flop_after_export() {
+    ic_74hc74_dual_d_flip_flop_in(true);
+}
+
+fn ic_74hc74_dual_d_flip_flop_in(exported: bool) {
+    let mut ic = Ic::new("74hc74.dwm", exported);
     // (CLR̄, D, CP, PR̄, Q, Q̄)
     for (clr, d, cp, pr, q, qn) in [(1, 2, 3, 4, 5, 6), (13, 12, 11, 10, 9, 8)] {
         ic.set(clr, true);
@@ -359,7 +444,16 @@ fn ic_74hc74_dual_d_flip_flop() {
 
 #[test]
 fn ic_74hc76_dual_jk_flip_flop() {
-    let mut ic = Ic::new("74hc76.dwm");
+    ic_74hc76_dual_jk_flip_flop_in(false);
+}
+
+#[test]
+fn ic_74hc76_dual_jk_flip_flop_after_export() {
+    ic_74hc76_dual_jk_flip_flop_in(true);
+}
+
+fn ic_74hc76_dual_jk_flip_flop_in(exported: bool) {
+    let mut ic = Ic::new("74hc76.dwm", exported);
     // (CP̄, SD̄, RD̄, J, K, Q, Q̄)
     for (cp, sd, rd, j, k, q, qn) in [(1, 2, 3, 4, 16, 15, 14), (6, 7, 8, 9, 12, 11, 10)] {
         ic.set(sd, true);
