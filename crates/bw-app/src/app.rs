@@ -60,8 +60,8 @@ pub struct BitwerkApp {
     pub circuit: Arc<Circuit>,
     pub revision: u64,
     pub(crate) path: Option<PathBuf>,
-    name: String,
-    dirty: bool,
+    pub(crate) name: String,
+    pub(crate) dirty: bool,
 
     // Engines / workers
     pub sim: SimHandle,
@@ -124,6 +124,8 @@ pub struct BitwerkApp {
     pub(crate) egui_ctx: egui::Context,
     /// Digital Works import (report window, workers).
     pub dw: crate::dwimport::DwState,
+    /// Digital Works export (Save As… `.dwm`, macro export) state.
+    pub dw_export: crate::dwexport::DwExportState,
     /// Drafts of free-text properties (notes, sequence patterns).
     pub prop_drafts: crate::kind_props::Drafts,
     /// Push button / pulse input held down with the Interact tool.
@@ -206,6 +208,7 @@ impl BitwerkApp {
             fit_pending: false,
             egui_ctx: cc.egui_ctx.clone(),
             dw: crate::dwimport::DwState::default(),
+            dw_export: crate::dwexport::DwExportState::default(),
             prop_drafts: crate::kind_props::Drafts::default(),
             pressed: None,
             frame_times: VecDeque::with_capacity(120),
@@ -258,6 +261,11 @@ impl BitwerkApp {
             std::path::Path::new(a).extension().is_some_and(|e| e == PROJECT_EXT || e.eq_ignore_ascii_case("dwm"))
         }) {
             app.open_path(PathBuf::from(path));
+        }
+        // `--save-as-dwm OUT`: export the opened circuit as a Digital Works
+        // file and show the Export report (automation, screenshots).
+        if let Some(out) = args.iter().position(|a| a == "--save-as-dwm").and_then(|i| args.get(i + 1)) {
+            app.export_dw_path(std::path::Path::new(out));
         }
         // `--import-dw-folder DIR`: converts the Digital Works macros below
         // DIR into the user library (Parts Centre, with progress).
@@ -457,6 +465,7 @@ impl BitwerkApp {
             MenuAction::StressMacros => self.spawn_stress_macros(ctx),
             MenuAction::ImportDw => self.guarded(Pending::ImportDw(None)),
             MenuAction::ImportDwFolder => self.import_dw_folder_dialog(),
+            MenuAction::ExportDw => self.export_dw_dialog(),
             MenuAction::EvalMode(mode) => self.set_eval_mode(mode),
         }
     }
@@ -549,6 +558,10 @@ impl BitwerkApp {
         }
     }
 
+    /// Save (to the document's file, else as Save As…) or Save As…,
+    /// which also offers the Digital Works format: choosing `.dwm` exports
+    /// a lossy copy and leaves the document (its file, its unsaved state)
+    /// as it was.
     fn save(&mut self, save_as: bool) {
         let path = if let (Some(p), false) = (&self.path, save_as) {
             p.clone()
@@ -556,11 +569,16 @@ impl BitwerkApp {
             let Some(mut p) = rfd::FileDialog::new()
                 .set_title("Save circuit")
                 .add_filter("bitwerk project", &[PROJECT_EXT])
+                .add_filter("Digital Works 3.0.5 (.dwm, lossy export)", &[crate::dwexport::DWM_EXT])
                 .set_file_name(format!("{}.{PROJECT_EXT}", self.name))
                 .save_file()
             else {
                 return;
             };
+            if crate::dwexport::is_dwm(&p) {
+                self.export_dw_path(&p);
+                return;
+            }
             if p.extension().is_none_or(|e| e != PROJECT_EXT) {
                 p.set_extension(PROJECT_EXT);
             }
@@ -749,6 +767,9 @@ impl BitwerkApp {
                 }
                 if ui.button("Save").clicked() {
                     self.save(false);
+                }
+                if ui.button("Save As…").clicked() {
+                    self.save(true);
                 }
                 if ui.button("Import Digital Works…").clicked() {
                     self.guarded(Pending::ImportDw(None));
@@ -1545,6 +1566,7 @@ impl eframe::App for BitwerkApp {
         }
         self.poll_workers();
         self.poll_dw();
+        self.poll_dw_export();
         // Repaint on demand: input, simulator snapshots and finished workers
         // request repaints themselves; only keep going while the scene is
         // still streaming to the GPU (or when measuring).
@@ -1592,6 +1614,7 @@ impl eframe::App for BitwerkApp {
         });
         crate::memwin::show(self, &ctx);
         crate::dwimport::show_report(self, &ctx);
+        crate::dwexport::show_report(self, &ctx);
         self.handle_dropped_files(&ctx);
         crate::dwimport::drop_hint(&ctx);
         self.confirm_dialog(&ctx);

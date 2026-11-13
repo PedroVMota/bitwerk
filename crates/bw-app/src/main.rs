@@ -13,12 +13,16 @@
 //! Command line: `bitwerk [file.bitwerk | file.dwm]` opens / imports a file
 //! (a `.dwm` import shows the Import report; `--no-report` hides it);
 //! `--import-dw-folder DIR` imports a folder of Digital Works macros into
-//! the user library; see `app.rs` for the other options.
+//! the user library; `bitwerk FILE --export-dwm OUT` exports FILE as a
+//! Digital Works circuit without opening a window (prints the report);
+//! `--save-as-dwm OUT` does the same in the app and shows the Export
+//! report; see `app.rs` for the other options.
 
 #![forbid(unsafe_code)]
 
 mod app;
 mod canvas;
+mod dwexport;
 mod dwimport;
 mod hier;
 mod icons;
@@ -35,6 +39,16 @@ mod sweep;
 const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/AppIcon-256.png");
 
 fn main() -> eframe::Result {
+    // `bitwerk FILE --export-dwm OUT`: headless Digital Works export.
+    if let Some(out) = arg_value("--export-dwm") {
+        let input = std::env::args().skip(1).find(|a| {
+            std::path::Path::new(a)
+                .extension()
+                .is_some_and(|e| e == app::PROJECT_EXT || e.eq_ignore_ascii_case(dwexport::DWM_EXT))
+                && *a != out
+        });
+        std::process::exit(dwexport::cli(input.as_deref(), &out));
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

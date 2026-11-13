@@ -256,6 +256,13 @@ pub fn editor(app: &mut BitwerkApp, ui: &mut egui::Ui, id: MacroId) {
         if ui.button("Export .bwmacro…").clicked() {
             app.export_macro(id);
         }
+        if ui
+            .button("Export as Digital Works macro…")
+            .on_hover_text("A Digital Works 3.0.5 .dwm macro (lossy, see the export report)")
+            .clicked()
+        {
+            app.export_dw_macro(id);
+        }
         if ui.button("Add to my parts").clicked() {
             app.add_to_library(id);
         }

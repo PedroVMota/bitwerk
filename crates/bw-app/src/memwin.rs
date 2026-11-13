@@ -11,7 +11,8 @@
 //!   cancels.
 //! * Clear (with confirmation), Load and Save of `.map` files
 //!   ([`bw_io::memmap`]; Load also reads Digital Works binary maps, detected
-//!   by their magic number, and says which format it loaded). A larger map is truncated, a smaller one
+//!   by their magic number, and says which format it loaded; Save offers
+//!   the bitwerk text map and the Digital Works binary map). A larger map is truncated, a smaller one
 //!   zero-filled, wider words are masked to the data width.
 
 use std::sync::Arc;
@@ -139,9 +140,20 @@ pub fn show(app: &mut BitwerkApp, ctx: &egui::Context) {
                         Err(e) => win.message = e,
                     }
                 }
-                if ui.button("Save…").on_hover_text("Save as a memory map (.map)").clicked() {
-                    win.message = save_map(&words, data_bits, label);
-                }
+                ui.menu_button("Save…", |ui| {
+                    if ui.button("bitwerk map (text)…").on_hover_text("Readable hex text, any width").clicked() {
+                        win.message = save_map(&words, data_bits, label, MapFormat::Bitwerk);
+                        ui.close();
+                    }
+                    if ui
+                        .button("Digital Works map (binary)…")
+                        .on_hover_text("The binary .map Digital Works 3.0.5 loads (16-bit words)")
+                        .clicked()
+                    {
+                        win.message = save_map(&words, data_bits, label, MapFormat::DigitalWorks);
+                        ui.close();
+                    }
+                });
                 ui.separator();
                 ui.selectable_value(&mut win.hex, true, "Hex");
                 ui.selectable_value(&mut win.hex, false, "Binary");
@@ -333,10 +345,23 @@ fn read_map_file(path: &std::path::Path) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-fn save_map(words: &[u16], data_bits: u8, label: &str) -> String {
+/// File format of a saved memory map (both use the `.map` extension).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MapFormat {
+    /// bitwerk text map.
+    Bitwerk,
+    /// Digital Works binary map.
+    DigitalWorks,
+}
+
+fn save_map(words: &[u16], data_bits: u8, label: &str, format: MapFormat) -> String {
+    let (title, filter) = match format {
+        MapFormat::Bitwerk => ("Save memory map (bitwerk text)", "bitwerk memory map"),
+        MapFormat::DigitalWorks => ("Save memory map (Digital Works binary)", "Digital Works memory map"),
+    };
     let Some(mut path) = rfd::FileDialog::new()
-        .set_title("Save memory map")
-        .add_filter("Memory map", &[MAP_EXT])
+        .set_title(title)
+        .add_filter(filter, &[MAP_EXT])
         .set_file_name(format!("{}.{MAP_EXT}", label.to_ascii_lowercase()))
         .save_file()
     else {
@@ -345,14 +370,19 @@ fn save_map(words: &[u16], data_bits: u8, label: &str) -> String {
     if path.extension().is_none_or(|e| e != MAP_EXT) {
         path.set_extension(MAP_EXT);
     }
-    save_map_to(&path, words, data_bits)
+    save_map_to(&path, words, data_bits, format)
 }
 
-fn save_map_to(path: &std::path::Path, words: &[u16], data_bits: u8) -> String {
+fn save_map_to(path: &std::path::Path, words: &[u16], data_bits: u8, format: MapFormat) -> String {
     let map = MemoryMap { data_bits, words: words.to_vec() };
-    match memmap::save_path(&map, path) {
-        Ok(()) => format!("Saved {}", path.display()),
-        Err(e) => format!("Could not save: {e}"),
+    let r = match format {
+        MapFormat::Bitwerk => memmap::save_path(&map, path),
+        MapFormat::DigitalWorks => memmap::save_dw_path(&map, path),
+    };
+    match (r, format) {
+        (Ok(()), MapFormat::Bitwerk) => format!("Saved {}", path.display()),
+        (Ok(()), MapFormat::DigitalWorks) => format!("Saved {} (Digital Works binary map)", path.display()),
+        (Err(e), _) => format!("Could not save: {e}"),
     }
 }
 

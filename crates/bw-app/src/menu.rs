@@ -31,6 +31,8 @@ pub enum MenuAction {
     ImportDw,
     /// File → Import Digital Works Folder to Library…
     ImportDwFolder,
+    /// File → Export as Digital Works… (`.dwm`).
+    ExportDw,
     /// Circuit → simulation mode.
     EvalMode(EvalMode),
 }
@@ -58,6 +60,7 @@ const ITEMS: &[(&str, MenuAction)] = &[
     ("debug.stress_macros", MenuAction::StressMacros),
     ("file.import_dw", MenuAction::ImportDw),
     ("file.import_dw_folder", MenuAction::ImportDwFolder),
+    ("file.export_dw", MenuAction::ExportDw),
     ("circuit.unit_delay", MenuAction::EvalMode(EvalMode::UnitDelay)),
     ("circuit.sequential", MenuAction::EvalMode(EvalMode::Sequential)),
 ];
@@ -154,6 +157,7 @@ fn build(ctx: &egui::Context) -> Result<NativeMenu, muda::Error> {
             &PredefinedMenuItem::separator(),
             &item("file.import_dw", "Import Digital Works…", Some("CmdOrCtrl+I")),
             &item("file.import_dw_folder", "Import Digital Works Folder to Library…", None),
+            &item("file.export_dw", "Export as Digital Works 3.0.5 (.dwm)…", None),
         ],
     )?;
     let unit = CheckMenuItem::with_id("circuit.unit_delay", "Unit Delay Simulation", true, true, None);
