@@ -145,3 +145,72 @@ pub fn button(
     }
     resp.on_hover_text(tooltip)
 }
+
+type MacroMeshCache = HashMap<(u64, bw_core::MacroShape), Arc<Vec<symbols::SymVertex>>>;
+
+thread_local! {
+    /// Tessellated macro symbols for previews, by (definition hash, shape).
+    static MACRO_MESHES: RefCell<MacroMeshCache> =
+        RefCell::new(HashMap::new());
+}
+
+/// The tessellated symbol of a macro definition (cached).
+pub fn macro_mesh(def: &bw_core::MacroDef, shape: &bw_core::MacroShape, hash: u64) -> Arc<Vec<symbols::SymVertex>> {
+    MACRO_MESHES.with_borrow_mut(|cache| {
+        if cache.len() > 256 {
+            cache.clear();
+        }
+        Arc::clone(
+            cache.entry((hash, *shape)).or_insert_with(|| Arc::new(symbols::macro_symbol(def, shape).tessellate())),
+        )
+    })
+}
+
+/// Paints a macro symbol fitted into `rect` (previews, placement ghost).
+pub fn paint_macro_fit(
+    painter: &egui::Painter,
+    rect: Rect,
+    verts: &[symbols::SymVertex],
+    size: [f32; 2],
+    opacity: f32,
+) {
+    let inner = rect.shrink(6.0);
+    let scale = (inner.width() / size[0].max(1.0)).min(inner.height() / size[1].max(1.0)).min(28.0);
+    let origin = rect.center() - egui::vec2(size[0], size[1]) * scale * 0.5;
+    paint_vertices(painter, verts, scale, opacity, |p| origin + egui::vec2(p[0], p[1]) * scale);
+}
+
+/// Paints symbol vertices with a local→screen mapping (`scale` points per
+/// grid unit), macro accent colours, neutral state.
+pub fn paint_vertices(
+    painter: &egui::Painter,
+    verts: &[symbols::SymVertex],
+    scale: f32,
+    opacity: f32,
+    to_screen: impl Fn([f32; 2]) -> Pos2,
+) {
+    let accent = SymbolKind::Macro.accent();
+    let level = 2;
+    let hw = |w: Width| w.half_width(scale);
+    let mut out = egui::Mesh::default();
+    out.vertices.reserve(verts.len());
+    for tri in verts.chunks_exact(3) {
+        if !tri[0].layer().shows(level) {
+            continue;
+        }
+        let [r, g, b] = symbols::shade(tri[0].role(), accent, level).map(byte);
+        let color = Color32::from_rgba_unmultiplied(r, g, b, byte(opacity));
+        for v in tri {
+            let idx = u32::try_from(out.vertices.len()).unwrap_or(u32::MAX);
+            out.vertices.push(egui::epaint::Vertex {
+                pos: to_screen(v.at(hw(v.width()))),
+                uv: egui::epaint::WHITE_UV,
+                color,
+            });
+            out.indices.push(idx);
+        }
+    }
+    if !out.is_empty() {
+        painter.add(egui::Shape::mesh(out));
+    }
+}

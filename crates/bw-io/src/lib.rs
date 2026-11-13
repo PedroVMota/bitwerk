@@ -20,6 +20,12 @@
 //!   junctions / bends) and orthogonal `segments` between them, instead of
 //!   point-to-point `wires`. Version 1 and 2 wires become an orthogonal path
 //!   between their two pins.
+//! * **4** — macros: a `macros` table of definitions (`id`, `name`, `pins`,
+//!   `package`, `datasheet`, optional `doc_link` / `origin`, content `hash`
+//!   and `body`, itself a circuit), macro tags (`Tag(dir: In, tristate:
+//!   false)`) and instances (`Macro((3))`, a reference by definition id).
+//!   Version 3 files load unchanged (no macros). See also [`bwmacro`] for
+//!   single-macro files.
 //!
 //! Loading treats every file as hostile input: the size is capped *before*
 //! reading, RON nesting depth is bounded, object counts are bounded, and the
@@ -28,21 +34,29 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bwmacro;
+pub mod datasheet;
 pub mod dwm;
+pub mod library;
 pub mod memmap;
 
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
-use bw_core::{Circuit, CircuitRaw, Component, GridPos, MemoryRecord, PinDir, PinRef};
+use std::sync::Arc;
+
+use bw_core::{
+    Circuit, CircuitRaw, Component, ComponentKind, GridPos, LibraryRef, MacroDef, MacroId, MacroPin, MacroTable,
+    MemoryRecord, Package, PinDir, PinRef,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Magic string identifying a bitwerk project.
 pub const FORMAT_MAGIC: &str = "bitwerk";
 /// Current (and highest understood) format version.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 /// Oldest version that can still be loaded (and is migrated).
 pub const OLDEST_VERSION: u32 = 1;
 /// Maximum accepted file size in bytes.
@@ -57,9 +71,13 @@ pub const MAX_WIRE_NODES: usize = 4_000_000;
 pub const MAX_JUNCTIONS: usize = 1_000_000;
 /// Maximum number of point-to-point wires in a version 1 or 2 file.
 pub const MAX_LEGACY_WIRES: usize = 2_000_000;
-/// Maximum macro nesting depth (macros are not implemented yet; the limit is
-/// part of the format contract so future versions must honour it).
-pub const MAX_MACRO_DEPTH: usize = 16;
+/// Maximum macro nesting depth (see [`bw_core::MAX_MACRO_DEPTH`]).
+pub const MAX_MACRO_DEPTH: usize = bw_core::MAX_MACRO_DEPTH as usize;
+/// Maximum macro definitions in one file.
+pub const MAX_MACROS: usize = bw_core::MAX_MACRO_DEFS;
+/// Maximum size of the design with every macro expanded (refuses "macro
+/// bombs", see [`bw_core::MAX_FLAT_COMPONENTS`]).
+pub const MAX_FLAT_COMPONENTS: u64 = bw_core::MAX_FLAT_COMPONENTS;
 /// Maximum project name length in bytes.
 pub const MAX_NAME_LEN: usize = 256;
 /// Maximum number of memory devices in one project (each holds at most
@@ -106,7 +124,151 @@ struct FileOut<'a> {
     format: &'a str,
     version: u32,
     name: &'a str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    macros: Vec<MacroRecordOut<'a>>,
     circuit: &'a Circuit,
+}
+
+/// On-disk macro definition (format 4, `.bwmacro`).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MacroRecordIn {
+    id: MacroId,
+    name: String,
+    #[serde(default)]
+    pins: Vec<MacroPin>,
+    #[serde(default)]
+    package: Package,
+    #[serde(default)]
+    datasheet: String,
+    #[serde(default)]
+    doc_link: Option<String>,
+    #[serde(default)]
+    origin: Option<LibraryRef>,
+    /// Informative: recomputed on load.
+    #[serde(default)]
+    #[allow(dead_code)]
+    hash: u64,
+    body: CircuitRaw,
+}
+
+#[derive(Serialize)]
+pub(crate) struct MacroRecordOut<'a> {
+    id: MacroId,
+    name: &'a str,
+    pins: &'a [MacroPin],
+    #[serde(skip_serializing_if = "is_auto")]
+    package: Package,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    datasheet: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    doc_link: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: &'a Option<LibraryRef>,
+    hash: u64,
+    body: &'a Circuit,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref, reason = "serde skip predicate signature")]
+fn is_auto(p: &Package) -> bool {
+    *p == Package::Auto
+}
+
+/// Records of the given definitions of a table (in the order given).
+pub(crate) fn macro_records<'a>(t: &'a MacroTable, ids: &[MacroId]) -> Vec<MacroRecordOut<'a>> {
+    ids.iter()
+        .filter_map(|&id| {
+            let e = t.get(id)?;
+            let d = &e.def;
+            Some(MacroRecordOut {
+                id,
+                name: &d.name,
+                pins: &d.pins,
+                package: d.package,
+                datasheet: &d.datasheet,
+                doc_link: &d.doc_link,
+                origin: &d.origin,
+                hash: e.hash,
+                body: &d.body,
+            })
+        })
+        .collect()
+}
+
+/// Builds a definitions table from file records: each definition after the
+/// ones it uses; cycles, unknown references, depth and size limits refused.
+pub(crate) fn build_table(records: Vec<MacroRecordIn>) -> Result<MacroTable, IoError> {
+    if records.len() > MAX_MACROS {
+        return Err(IoError::LimitExceeded { what: "macro definitions", limit: MAX_MACROS });
+    }
+    let mut components = 0usize;
+    let mut pending: std::collections::BTreeMap<MacroId, MacroRecordIn> = std::collections::BTreeMap::new();
+    for r in records {
+        components += r.body.components.len();
+        if components > MAX_COMPONENTS {
+            return Err(IoError::LimitExceeded { what: "components", limit: MAX_COMPONENTS });
+        }
+        let id = r.id;
+        if pending.insert(id, r).is_some() {
+            return Err(IoError::Parse(format!("duplicate macro id {}", id.0)));
+        }
+    }
+    let uses = |r: &MacroRecordIn| -> Vec<MacroId> {
+        r.body
+            .components
+            .iter()
+            .filter_map(|c| match c.kind {
+                ComponentKind::Macro(s) => Some(s.def),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut table = MacroTable::default();
+    while !pending.is_empty() {
+        let ready: Vec<MacroId> = pending
+            .iter()
+            .filter(|(_, r)| uses(r).iter().all(|d| table.get(*d).is_some() || !pending.contains_key(d)))
+            .map(|(&id, _)| id)
+            .collect();
+        if ready.is_empty() {
+            let id = pending.keys().next().map_or(0, |m| m.0);
+            return Err(IoError::Parse(format!("macro {id} contains itself (definition cycle)")));
+        }
+        for id in ready {
+            let Some(r) = pending.remove(&id) else { continue };
+            let bad = |e: bw_core::CircuitError| IoError::Parse(format!("macro {} ({:?}): {e}", id.0, r.name));
+            check_raw_limits(&r.body)?;
+            let body =
+                Circuit::from_raw(r.body, &table, true).map_err(|e| IoError::Parse(format!("macro {}: {e}", id.0)))?;
+            let def = MacroDef {
+                name: r.name.clone(),
+                body,
+                pins: r.pins,
+                package: r.package,
+                datasheet: r.datasheet,
+                doc_link: r.doc_link,
+                origin: r.origin,
+            };
+            table.add(id, Arc::new(def)).map_err(bad)?;
+        }
+    }
+    Ok(table)
+}
+
+fn check_raw_limits(raw: &CircuitRaw) -> Result<(), IoError> {
+    if raw.components.len() > MAX_COMPONENTS {
+        return Err(IoError::LimitExceeded { what: "components", limit: MAX_COMPONENTS });
+    }
+    if raw.segments.len() > MAX_SEGMENTS {
+        return Err(IoError::LimitExceeded { what: "wire segments", limit: MAX_SEGMENTS });
+    }
+    if raw.nodes.len() > MAX_WIRE_NODES {
+        return Err(IoError::LimitExceeded { what: "wire nodes", limit: MAX_WIRE_NODES });
+    }
+    if raw.memories.len() > MAX_MEMORIES {
+        return Err(IoError::LimitExceeded { what: "memories", limit: MAX_MEMORIES });
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -124,6 +286,8 @@ struct FileIn<C> {
     version: u32,
     #[serde(default)]
     name: String,
+    #[serde(default)]
+    macros: Vec<MacroRecordIn>,
     circuit: C,
 }
 
@@ -175,15 +339,36 @@ pub fn load_from_bytes(bytes: &[u8]) -> Result<Project, IoError> {
     }
     // Pass 2: full, strict parse (validates the circuit).
     let project = if header.version >= 3 {
-        let file: FileIn<Circuit> = opts.from_bytes(bytes).map_err(|e| IoError::Parse(e.to_string()))?;
-        Project { name: file.name, circuit: file.circuit }
+        let file: FileIn<CircuitRaw> = opts.from_bytes(bytes).map_err(|e| IoError::Parse(e.to_string()))?;
+        if header.version < 4 {
+            let feature = if file.macros.is_empty() { macro_feature(&file.circuit) } else { Some("macros") };
+            if let Some(feature) = feature {
+                return Err(IoError::FeatureNotInVersion { version: header.version, feature });
+            }
+        }
+        check_raw_limits(&file.circuit)?;
+        let table = build_table(file.macros)?;
+        let circuit = Circuit::from_raw(file.circuit, &table, false).map_err(|e| IoError::Parse(e.to_string()))?;
+        Project { name: file.name, circuit }
     } else {
         let file: FileIn<LegacyCircuit> = opts.from_bytes(bytes).map_err(|e| IoError::Parse(e.to_string()))?;
+        if !file.macros.is_empty() {
+            return Err(IoError::FeatureNotInVersion { version: header.version, feature: "macros" });
+        }
         let circuit = upgrade_wires(header.version, file.circuit)?;
         migrate(header.version, Project { name: file.name, circuit })?
     };
     check_limits(&project.circuit, &project.name)?;
     Ok(project)
+}
+
+/// Format 4 component kinds used by a circuit (macro tags or instances).
+fn macro_feature(c: &CircuitRaw) -> Option<&'static str> {
+    c.components.iter().find_map(|k| match k.kind {
+        ComponentKind::Tag { .. } => Some("macro tags"),
+        ComponentKind::Macro(_) => Some("macros"),
+        _ => None,
+    })
 }
 
 /// Version 1 / 2 → 3: every point-to-point wire becomes an orthogonal path
@@ -229,21 +414,23 @@ fn upgrade_wires(version: u32, legacy: LegacyCircuit) -> Result<Circuit, IoError
 /// which logic sees as X).
 ///
 /// Version 2 → 3 (wires to a wire graph) happens while parsing, see
-/// `upgrade_wires`. Saving writes version 3.
+/// `upgrade_wires`. Version 3 → 4 adds macros and needs no change (a
+/// version 3 file using format 4 kinds is refused). Saving writes
+/// version 4.
 ///
 /// # Errors
 /// [`IoError::FeatureNotInVersion`] for a version 1 file with version 2 content.
 pub fn migrate(version: u32, project: Project) -> Result<Project, IoError> {
-    if version < 2 {
-        for c in project.circuit.components() {
-            let feature = match c.kind {
-                bw_core::ComponentKind::TriState => "tri-state buffers",
-                bw_core::ComponentKind::FlipFlop { .. } => "flip-flops",
-                bw_core::ComponentKind::Memory { .. } => "memories",
-                _ => continue,
-            };
-            return Err(IoError::FeatureNotInVersion { version, feature });
-        }
+    for c in project.circuit.components() {
+        let feature = match c.kind {
+            ComponentKind::TriState if version < 2 => "tri-state buffers",
+            ComponentKind::FlipFlop { .. } if version < 2 => "flip-flops",
+            ComponentKind::Memory { .. } if version < 2 => "memories",
+            ComponentKind::Tag { .. } if version < 4 => "macro tags",
+            ComponentKind::Macro(_) if version < 4 => "macros",
+            _ => continue,
+        };
+        return Err(IoError::FeatureNotInVersion { version, feature });
     }
     Ok(project)
 }
@@ -268,6 +455,15 @@ fn check_limits(c: &Circuit, name: &str) -> Result<(), IoError> {
     if name.len() > MAX_NAME_LEN {
         return Err(IoError::LimitExceeded { what: "name bytes", limit: MAX_NAME_LEN });
     }
+    if c.macros().len() > MAX_MACROS {
+        return Err(IoError::LimitExceeded { what: "macro definitions", limit: MAX_MACROS });
+    }
+    if c.flat_size() > MAX_FLAT_COMPONENTS {
+        return Err(IoError::LimitExceeded {
+            what: "components when flattened",
+            limit: usize::try_from(MAX_FLAT_COMPONENTS).unwrap_or(usize::MAX),
+        });
+    }
     Ok(())
 }
 
@@ -277,6 +473,19 @@ fn check_limits(c: &Circuit, name: &str) -> Result<(), IoError> {
 /// # Errors
 /// I/O errors and everything [`load_from_bytes`] rejects.
 pub fn load_from_path(path: &Path) -> Result<Project, IoError> {
+    let buf = read_capped(path)?;
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("dwm")) {
+        return dwm::load(&buf);
+    }
+    load_from_bytes(&buf)
+}
+
+/// Reads a regular file of at most [`MAX_FILE_SIZE`] bytes (the limit is
+/// enforced while reading too).
+///
+/// # Errors
+/// Not a regular file, too large, or I/O failure.
+pub fn read_capped(path: &Path) -> Result<Vec<u8>, IoError> {
     let file = File::open(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() {
@@ -290,10 +499,7 @@ pub fn load_from_path(path: &Path) -> Result<Project, IoError> {
     if buf.len() as u64 > MAX_FILE_SIZE {
         return Err(IoError::TooLarge);
     }
-    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("dwm")) {
-        return dwm::load(&buf);
-    }
-    load_from_bytes(&buf)
+    Ok(buf)
 }
 
 /// Serializes a project to a RON string.
@@ -302,8 +508,16 @@ pub fn load_from_path(path: &Path) -> Result<Project, IoError> {
 /// Limits exceeded or serializer failure.
 pub fn save_to_string(p: &Project) -> Result<String, IoError> {
     check_limits(&p.circuit, &p.name)?;
-    let out = FileOut { format: FORMAT_MAGIC, version: FORMAT_VERSION, name: &p.name, circuit: &p.circuit };
-    let cfg = ron::ser::PrettyConfig::new().depth_limit(8);
+    let t = p.circuit.macros();
+    let ids: Vec<MacroId> = t.iter().map(|(id, _)| id).collect();
+    let out = FileOut {
+        format: FORMAT_MAGIC,
+        version: FORMAT_VERSION,
+        name: &p.name,
+        macros: macro_records(t, &ids),
+        circuit: &p.circuit,
+    };
+    let cfg = ron::ser::PrettyConfig::new().depth_limit(10);
     ron_options().to_string_pretty(&out, cfg).map_err(|e| IoError::Serialize(e.to_string()))
 }
 
@@ -312,7 +526,14 @@ pub fn save_to_string(p: &Project) -> Result<String, IoError> {
 /// # Errors
 /// I/O or serialization failure.
 pub fn save_to_path(p: &Project, path: &Path) -> Result<(), IoError> {
-    let text = save_to_string(p)?;
+    write_atomic(&save_to_string(p)?, path)
+}
+
+/// Writes text atomically (temp file in the same directory + rename).
+///
+/// # Errors
+/// I/O failure.
+pub fn write_atomic(text: &str, path: &Path) -> Result<(), IoError> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp);
@@ -355,7 +576,7 @@ mod tests {
     fn roundtrip() {
         let p = sample();
         let text = save_to_string(&p).unwrap();
-        assert!(text.contains("version: 3") && text.contains("Free((") && text.contains("segments:"), "{text}");
+        assert!(text.contains("version: 4") && text.contains("Free((") && text.contains("segments:"), "{text}");
         let q = load_from_bytes(text.as_bytes()).unwrap();
         assert_eq!(q.name, "sample");
         assert_eq!(q.circuit.component_count(), 3);
@@ -371,7 +592,7 @@ mod tests {
         let text = save_to_string(&p).unwrap();
         let wrong = text.replace("\"bitwerk\"", "\"other\"");
         assert!(matches!(load_from_bytes(wrong.as_bytes()), Err(IoError::NotABitwerkFile)));
-        let future = text.replace("version: 3", "version: 99");
+        let future = text.replace("version: 4", "version: 99");
         assert!(matches!(load_from_bytes(future.as_bytes()), Err(IoError::UnsupportedVersion { found: 99 })));
     }
 
@@ -612,6 +833,9 @@ mod migration {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
             let text = std::fs::read_to_string(&path).unwrap();
+            if text.contains("version: 3,") {
+                continue; // see v3_fixtures_migrate_to_v4
+            }
             if text.contains("version: 1,") {
                 v1 += 1;
             } else {
@@ -736,5 +960,131 @@ mod mutation {
             }
         }
         assert!(accepted > 10 && accepted < total, "{accepted} of {total} mutants accepted");
+    }
+}
+
+/// Format 4 (macros): migration from format 3 and macro round trips.
+#[cfg(test)]
+mod v4 {
+    use bw_core::{Circuit, ComponentKind, Edit, GridPos, PinRef, Rotation, WireEnd};
+
+    use crate::bwmacro;
+
+    fn nets(c: &Circuit) -> std::collections::BTreeSet<Vec<PinRef>> {
+        let n = c.nets();
+        (0..n.len())
+            .map(|i| {
+                let mut v = n.net(i).to_vec();
+                v.sort_unstable();
+                v
+            })
+            .collect()
+    }
+
+    /// The format 3 fixtures (saved before format 4 existed) load, keep
+    /// every component and net, save as format 4 and load back identically.
+    #[test]
+    fn v3_fixtures_migrate_to_v4() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let mut n = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let text = std::fs::read_to_string(&path).unwrap();
+            if !text.contains("version: 3,") {
+                continue;
+            }
+            n += 1;
+            let p = crate::load_from_path(&path).unwrap();
+            p.circuit.check().unwrap();
+            assert_eq!(p.circuit.component_count(), text.matches("kind:").count());
+            let saved = crate::save_to_string(&p).unwrap();
+            assert!(saved.contains("version: 4") && !saved.contains("macros:"), "no macro table without macros");
+            let q = crate::load_from_bytes(saved.as_bytes()).unwrap();
+            assert_eq!(q.circuit.components().collect::<Vec<_>>(), p.circuit.components().collect::<Vec<_>>());
+            assert_eq!(nets(&q.circuit), nets(&p.circuit));
+            assert_eq!(crate::save_to_string(&q).unwrap(), saved);
+        }
+        assert_eq!(n, 4, "four format 3 fixtures");
+    }
+
+    fn library_part(key: &str) -> &'static crate::library::LibEntry {
+        crate::library::builtin().iter().find(|e| e.key == key).unwrap()
+    }
+
+    fn project_with_macros() -> crate::Project {
+        let src = library_part("builtin/adder-4");
+        let mut c = Circuit::new();
+        let (defs, root) = c.macros().import_plan(&src.file.table, src.file.root).unwrap();
+        for (id, def) in defs {
+            c.apply(&Edit::DefineMacro { id, def }).unwrap();
+        }
+        let shape = c.macros().get(root).unwrap().shape;
+        let inst = c.add_component(ComponentKind::Macro(shape), GridPos::new(20, 0), Rotation::R0).unwrap();
+        let s = c.add_component(ComponentKind::Switch { on: true }, GridPos::new(0, 0), Rotation::R0).unwrap();
+        c.apply(&Edit::AddWire {
+            from: WireEnd::Pin(PinRef { component: s, pin: 0 }),
+            to: WireEnd::Pin(PinRef { component: inst, pin: 3 }),
+            via: vec![],
+        })
+        .unwrap();
+        crate::Project { name: "adder".into(), circuit: c }
+    }
+
+    #[test]
+    fn project_with_macros_round_trips() {
+        let p = project_with_macros();
+        assert_eq!(p.circuit.macros().len(), 3, "adder-4, full adder, half adder");
+        let text = crate::save_to_string(&p).unwrap();
+        assert!(text.contains("macros:") && text.contains("kind: Macro(("), "{}", &text[..400]);
+        let q = crate::load_from_bytes(text.as_bytes()).unwrap();
+        assert_eq!(crate::save_to_string(&q).unwrap(), text);
+        for (id, e) in p.circuit.macros().iter() {
+            assert_eq!(q.circuit.macros().get(id).unwrap().hash, e.hash, "content hash is stable");
+        }
+        q.circuit.check().unwrap();
+        // A format 3 file may not use macros.
+        let old = text.replace("version: 4", "version: 3");
+        assert!(matches!(crate::load_from_bytes(old.as_bytes()), Err(crate::IoError::FeatureNotInVersion { .. })));
+    }
+
+    #[test]
+    fn bwmacro_round_trip_and_malformed_files() {
+        let src = library_part("builtin/adder-4");
+        let text = bwmacro::save_to_string(&src.file.table, src.file.root).unwrap();
+        let f = bwmacro::load_from_bytes(text.as_bytes()).unwrap();
+        assert_eq!(f.hash(), src.file.hash());
+        assert_eq!(bwmacro::save_to_string(&f.table, f.root).unwrap(), text);
+        let bad = |t: &str| bwmacro::load_from_bytes(t.as_bytes()).is_err();
+        assert!(bad(&text.replace("bitwerk-macro", "bitwerk")), "magic");
+        assert!(bad(&text.replace("version: 1,", "version: 2,")), "version");
+        assert!(bad(&text.replace("root: (", "root: (9")), "unknown root");
+        assert!(bad("garbage"));
+        assert!(bad(&"(".repeat(5000)), "deep nesting");
+        // A definition referring to an unknown one, or to itself.
+        let first_ref = text.find("kind: Macro((").unwrap() + "kind: Macro((".len();
+        let mut t = text.clone();
+        t.replace_range(first_ref..=first_ref, "7");
+        assert!(bad(&t), "unknown nested definition");
+        // Self reference: the half adder record (id 0) instantiating itself.
+        let cyc = text.replacen("components: [", "components: [(id: (900), kind: Macro((0)), pos: (x: 0, y: 99)),", 1);
+        assert!(bad(&cyc), "cycle");
+        // Mutations never panic; anything accepted is valid.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut accepted = 0;
+        for _ in 0..400 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let mut b = text.clone().into_bytes();
+            let i = usize::try_from(seed % b.len() as u64).unwrap();
+            b[i] = b"0123456789(),:[]x"[usize::try_from(seed >> 40).unwrap() % 17];
+            if let Ok(f) = bwmacro::load_from_bytes(&b) {
+                accepted += 1;
+                for (_, e) in f.table.iter() {
+                    e.def.body.check().unwrap();
+                }
+            }
+        }
+        assert!(accepted < 400);
     }
 }

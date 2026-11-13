@@ -8,10 +8,14 @@
 // mesh; an output pin stub reads the level of its own output (signal slot
 // `net + pin`).
 
-const SYM_BUCKETS: u32 = 17u;
+const SYM_BUCKETS: u32 = 19u;
 const SYM_VARIANTS: u32 = 256u;
-const SYM_INFO_VCOUNT: u32 = 17u;
-const SYM_INFO_TABLE: u32 = 34u;
+const SYM_INFO_VCOUNT: u32 = 19u;
+const SYM_INFO_TABLE: u32 = 38u;
+// Per-definition macro meshes (symbols/atlas.rs INFO_MACRO): (start, count)
+// of definition `kind >> 18` of a macro instance.
+const SYM_INFO_MACRO: u32 = 19494u;
+const SYM_MACRO_CODE: u32 = 17u;
 
 struct SymOut {
     @builtin(position) pos: vec4<f32>,
@@ -80,7 +84,7 @@ fn vs_symbol(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -
     o.pos = CLIPPED;
     let bucket = min(vi >> 16u, SYM_BUCKETS - 1u);
     let local = vi & 0xffffu;
-    // Bucket bases are written by the culling pass into sym_info[0..17).
+    // Bucket bases are written by the culling pass into sym_info[0..19).
     let slot = vis_bodies[sym_info[bucket] + ii];
     let inst = bodies[slot];
     if (inst.kind == HIDDEN_KIND) {
@@ -89,7 +93,10 @@ fn vs_symbol(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -
     let code = min(inst.kind & 0xffu, SYM_BUCKETS - 1u);
     let variant = (inst.kind >> 8u) & 0xffu;
     let rot = (inst.kind >> 16u) & 3u;
-    let mi = SYM_INFO_TABLE + ((min(g.style, 1u) * SYM_BUCKETS + code) * SYM_VARIANTS + variant) * 2u;
+    var mi = SYM_INFO_TABLE + ((min(g.style, 1u) * SYM_BUCKETS + code) * SYM_VARIANTS + variant) * 2u;
+    if (code == SYM_MACRO_CODE) {
+        mi = SYM_INFO_MACRO + (inst.kind >> 18u) * 2u;
+    }
     let start = sym_info[mi];
     let count = sym_info[mi + 1u];
     if (local >= count) {

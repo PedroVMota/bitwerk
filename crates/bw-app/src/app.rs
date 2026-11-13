@@ -1,6 +1,6 @@
 //! Application state, panels and command dispatch.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -22,6 +22,9 @@ pub const MSAA_SAMPLES: u16 = 4;
 pub const PROJECT_EXT: &str = "bitwerk";
 /// Size of the debug stress test.
 const STRESS_COMPONENTS: usize = 100_000;
+/// Cells of the macro stress test (each a counter + 4-bit adder, four
+/// levels of macros: 2 500 cells ≈ 37 500 instances, 70 000 primitives).
+const STRESS_MACRO_CELLS: usize = 2_500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -51,20 +54,22 @@ pub struct BitwerkApp {
     // Model
     pub circuit: Arc<Circuit>,
     pub revision: u64,
-    path: Option<PathBuf>,
+    pub(crate) path: Option<PathBuf>,
     name: String,
     dirty: bool,
 
     // Engines / workers
     pub sim: SimHandle,
-    scene_worker: SceneWorker,
+    pub(crate) scene_worker: SceneWorker,
     /// Render scene, owned by the UI thread and patched in place by edits.
     pub scene: Box<Scene>,
     /// A full scene build is in flight; edits re-request it instead of
     /// patching the (stale) current scene.
-    full_build_pending: bool,
+    pub(crate) full_build_pending: bool,
     gpu: Option<egui_wgpu::RenderState>,
     stress_rx: Option<Receiver<Result<Circuit, bw_core::CircuitError>>>,
+    /// Name of the stress circuit being generated.
+    stress_name: &'static str,
     pub fit_on_next_scene: bool,
     /// Camera to apply when the next scene arrives (`--view`).
     initial_view: Option<Camera>,
@@ -93,6 +98,23 @@ pub struct BitwerkApp {
     menu: Option<NativeMenu>,
     /// The Memory Contents window, if open.
     pub memory_window: Option<crate::memwin::MemoryWindow>,
+    /// Macro levels opened below the root (see `hier`).
+    pub levels: Vec<crate::hier::Level>,
+    /// Further selected components (box select / Shift-click), besides
+    /// `selection`.
+    pub multi: BTreeSet<ComponentId>,
+    /// Box selection being dragged (world corners).
+    pub box_select: Option<(glam::Vec2, glam::Vec2)>,
+    pub parts: crate::parts::PartsCentre,
+    pub macro_draft: Option<crate::macro_props::Draft>,
+    /// "Create Macro from Selection" name prompt.
+    pub macro_name_prompt: Option<String>,
+    /// Component under the cursor when the context menu opened.
+    pub ctx_target: Option<ComponentId>,
+    /// `--enter A/B/…`: instance path to open once loaded.
+    enter_path: Vec<ComponentId>,
+    /// Fit the view to the scene once the canvas size is known.
+    pub fit_pending: bool,
 
     // Stats
     frame_times: VecDeque<f32>,
@@ -117,6 +139,7 @@ pub struct BitwerkApp {
 const HIDDEN_REPAINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 impl BitwerkApp {
+    #[allow(clippy::too_many_lines, reason = "start-up options, one after the other")]
     pub fn new(cc: &eframe::CreationContext<'_>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let rs = cc.wgpu_render_state.as_ref().ok_or("bitwerk requires the wgpu (Metal) renderer")?;
         let canvas = CanvasRenderer::new(&rs.device, rs.target_format, u32::from(MSAA_SAMPLES));
@@ -140,6 +163,7 @@ impl BitwerkApp {
             full_build_pending: false,
             gpu: cc.wgpu_render_state.clone(),
             stress_rx: None,
+            stress_name: "stress-test",
             fit_on_next_scene: false,
             initial_view: None,
             camera: Camera::default(),
@@ -158,6 +182,15 @@ impl BitwerkApp {
             debug: DebugOpts::default(),
             menu,
             memory_window: None,
+            levels: Vec::new(),
+            multi: BTreeSet::new(),
+            box_select: None,
+            parts: crate::parts::PartsCentre::default(),
+            macro_draft: None,
+            macro_name_prompt: None,
+            ctx_target: None,
+            enter_path: Vec::new(),
+            fit_pending: false,
             frame_times: VecDeque::with_capacity(120),
             frames_since_log: 0,
             canvas_state: (DrawMode::All(0), None),
@@ -178,6 +211,22 @@ impl BitwerkApp {
             app.debug.log_stats = true;
             app.spawn_stress(&cc.egui_ctx);
         }
+        // `--stress-macros`: thousands of nested macro instances.
+        if args.iter().any(|a| a == "--stress-macros") {
+            app.debug.log_stats = true;
+            app.spawn_stress_macros(&cc.egui_ctx);
+        }
+        // `--parts`: open the Parts Centre (screenshots / demos).
+        if let Some(i) = args.iter().position(|a| a == "--parts") {
+            app.parts.open = true;
+            if let Some(key) = args.get(i + 1).filter(|k| !k.starts_with("--")) {
+                app.parts.select(crate::parts::PartRef::Lib(key.clone()));
+            }
+        }
+        // `--enter ID/ID/…`: open that macro instance path once loaded.
+        if let Some(v) = args.iter().position(|a| a == "--enter").and_then(|i| args.get(i + 1)) {
+            app.enter_path = v.split('/').filter_map(|t| t.trim().parse().ok()).map(ComponentId).collect();
+        }
         // `--style iec|ansi`: initial symbol style.
         if let Some(v) = args.iter().position(|a| a == "--style").and_then(|i| args.get(i + 1)) {
             app.set_style(if v.eq_ignore_ascii_case("iec") { SymbolStyle::Iec } else { SymbolStyle::Ansi });
@@ -187,6 +236,10 @@ impl BitwerkApp {
             std::path::Path::new(a).extension().is_some_and(|e| e == PROJECT_EXT || e.eq_ignore_ascii_case("dwm"))
         }) {
             app.open_path(PathBuf::from(path));
+        }
+        // `--select ID`: select a component (screenshots).
+        if let Some(id) = args.iter().position(|a| a == "--select").and_then(|i| args.get(i + 1)) {
+            app.selection = id.parse().ok().map(ComponentId);
         }
         // Debug: `--view X,Y,ZOOM` sets the camera once the scene is built
         // (reproducible screenshots).
@@ -238,26 +291,79 @@ impl BitwerkApp {
     ///
     /// # Errors
     /// The model rejected the edit; nothing changed.
+    ///
+    /// Inside a macro the edit changes the definition (see `hier`).
     pub fn apply_edit(&mut self, edit: Edit) -> Result<Applied, CircuitError> {
-        let applied = self.circuit_mut().apply(&edit)?;
-        self.revision += 1;
-        self.sim.send(Command::Edit { edit, revision: self.revision });
-        if self.full_build_pending {
-            self.scene_worker.request(Arc::clone(&self.circuit), self.revision);
-        } else {
-            self.scene.apply(&self.circuit, &applied, self.revision);
-            // Many deletions leave holes; compact with a background rebuild.
-            if self.scene.free_ratio() > 0.5 && self.scene.slot_count() > 50_000 {
-                self.commit_rebuild();
-            }
-        }
-        self.mark_dirty();
-        Ok(applied)
+        if self.levels.is_empty() { self.apply_root_edit(edit) } else { self.apply_body_edit(&edit) }
     }
 
-    fn commit_rebuild(&mut self) {
-        self.scene_worker.request(Arc::clone(&self.circuit), self.revision);
-        self.full_build_pending = true;
+    /// Selected components (primary + box / Shift selection).
+    #[must_use]
+    pub fn selected_ids(&self) -> Vec<ComponentId> {
+        let mut v: Vec<ComponentId> = self.multi.iter().copied().collect();
+        if let Some(s) = self.selection {
+            if !self.multi.contains(&s) {
+                v.push(s);
+            }
+        }
+        v.sort_unstable();
+        v
+    }
+
+    /// Turns the selection into a macro named `name` (see
+    /// [`bw_core::Circuit::plan_macro`]).
+    pub fn create_macro_from_selection(&mut self, name: &str) {
+        struct Target<'a>(&'a mut BitwerkApp);
+        impl bw_core::PlanTarget for Target<'_> {
+            fn define(&mut self, e: Edit) -> Result<Applied, CircuitError> {
+                self.0.apply_root_edit(e)
+            }
+            fn edit(&mut self, e: Edit) -> Result<Applied, CircuitError> {
+                self.0.apply_edit(e)
+            }
+            fn circuit(&self) -> &Circuit {
+                self.0.shown()
+            }
+            fn table(&self) -> &bw_core::MacroTable {
+                self.0.circuit.macros()
+            }
+        }
+        let sel = self.selected_ids();
+        let plan = match self.shown().plan_macro(&sel, name) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = format!("Cannot create the macro: {e}");
+                return;
+            }
+        };
+        let Some(id) = self.circuit.macros().free_id() else {
+            self.status = "Too many macro definitions".into();
+            return;
+        };
+        let pins = plan.links.len();
+        self.clear_selection();
+        match bw_core::run_macro_plan(&mut Target(self), plan, id) {
+            Ok(inst) => {
+                self.selection = Some(inst);
+                self.status = format!("Created macro '{name}' with {pins} pins (double-click it to open)");
+            }
+            Err(e) => self.status = format!("Macro creation stopped: {e}"),
+        }
+    }
+
+    /// Creates an empty macro definition and opens it.
+    pub fn new_macro(&mut self) {
+        let Some(id) = self.circuit.macros().free_id() else { return };
+        let name = format!("Macro {}", id.0 + 1);
+        match self.apply_root_edit(Edit::DefineMacro { id, def: Arc::new(bw_core::MacroDef::new(&name)) }) {
+            Ok(_) => {
+                self.enter_def(id);
+                self.status = format!(
+                    "New macro '{name}': add components and In / Out tags, then place it from the Parts Centre"
+                );
+            }
+            Err(e) => self.status = e.to_string(),
+        }
     }
 
     /// Switches the symbol style: only a uniform changes on the GPU.
@@ -273,6 +379,9 @@ impl BitwerkApp {
     }
 
     fn replace_circuit(&mut self, circuit: Circuit, name: String, path: Option<PathBuf>) {
+        self.drop_levels();
+        self.multi.clear();
+        self.macro_draft = None;
         self.circuit = Arc::new(circuit);
         self.name = name;
         self.path = path;
@@ -304,7 +413,28 @@ impl BitwerkApp {
             MenuAction::StressTest => self.spawn_stress(ctx),
             MenuAction::ToggleContinuousRepaint => self.debug.continuous_repaint = !self.debug.continuous_repaint,
             MenuAction::Style(style) => self.set_style(style),
+            MenuAction::CreateMacro => self.prompt_macro_name(),
+            MenuAction::NewMacro => self.new_macro(),
+            MenuAction::EditMacro => {
+                if let Some(id) = self.selection {
+                    self.enter_instance(id);
+                }
+            }
+            MenuAction::UpLevel => self.go_up(),
+            MenuAction::PartsCentre => self.parts.open = !self.parts.open,
+            MenuAction::ImportMacro => self.import_macro_file(),
+            MenuAction::StressMacros => self.spawn_stress_macros(ctx),
         }
+    }
+
+    /// Asks for a name, then creates a macro from the selection.
+    pub fn prompt_macro_name(&mut self) {
+        if self.selected_ids().is_empty() {
+            self.status = "Select the components to turn into a macro first (drag a box or Shift-click)".into();
+            return;
+        }
+        let n = self.circuit.macros().free_id().map_or(0, |m| m.0 + 1);
+        self.macro_name_prompt = Some(format!("Macro {n}"));
     }
 
     fn guarded(&mut self, p: Pending) {
@@ -379,13 +509,27 @@ impl BitwerkApp {
     }
 
     fn spawn_stress(&mut self, ctx: &egui::Context) {
+        self.spawn_generator(ctx, "stress-test", || crate::stress::generate(STRESS_COMPONENTS));
+    }
+
+    fn spawn_stress_macros(&mut self, ctx: &egui::Context) {
+        self.spawn_generator(ctx, "stress-macros", || bw_io::library::stress_macros(STRESS_MACRO_CELLS));
+    }
+
+    fn spawn_generator(
+        &mut self,
+        ctx: &egui::Context,
+        name: &'static str,
+        f: impl FnOnce() -> Result<Circuit, CircuitError> + Send + 'static,
+    ) {
         if self.stress_rx.is_some() {
             return;
         }
+        self.stress_name = name;
         let (tx, rx) = crossbeam_channel::bounded(1);
         let ctx = ctx.clone();
         let spawned = std::thread::Builder::new().name("bw-stress".into()).spawn(move || {
-            let _ = tx.send(crate::stress::generate(STRESS_COMPONENTS));
+            let _ = tx.send(f());
             ctx.request_repaint();
         });
         match spawned {
@@ -409,7 +553,7 @@ impl BitwerkApp {
                             c.component_count(),
                             c.segment_count()
                         );
-                        self.replace_circuit(c, "stress-test".into(), None);
+                        self.replace_circuit(c, self.stress_name.into(), None);
                         self.dirty = true;
                     }
                     Err(e) => self.status = format!("Stress test failed: {e}"),
@@ -422,14 +566,21 @@ impl BitwerkApp {
             // scene; older ones are superseded by a newer request in flight.
             if scene.revision() == self.revision {
                 self.event("scene-built");
-                let old = std::mem::replace(&mut self.scene, scene);
+                let old = std::mem::replace(self.root_scene_mut(), scene);
                 self.scene_worker.retire(old);
                 self.full_build_pending = false;
-                if self.fit_on_next_scene {
+                if !self.enter_path.is_empty() {
                     self.fit_on_next_scene = false;
-                    self.fit_view();
+                    for id in std::mem::take(&mut self.enter_path) {
+                        self.enter_instance(id);
+                    }
+                }
+                if self.fit_on_next_scene && self.levels.is_empty() {
+                    self.fit_on_next_scene = false;
+                    self.fit_pending = true;
                 }
                 if let Some(cam) = self.initial_view.take() {
+                    self.fit_pending = false;
                     self.camera = cam;
                 }
             } else {
@@ -438,13 +589,15 @@ impl BitwerkApp {
         }
     }
 
-    fn fit_view(&mut self) {
+    pub(crate) fn fit_view(&mut self) {
         let (lo, hi) = self.scene.bounds();
         if hi.cmple(lo).any() {
             return;
         }
         self.camera.center = (lo + hi) * 0.5;
-        let ext = (hi - lo).max(glam::Vec2::ONE);
+        // Inside a macro leave room for the tag names drawn beside the tags.
+        let margin = if self.levels.is_empty() { 0.0 } else { 6.0 };
+        let ext = (hi - lo + glam::Vec2::splat(margin)).max(glam::Vec2::ONE);
         let c = self.canvas_size.max(glam::Vec2::splat(100.0)) * 0.95;
         self.camera.zoom = (c.x / ext.x).min(c.y / ext.y).clamp(bw_render::camera::MIN_ZOOM, 40.0);
     }
@@ -510,23 +663,16 @@ impl BitwerkApp {
 
     /// Error message with component names (bus contention lists the
     /// drivers by kind and id).
+    #[allow(clippy::unused_self)]
     fn describe_error(&self, e: &SimError) -> String {
-        match e {
-            SimError::BusContention { net, drivers } => {
-                let names: Vec<String> = drivers
-                    .iter()
-                    .map(|id| {
-                        let label = self.circuit.component(*id).map_or("?", |c| c.kind.label());
-                        format!("{label} #{}", id.0)
-                    })
-                    .collect();
-                format!("Bus contention, process halted: net {net} driven by {}", names.join(" and "))
-            }
-            SimError::RaceCondition { net } => format!("Race condition, process halted (net {net})"),
-            SimError::TooLarge => e.to_string(),
-        }
+        // The message names the place, with the macro instance path
+        // (`root › Counter#3 › NAND#2`) when it is inside a macro.
+        let s = e.to_string();
+        let mut c = s.chars();
+        c.next().map_or_else(String::new, |f| f.to_uppercase().collect::<String>() + c.as_str())
     }
 
+    #[allow(clippy::too_many_lines, reason = "one palette section after the other")]
     fn palette(&mut self, ui: &mut egui::Ui) {
         ui.heading("Tools");
         ui.selectable_value(&mut self.tool, Tool::Select, "Select / move");
@@ -600,6 +746,41 @@ impl BitwerkApp {
                 }
             }
         });
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Macros");
+            if ui.button("Parts Centre").on_hover_text("Browse and place macros (Shift+Cmd+P)").clicked() {
+                self.parts.open = !self.parts.open;
+            }
+        });
+        egui::Grid::new("palette-macros").spacing([4.0, 4.0]).show(ui, |ui| {
+            for (kind, caption, tip) in [
+                (
+                    ComponentKind::Tag { dir: bw_core::TagDir::In, tristate: false },
+                    "In tag",
+                    "Macro input pin (use inside a macro definition)",
+                ),
+                (
+                    ComponentKind::Tag { dir: bw_core::TagDir::Out, tristate: false },
+                    "Out tag",
+                    "Macro output pin (use inside a macro definition)",
+                ),
+            ] {
+                let selected = matches!(self.tool, Tool::Place(k) if k == kind);
+                if crate::icons::button(ui, SymbolKind::of(&kind), style, caption, tip, selected, true).clicked() {
+                    self.tool = Tool::Place(kind);
+                }
+            }
+            if crate::icons::button(ui, SymbolKind::Macro, style, "New", "New empty macro definition", false, true)
+                .clicked()
+            {
+                self.new_macro();
+            }
+            ui.end_row();
+        });
+        if ui.button("Create Macro from Selection…").on_hover_text("Shift+Cmd+M").clicked() {
+            self.prompt_macro_name();
+        }
         egui::CollapsingHeader::new("Coming later").default_open(true).show(ui, |ui| {
             egui::Grid::new("palette-future").spacing([4.0, 4.0]).show(ui, |ui| {
                 for (i, kind) in SymbolKind::FUTURE.into_iter().enumerate() {
@@ -625,16 +806,41 @@ impl BitwerkApp {
             self.segment_properties(ui, seg);
             return;
         }
+        let selected = self.selected_ids();
+        if selected.len() > 1 {
+            ui.label(format!("{} components selected", selected.len()));
+            if ui.button("Create Macro from Selection…").clicked() {
+                self.prompt_macro_name();
+            }
+            if ui.button("Delete all").clicked() {
+                for id in selected {
+                    self.edit_delete(id);
+                }
+                self.clear_selection();
+            }
+            return;
+        }
         let Some(id) = self.selection else {
+            if let Some(def) = self.current_def() {
+                crate::macro_props::editor(self, ui, def);
+                return;
+            }
             ui.weak("Nothing selected");
             ui.separator();
             ui.label(format!("Project: {}{}", self.name, if self.dirty { " •" } else { "" }));
             ui.label(format!("{} components", self.circuit.component_count()));
             ui.label(format!("{} wire segments", self.circuit.segment_count()));
             ui.label(format!("{} junctions", self.scene.dot_count()));
+            if !self.circuit.macros().is_empty() {
+                ui.label(format!(
+                    "{} macro definitions · {} components flattened",
+                    self.circuit.macros().len(),
+                    self.circuit.flat_size()
+                ));
+            }
             return;
         };
-        let Some(comp) = self.circuit.component(id).cloned() else {
+        let Some(comp) = self.shown().component(id).cloned() else {
             self.selection = None;
             return;
         };
@@ -699,14 +905,46 @@ impl BitwerkApp {
                     }
                 });
                 ui.label(format!("{} words × {} bits", 1u32 << *addr_bits, *data_bits));
-                if ui.button("Edit contents…").clicked() {
+                let root = self.levels.is_empty();
+                if ui
+                    .add_enabled(root, egui::Button::new("Edit contents…"))
+                    .on_disabled_hover_text("Memory contents can be edited at the root level only")
+                    .clicked()
+                {
                     crate::memwin::open(self, id);
                 }
+            }
+            ComponentKind::Tag { dir, tristate } => {
+                let def = self.current_def();
+                let pin = def
+                    .and_then(|d| self.circuit.macros().def(d))
+                    .and_then(|d| d.pins.iter().find(|p| p.tag == id).cloned());
+                match (def, pin) {
+                    (Some(_), Some(p)) => {
+                        ui.label(format!("Interface pin '{}'", p.name));
+                        ui.small("Rename and reorder pins in the macro's properties (click empty space).");
+                    }
+                    _ => {
+                        ui.weak("Tags only matter inside a macro definition.");
+                    }
+                }
+                if *dir == bw_core::TagDir::Out {
+                    ui.checkbox(tristate, "tri-state output (may share a bus)");
+                }
+            }
+            ComponentKind::Macro(shape) => {
+                let def = shape.def;
+                if ui.button("Open (Edit Macro)").clicked() {
+                    self.enter_instance(id);
+                    return;
+                }
+                ui.separator();
+                crate::macro_props::editor(self, ui, def);
             }
             ComponentKind::Not | ComponentKind::Led | ComponentKind::TriState => {}
         }
         if kind != comp.kind {
-            let res = if let ComponentKind::Switch { on } = kind {
+            let res = if let (ComponentKind::Switch { on }, true) = (kind, self.levels.is_empty()) {
                 // Toggling a switch changes no geometry: the simulator updates
                 // its copy and the level arrives with the next snapshot.
                 let r = self.circuit_mut().set_kind(id, kind);
@@ -733,7 +971,7 @@ impl BitwerkApp {
 
     /// Properties of a selected wire segment.
     fn segment_properties(&mut self, ui: &mut egui::Ui, seg: SegmentId) {
-        let (Some(sg), Some((a, b))) = (self.circuit.segment(seg).copied(), self.circuit.segment_ends(seg)) else {
+        let (Some(sg), Some((a, b))) = (self.shown().segment(seg).copied(), self.shown().segment_ends(seg)) else {
             self.selected_segment = None;
             return;
         };
@@ -741,11 +979,11 @@ impl BitwerkApp {
         ui.label(format!("({}, {}) → ({}, {})", a.x, a.y, b.x, b.y));
         let len = (b.x - a.x).abs() + (b.y - a.y).abs();
         ui.label(format!("length {len}"));
-        let drivers = self.circuit.net_drivers(sg.a);
+        let drivers = self.shown().net_drivers(sg.a);
         let net = match drivers.as_slice() {
             [] => "net: no driver (floating)".to_string(),
             [d] => {
-                let label = self.circuit.component(d.component).map_or("?", |c| c.kind.label());
+                let label = self.shown().component(d.component).map_or("?", |c| c.kind.label());
                 format!("net driven by {label} #{}", d.component.0)
             }
             many => format!("net: bus of {} tri-state drivers", many.len()),
@@ -769,8 +1007,11 @@ impl BitwerkApp {
             if let Err(e) = self.apply_edit(Edit::RemoveSegment(seg)) {
                 self.status = e.to_string();
             }
-        } else if let Some(id) = self.selection.take() {
-            self.edit_delete(id);
+        } else {
+            for id in self.selected_ids() {
+                self.edit_delete(id);
+            }
+            self.clear_selection();
         }
     }
 
@@ -783,7 +1024,7 @@ impl BitwerkApp {
     }
 
     pub fn edit_rotate(&mut self, id: ComponentId) -> bool {
-        let Some(rot) = self.circuit.component(id).map(|c| c.rotation.rotated_cw()) else { return false };
+        let Some(rot) = self.shown().component(id).map(|c| c.rotation.rotated_cw()) else { return false };
         self.apply_edit(Edit::SetRotation(id, rot)).is_ok()
     }
 
@@ -816,7 +1057,21 @@ impl BitwerkApp {
         if let Some(r) = renderer.callback_resources.get_mut::<CanvasRenderer>() {
             let levels = crate::canvas::SnapshotLevels(snap);
             r.set_symbol_style(self.style);
-            r.prepare(&rs.device, &rs.queue, &mut self.scene, view, Some(&levels));
+            r.sync_macros(&rs.device, &rs.queue, self.circuit.macros());
+            // Live levels only when the simulator maps nets onto the circuit
+            // being shown (the root, or that very instance).
+            let path = self.view_path();
+            let matches = match (&snap.view, &path) {
+                (Some(v), Some(p)) => **v == **p,
+                _ => false,
+            };
+            r.prepare(
+                &rs.device,
+                &rs.queue,
+                &mut self.scene,
+                view,
+                matches.then_some(&levels as &dyn bw_render::NetLevels),
+            );
             self.canvas_state = (r.draw_mode(), r.stream_progress());
             self.symbols_drawn = r.draws_symbols();
         }
@@ -981,6 +1236,76 @@ impl BitwerkApp {
         }
     }
 
+    /// Breadcrumbs (`root › Counter#3 › …`), "Up one level" and the
+    /// all-instances warning.
+    fn breadcrumb_bar(&mut self, ui: &mut egui::Ui) {
+        let crumbs = self.breadcrumbs();
+        let mut go = None;
+        ui.horizontal(|ui| {
+            if ui.button("Up one level").on_hover_text("Cmd+Up").clicked() {
+                go = Some(self.levels.len() - 1);
+            }
+            ui.separator();
+            for (i, c) in crumbs.iter().enumerate() {
+                if i > 0 {
+                    ui.label("›");
+                }
+                let last = i + 1 == crumbs.len();
+                if ui.add_enabled(!last, egui::Button::new(c).small()).clicked() {
+                    go = Some(i);
+                }
+            }
+            if let Some(def) = self.current_def() {
+                let n = self.circuit.total_instances(def);
+                ui.separator();
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 200, 90),
+                    format!("Editing the definition: changes affect all {n} instance{}", if n == 1 { "" } else { "s" }),
+                );
+                if self.view_path().is_none() {
+                    ui.weak("(no live state: opened as a definition)");
+                }
+            }
+        });
+        if let Some(d) = go {
+            self.go_to_depth(d);
+        }
+    }
+
+    fn macro_name_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut name) = self.macro_name_prompt.take() else { return };
+        let mut keep = true;
+        let mut create = false;
+        egui::Window::new("Create Macro from Selection")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "{} components become a macro; wires crossing the selection become its pins.",
+                    self.selected_ids().len()
+                ));
+                let r = ui.text_edit_singleline(&mut name);
+                r.request_focus();
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    create = true;
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Create").clicked() {
+                        create = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        keep = false;
+                    }
+                });
+            });
+        if create && !name.trim().is_empty() {
+            self.create_macro_from_selection(name.trim());
+        } else if keep {
+            self.macro_name_prompt = Some(name);
+        }
+    }
+
     fn confirm_dialog(&mut self, ctx: &egui::Context) {
         let Some(p) = self.confirm else { return };
         let mut close = false;
@@ -1085,20 +1410,31 @@ impl eframe::App for BitwerkApp {
         self.handle_keys(&ctx);
 
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui, &snap));
+        if !self.levels.is_empty() {
+            egui::Panel::top("breadcrumbs").show(ui, |ui| self.breadcrumb_bar(ui));
+        }
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.status);
             });
         });
         egui::Panel::left("palette").resizable(false).default_size(170.0).show(ui, |ui| self.palette(ui));
-        egui::Panel::right("properties").resizable(true).default_size(220.0).show(ui, |ui| self.properties(ui));
+        egui::Panel::right("properties").resizable(true).default_size(250.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| self.properties(ui));
+        });
+        crate::parts::show(self, ui);
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let rect = crate::canvas::canvas_ui(self, ui, &snap);
             self.canvas_size = glam::Vec2::new(rect.width(), rect.height());
+            if std::mem::take(&mut self.fit_pending) {
+                self.fit_view();
+                ctx.request_repaint();
+            }
             self.stats_overlay(ui, rect);
         });
         crate::memwin::show(self, &ctx);
         self.confirm_dialog(&ctx);
+        self.macro_name_dialog(&ctx);
         if let Some(mut sweep) = self.sweep.take() {
             sweep.end_frame(self);
             self.sweep = Some(sweep);

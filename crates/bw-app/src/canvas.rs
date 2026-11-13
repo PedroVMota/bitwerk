@@ -164,6 +164,7 @@ fn reach(app: &BitwerkApp) -> f32 {
 }
 
 /// Draws the canvas and handles its input. Returns the canvas rect.
+#[allow(clippy::too_many_lines, reason = "one input handler per gesture")]
 pub fn canvas_ui(app: &mut BitwerkApp, ui: &mut egui::Ui, snap_shot: &Arc<Snapshot>) -> Rect {
     let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
     let viewport = v(rect.size());
@@ -178,41 +179,101 @@ pub fn canvas_ui(app: &mut BitwerkApp, ui: &mut egui::Ui, snap_shot: &Arc<Snapsh
     let world_at = |cam: &bw_render::Camera, p: Vec2| cam.screen_to_world(p, viewport);
 
     // ---- primary-button interaction ----------------------------------
+    let shift = ui.input(|i| i.modifiers.shift);
     if resp.drag_started_by(egui::PointerButton::Primary) && app.tool == Tool::Select {
         if let Some(p) = resp.interact_pointer_pos().map(local) {
-            app.drag = start_drag(app, world_at(&app.camera, p));
+            let w = world_at(&app.camera, p);
+            app.drag = if shift { None } else { start_drag(app, w) };
+            if app.drag.is_none() {
+                // Dragging empty space draws a selection box.
+                app.box_select = Some((w, w));
+            }
         }
     }
     if resp.dragged_by(egui::PointerButton::Primary) {
         let w = resp.interact_pointer_pos().map(|p| app.camera.screen_to_world(local(p), viewport));
+        let seg_h = match app.drag {
+            Some(DragState::Segment { id, .. }) => app.shown().segment_ends(id).is_some_and(|(a, b)| a.y == b.y),
+            _ => false,
+        };
         match (app.drag.as_mut(), w) {
             (Some(DragState::Component { grab, to, .. }), Some(w)) => *to = snap(w - *grab),
             (Some(DragState::Node { to, .. }), Some(w)) => *to = snap(w),
-            (Some(DragState::Segment { id, from, offset }), Some(w)) => {
+            (Some(DragState::Segment { from, offset, .. }), Some(w)) => {
                 let p = snap(w);
-                let horizontal = app.circuit.segment_ends(*id).is_some_and(|(a, b)| a.y == b.y);
-                *offset = if horizontal { p.y - from.y } else { p.x - from.x };
+                *offset = if seg_h { p.y - from.y } else { p.x - from.x };
             }
-            (Some(_), None) => {}
-            // Dragging empty space pans.
-            (None, _) => app.camera.pan_by(v(resp.drag_delta())),
+            (None, Some(w)) => {
+                if let Some(b) = app.box_select.as_mut() {
+                    b.1 = w;
+                } else {
+                    app.camera.pan_by(v(resp.drag_delta()));
+                }
+            }
+            (Some(_) | None, None) => {}
         }
     }
     if resp.drag_stopped() {
         if let Some(d) = app.drag.take() {
             finish_drag(app, d);
         }
+        if let Some((a, b)) = app.box_select.take() {
+            finish_box(app, a, b, shift);
+        }
     }
-    if resp.clicked() {
+    if resp.double_clicked() && matches!(app.tool, Tool::Select | Tool::Interact) {
+        // Double-click a macro instance: open it in place.
         if let Some(p) = resp.interact_pointer_pos().map(local) {
-            click(app, world_at(&app.camera, p));
+            if let Some(id) = pick_component(app, world_at(&app.camera, p)) {
+                if matches!(app.shown().component(id).map(|c| c.kind), Some(ComponentKind::Macro(_))) {
+                    app.enter_instance(id);
+                    return rect;
+                }
+            }
+        }
+    } else if resp.clicked() {
+        if let Some(p) = resp.interact_pointer_pos().map(local) {
+            let w = world_at(&app.camera, p);
+            if shift && app.tool == Tool::Select {
+                if let Some(id) = pick_component(app, w) {
+                    if !app.multi.remove(&id) {
+                        app.multi.insert(id);
+                        if let Some(s) = app.selection.take() {
+                            app.multi.insert(s);
+                        }
+                    }
+                }
+            } else {
+                app.multi.clear();
+                click(app, w);
+            }
+        }
+    }
+    // Context menu: Edit Macro, Create Macro from Selection, Up one level.
+    if resp.secondary_clicked() {
+        app.ctx_target =
+            resp.interact_pointer_pos().map(local).and_then(|p| pick_component(app, world_at(&app.camera, p)));
+    }
+    resp.context_menu(|ui| context_menu(app, ui));
+    // A part dragged from the Parts Centre and dropped here is placed.
+    if let Some(part) = resp.dnd_release_payload::<crate::parts::PartRef>() {
+        if let (Some(kind), Some(p)) = (app.place_part(&part), resp.hover_pos().map(local)) {
+            let (sw, sh) = kind.size();
+            let origin = snap(world_at(&app.camera, p) - gp(GridPos::new(sw, sh)) * 0.5);
+            match app.edit_place(kind, origin) {
+                Ok(id) => {
+                    app.selection = Some(id);
+                    app.tool = Tool::Select;
+                }
+                Err(e) => app.status = e.to_string(),
+            }
         }
     }
     // Hovered wire → its whole net is highlighted (cached per revision).
     let hovered_seg = hover
         .filter(|_| app.drag.is_none() && matches!(app.tool, Tool::Select | Tool::Wire))
         .and_then(|c| app.scene.pick_wire(world_at(&app.camera, c), reach(app)))
-        .filter(|&s| app.circuit.segment(s).is_some());
+        .filter(|&s| app.shown().segment(s).is_some());
     update_hover_net(app, hovered_seg);
 
     // ---- GPU canvas --------------------------------------------------
@@ -235,28 +296,84 @@ fn start_drag(app: &mut BitwerkApp, w: Vec2) -> Option<DragState> {
         return Some(DragState::Node { id, to: pos });
     }
     if let Some(id) = pick_component(app, w) {
-        let c = app.circuit.component(id)?;
+        let pos = app.shown().component(id)?.pos;
         app.selection = Some(id);
         app.selected_segment = None;
-        return Some(DragState::Component { id, grab: w - gp(c.pos), to: c.pos });
+        return Some(DragState::Component { id, grab: w - gp(pos), to: pos });
     }
     let seg = app.scene.pick_wire(w, r)?;
-    let (a, b) = app.circuit.segment_ends(seg)?;
+    let (a, b) = app.shown().segment_ends(seg)?;
     app.selection = None;
     app.selected_segment = Some(seg);
     (a != b).then(|| DragState::Segment { id: seg, from: snap(w), offset: 0 })
 }
 
+/// Selects every component touching the box (Shift adds to the selection).
+fn finish_box(app: &mut BitwerkApp, a: Vec2, b: Vec2, add: bool) {
+    let (lo, hi) = (a.min(b), a.max(b));
+    if (hi - lo).length() < 0.3 {
+        return;
+    }
+    if !add {
+        app.clear_selection();
+    }
+    let mut found = Vec::new();
+    crate::sweep::bodies_in(&app.scene, lo, hi, |id| found.push(id));
+    found.retain(|id| app.shown().component(*id).is_some());
+    app.multi.extend(found);
+    if app.multi.len() == 1 {
+        app.selection = app.multi.pop_first();
+    }
+    let n = app.selected_ids().len();
+    app.status = format!("{n} component{} selected", if n == 1 { "" } else { "s" });
+}
+
+fn context_menu(app: &mut BitwerkApp, ui: &mut egui::Ui) {
+    let target = app.ctx_target;
+    let is_macro =
+        target.is_some_and(|id| matches!(app.shown().component(id).map(|c| c.kind), Some(ComponentKind::Macro(_))));
+    if is_macro {
+        if ui.button("Edit Macro (open inside)").clicked() {
+            if let Some(id) = target {
+                app.enter_instance(id);
+            }
+            ui.close();
+        }
+        if ui.button("Macro Properties").clicked() {
+            app.clear_selection();
+            app.selection = target;
+            ui.close();
+        }
+        ui.separator();
+    }
+    if ui.add_enabled(!app.selected_ids().is_empty(), egui::Button::new("Create Macro from Selection…")).clicked() {
+        app.prompt_macro_name();
+        ui.close();
+    }
+    if ui.button("New Macro").clicked() {
+        app.new_macro();
+        ui.close();
+    }
+    if ui.button("Parts Centre").clicked() {
+        app.parts.open = true;
+        ui.close();
+    }
+    if !app.levels.is_empty() && ui.button("Up One Level").clicked() {
+        app.go_up();
+        ui.close();
+    }
+}
+
 fn finish_drag(app: &mut BitwerkApp, d: DragState) {
     let r = match d {
         DragState::Component { id, to, .. } => {
-            if app.circuit.component(id).is_some_and(|c| c.pos != to) {
+            if app.shown().component(id).is_some_and(|c| c.pos != to) {
                 app.edit_move(id, to);
             }
             return;
         }
         DragState::Node { id, to } => {
-            if app.circuit.node(id).is_none_or(|n| n.pos == to) {
+            if app.shown().node(id).is_none_or(|n| n.pos == to) {
                 return;
             }
             app.apply_edit(bw_core::Edit::MoveNode(id, to))
@@ -272,7 +389,7 @@ fn finish_drag(app: &mut BitwerkApp, d: DragState) {
         app.status = e.to_string();
     }
     // Segment ids may be reused by the normalisation: drop a stale selection.
-    if app.selected_segment.is_some_and(|s| app.circuit.segment(s).is_none()) {
+    if app.selected_segment.is_some_and(|s| app.shown().segment(s).is_none()) {
         app.selected_segment = None;
     }
 }
@@ -285,9 +402,9 @@ fn update_hover_net(app: &mut BitwerkApp, seg: Option<SegmentId>) {
     if app.hover_net.as_ref().is_some_and(|(rev, s, _)| *rev == app.revision && *s == seg) {
         return;
     }
-    let Some(start) = app.circuit.segment(seg).map(|s| s.a) else { return };
+    let Some(start) = app.shown().segment(seg).map(|s| s.a) else { return };
     let mut segs = Vec::new();
-    app.circuit.visit_net(start, |_, _| {}, |s| segs.push(s));
+    app.shown().visit_net(start, |_, _| {}, |s| segs.push(s));
     app.hover_net = Some((app.revision, seg, segs));
 }
 
@@ -307,7 +424,7 @@ fn draw_overlays(app: &BitwerkApp, ui: &egui::Ui, rect: Rect, hover: Option<Vec2
         let s = app.camera.world_to_screen(w, viewport);
         rect.min + egui::vec2(s.x, s.y)
     };
-    let seg_line = |id: SegmentId| app.circuit.segment_ends(id).map(|(a, b)| [to_screen(gp(a)), to_screen(gp(b))]);
+    let seg_line = |id: SegmentId| app.shown().segment_ends(id).map(|(a, b)| [to_screen(gp(a)), to_screen(gp(b))]);
     let (vis_lo, vis_hi) = app.camera.visible_rect(viewport);
     let visible = |a: GridPos, b: GridPos| {
         let (lo, hi) = (gp(a).min(gp(b)), gp(a).max(gp(b)));
@@ -320,7 +437,7 @@ fn draw_overlays(app: &BitwerkApp, ui: &egui::Ui, rect: Rect, hover: Option<Vec2
         let glow = Stroke::new(wire_px + 5.0, Color32::from_rgba_unmultiplied(120, 200, 255, 70));
         let mut n = 0;
         for &s in segs {
-            let Some((a, b)) = app.circuit.segment_ends(s) else { continue };
+            let Some((a, b)) = app.shown().segment_ends(s) else { continue };
             if !visible(a, b) {
                 continue;
             }
@@ -331,8 +448,48 @@ fn draw_overlays(app: &BitwerkApp, ui: &egui::Ui, rect: Rect, hover: Option<Vec2
             }
         }
     }
+    for id in app.multi.iter().take(4_000) {
+        if let Some(c) = app.shown().component(*id) {
+            let b = c.bounds();
+            let r = Rect::from_two_pos(to_screen(gp(b.min)), to_screen(gp(b.max))).expand(3.0);
+            painter.rect_stroke(r, 2.0, Stroke::new(1.5, Color32::from_rgb(140, 200, 255)), egui::StrokeKind::Outside);
+        }
+    }
+    if let Some((a, b)) = app.box_select {
+        let r = Rect::from_two_pos(to_screen(a), to_screen(b));
+        painter.rect(
+            r,
+            0.0,
+            Color32::from_rgba_unmultiplied(120, 180, 255, 30),
+            Stroke::new(1.0, Color32::from_rgb(120, 180, 255)),
+            egui::StrokeKind::Middle,
+        );
+    }
+    // Inside a macro: the interface pin name next to each tag.
+    if let Some(def) = app.current_def().and_then(|d| app.circuit.macros().def(d)) {
+        if app.camera.zoom >= 4.0 {
+            for p in def.pins.iter().take(256) {
+                let Some(c) = app.shown().component(p.tag) else { continue };
+                let b = c.bounds();
+                let (anchor, align) = match c.kind {
+                    ComponentKind::Tag { dir: bw_core::TagDir::In, .. } => {
+                        (gp(b.min) + Vec2::new(-0.3, 1.0), egui::Align2::RIGHT_CENTER)
+                    }
+                    _ => (gp(b.max) + Vec2::new(0.3, -1.0), egui::Align2::LEFT_CENTER),
+                };
+                let size = (0.8 * app.camera.zoom).clamp(9.0, 22.0);
+                painter.text(
+                    to_screen(anchor),
+                    align,
+                    &p.name,
+                    egui::FontId::proportional(size),
+                    Color32::from_rgb(255, 214, 120),
+                );
+            }
+        }
+    }
     if let Some(id) = app.selection {
-        if let Some(c) = app.circuit.component(id) {
+        if let Some(c) = app.shown().component(id) {
             let b = c.bounds();
             let r = Rect::from_two_pos(to_screen(gp(b.min)), to_screen(gp(b.max))).expand(3.0);
             painter.rect_stroke(r, 2.0, Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Outside);
@@ -341,10 +498,17 @@ fn draw_overlays(app: &BitwerkApp, ui: &egui::Ui, rect: Rect, hover: Option<Vec2
     if let Some(line) = app.selected_segment.and_then(seg_line) {
         painter.line_segment(line, Stroke::new(wire_px + 3.0, Color32::from_white_alpha(170)));
     }
-    // Bus contention: the drivers fighting over the net, outlined in red.
+    // Bus contention: the drivers fighting over the net, outlined in red
+    // (inside a macro: the instance containing them, at this level).
     if let Some(bw_sim::SimError::BusContention { drivers, .. }) = &snap_shot.error {
-        for id in drivers.iter().take(64) {
-            if let Some(c) = app.circuit.component(*id) {
+        let here = app.view_path().unwrap_or_default();
+        let ids: Vec<ComponentId> = drivers
+            .iter()
+            .filter(|p| p.len() > here.len() && p[..here.len()] == here[..])
+            .map(|p| p[here.len()])
+            .collect();
+        for id in ids.iter().take(64) {
+            if let Some(c) = app.shown().component(*id) {
                 let b = c.bounds();
                 let r = Rect::from_two_pos(to_screen(gp(b.min)), to_screen(gp(b.max))).expand(5.0);
                 painter.rect_stroke(
@@ -359,7 +523,7 @@ fn draw_overlays(app: &BitwerkApp, ui: &egui::Ui, rect: Rect, hover: Option<Vec2
     let ghost = Stroke::new(1.5, Color32::from_rgb(120, 180, 255));
     match app.drag {
         Some(DragState::Component { id, to, .. }) => {
-            if let Some(c) = app.circuit.component(id) {
+            if let Some(c) = app.shown().component(id) {
                 let b = c.bounds();
                 let size = gp(b.max) - gp(b.min);
                 let r = Rect::from_two_pos(to_screen(gp(to)), to_screen(gp(to) + size));
@@ -367,9 +531,9 @@ fn draw_overlays(app: &BitwerkApp, ui: &egui::Ui, rect: Rect, hover: Option<Vec2
             }
         }
         Some(DragState::Node { id, to }) => {
-            if let Some(n) = app.circuit.node(id) {
+            if let Some(n) = app.shown().node(id) {
                 for &s in n.segments() {
-                    let Some(o) = app.circuit.segment(s).and_then(|sg| app.circuit.node(sg.other(id))) else {
+                    let Some(o) = app.shown().segment(s).and_then(|sg| app.shown().node(sg.other(id))) else {
                         continue;
                     };
                     // The L the rubber band will make.
@@ -381,7 +545,7 @@ fn draw_overlays(app: &BitwerkApp, ui: &egui::Ui, rect: Rect, hover: Option<Vec2
             }
         }
         Some(DragState::Segment { id, offset, .. }) => {
-            if let Some((a, b)) = app.circuit.segment_ends(id) {
+            if let Some((a, b)) = app.shown().segment_ends(id) {
                 let shift = |p: GridPos| if a.y == b.y { p.offset(0, offset) } else { p.offset(offset, 0) };
                 painter.line_segment([to_screen(gp(shift(a))), to_screen(gp(shift(b)))], Stroke::new(2.0, ghost.color));
                 painter.line_segment([to_screen(gp(a)), to_screen(gp(shift(a)))], ghost);
@@ -395,8 +559,16 @@ fn draw_overlays(app: &BitwerkApp, ui: &egui::Ui, rect: Rect, hover: Option<Vec2
         // Name of the pin under the cursor (memories have dozens).
         if app.camera.zoom >= 6.0 {
             if let Some((pin, pos, _)) = pick_pin(app, w) {
-                if let Some(c) = app.circuit.component(pin.component) {
-                    let name = c.kind.pin_name(pin.pin);
+                if let Some(c) = app.shown().component(pin.component) {
+                    let name = match c.kind {
+                        ComponentKind::Macro(s) => app
+                            .circuit
+                            .macros()
+                            .def(s.def)
+                            .and_then(|d| d.interface().get(usize::from(pin.pin)).map(|p| d.pins[p.index].name.clone()))
+                            .unwrap_or_default(),
+                        k => k.pin_name(pin.pin),
+                    };
                     let at = to_screen(gp(pos)) + egui::vec2(8.0, -14.0);
                     let galley = painter.layout_no_wrap(name, egui::FontId::monospace(11.0), Color32::from_gray(235));
                     let bg = Rect::from_min_size(at, galley.size()).expand(3.0);
@@ -448,9 +620,24 @@ fn draw_overlays(app: &BitwerkApp, ui: &egui::Ui, rect: Rect, hover: Option<Vec2
                 painter.rect_stroke(r, 2.0, Stroke::new(1.0, Color32::from_white_alpha(60)), egui::StrokeKind::Middle);
                 // Ghost of the symbol about to be placed (same mesh as the canvas).
                 let o = gp(origin);
-                crate::icons::paint_with(&painter, SymbolKind::of(&kind), app.style, 2, 0.55, app.camera.zoom, |p| {
-                    to_screen(o + Vec2::new(p[0], p[1]))
-                });
+                if let ComponentKind::Macro(shape) = kind {
+                    if let Some(e) = app.circuit.macros().get(shape.def) {
+                        let mesh = crate::icons::macro_mesh(&e.def, &shape, e.hash);
+                        crate::icons::paint_vertices(&painter, &mesh, app.camera.zoom, 0.55, |p| {
+                            to_screen(o + Vec2::new(p[0], p[1]))
+                        });
+                    }
+                } else {
+                    crate::icons::paint_with(
+                        &painter,
+                        SymbolKind::of(&kind),
+                        app.style,
+                        2,
+                        0.55,
+                        app.camera.zoom,
+                        |p| to_screen(o + Vec2::new(p[0], p[1])),
+                    );
+                }
             }
             Tool::Select => {
                 // Junctions and bends are grabbable: show it.
@@ -473,7 +660,7 @@ fn draw_overlays(app: &BitwerkApp, ui: &egui::Ui, rect: Rect, hover: Option<Vec2
 /// (the scene may lag one rebuild behind).
 fn pick_component(app: &BitwerkApp, w: Vec2) -> Option<ComponentId> {
     let id = app.scene.pick_body(w)?;
-    let c = app.circuit.component(id)?;
+    let c = app.shown().component(id)?;
     let b = c.bounds();
     let inside = w.x >= gp(b.min).x && w.y >= gp(b.min).y && w.x <= gp(b.max).x && w.y <= gp(b.max).y;
     inside.then_some(id)
@@ -486,7 +673,7 @@ fn pick_pin(app: &BitwerkApp, w: Vec2) -> Option<(PinRef, GridPos, PinDir)> {
     app.scene.query(w - Vec2::splat(REACH), w + Vec2::splat(REACH), |it| {
         let Item::Body(i) = it else { return };
         let Some(id) = app.scene.body_id(i) else { return };
-        let Some(c) = app.circuit.component(id) else { return };
+        let Some(c) = app.shown().component(id) else { return };
         for pin in 0..c.kind.pin_count() {
             let (Some(pos), Some(dir)) = (c.pin_pos(pin), c.pin_dir(pin)) else { continue };
             let d = (gp(pos) - w).length();
@@ -504,9 +691,9 @@ fn pick_node(app: &BitwerkApp, w: Vec2, reach: f32, free_only: bool) -> Option<(
     let mut best: Option<(f32, NodeId, GridPos)> = None;
     app.scene.query(w - Vec2::splat(reach), w + Vec2::splat(reach), |it| {
         let Item::Wire(i) = it else { return };
-        let Some(seg) = app.scene.segment_at(i).and_then(|s| app.circuit.segment(s)) else { return };
+        let Some(seg) = app.scene.segment_at(i).and_then(|s| app.shown().segment(s)) else { return };
         for n in [seg.a, seg.b] {
-            let Some(node) = app.circuit.node(n) else { continue };
+            let Some(node) = app.shown().node(n) else { continue };
             if free_only && !node.is_free() {
                 continue;
             }
@@ -521,7 +708,7 @@ fn pick_node(app: &BitwerkApp, w: Vec2, reach: f32, free_only: bool) -> Option<(
 
 /// Grid point of segment `seg` nearest to `w`.
 fn snap_on_segment(app: &BitwerkApp, seg: SegmentId, w: Vec2) -> Option<GridPos> {
-    let (a, b) = app.circuit.segment_ends(seg)?;
+    let (a, b) = app.shown().segment_ends(seg)?;
     let p = snap(w);
     Some(if a.y == b.y {
         GridPos::new(p.x.clamp(a.x.min(b.x), a.x.max(b.x)), a.y)
@@ -553,9 +740,14 @@ fn click(app: &mut BitwerkApp, w: Vec2) {
         }
         Tool::Interact => {
             if let Some(id) = pick_component(app, w) {
-                if let Some(ComponentKind::Switch { on }) = app.circuit.component(id).map(|c| c.kind) {
+                if let Some(ComponentKind::Switch { on }) = app.shown().component(id).map(|c| c.kind) {
                     let kind = ComponentKind::Switch { on: !on };
-                    if app.circuit_mut().set_kind(id, kind).is_ok() {
+                    if !app.levels.is_empty() {
+                        // Inside a macro a switch is part of the definition.
+                        if let Err(e) = app.apply_edit(bw_core::Edit::SetKind(id, kind)) {
+                            app.status = e.to_string();
+                        }
+                    } else if app.circuit_mut().set_kind(id, kind).is_ok() {
                         app.sim.send(Command::SetSwitch(id, !on));
                         app.mark_dirty();
                     }

@@ -45,6 +45,7 @@ audit:
 fuzz:
 	$(CARGO) +nightly fuzz run load_project fuzz/seeds/load_project -- -max_total_time=300
 	$(CARGO) +nightly fuzz run load_memory_map fuzz/seeds/load_memory_map -- -max_total_time=300
+	$(CARGO) +nightly fuzz run load_macro fuzz/seeds/load_macro -- -max_total_time=300
 
 # Compiles the fuzz crate on stable without running it.
 fuzz-check:

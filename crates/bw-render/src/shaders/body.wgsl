@@ -25,7 +25,7 @@ fn vs_body(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     let code = inst.kind & 0xffu;
     let accent = kind_accent(code);
     var fill = vec3<f32>(0.20, 0.21, 0.24);
-    if (code >= 7u && code <= 9u) {
+    if ((code >= 7u && code <= 9u) || code == 16u) {
         // Sources and LEDs show their level in the fill colour.
         if (lvl == LVL_HIGH) {
             fill = accent;

@@ -1,11 +1,12 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::component::{Component, ComponentId, ComponentKind, PinRef, Rotation};
+use crate::component::{Component, ComponentId, ComponentKind, MacroId, PinRef, Rotation};
 use crate::geom::GridPos;
+use crate::macros::{MAX_FLAT_COMPONENTS, MacroDef, MacroTable, pin_remap};
 use crate::memenc;
 use crate::wiring::{NodeId, NodeRecord, Segment, SegmentId, SegmentRecord, WireEnd, WireLog, WireNode};
 
@@ -57,6 +58,22 @@ pub enum CircuitError {
     AddressOutOfRange { addr: u32 },
     #[error("memory contents of {0:?}: {1}")]
     BadMemory(ComponentId, memenc::MemEncError),
+    #[error("macro definition {} does not exist", .0.0)]
+    NoSuchMacro(MacroId),
+    #[error("a macro cannot contain itself (cycle through definition {})", .0.0)]
+    MacroCycle(MacroId),
+    #[error("macros nested deeper than {limit} levels")]
+    MacroTooDeep { limit: u32 },
+    #[error("design too large when flattened: {size} components (limit {limit})")]
+    MacroTooLarge { size: u64, limit: u64 },
+    #[error("macro definition {} is still used", .0.0)]
+    MacroInUse(MacroId),
+    #[error("too many macro definitions")]
+    TooManyMacros,
+    #[error("invalid macro: {0}")]
+    BadMacro(String),
+    #[error("macro definitions live in the root circuit only")]
+    NotRoot,
 }
 
 /// Contents of one memory device (exactly `kind.memory_words()` words, each
@@ -109,6 +126,16 @@ pub enum Edit {
         id: ComponentId,
         words: Arc<[u16]>,
     },
+    /// Adds or replaces a macro definition (root circuit only). Every
+    /// instance follows: if the interface changed, instance pins are
+    /// re-matched by tag and wires on vanished pins are detached. Refused
+    /// on cycles, excessive depth or flattened size.
+    DefineMacro {
+        id: MacroId,
+        def: Arc<MacroDef>,
+    },
+    /// Removes an unused macro definition.
+    RemoveMacro(MacroId),
 }
 
 impl Edit {
@@ -125,6 +152,7 @@ impl Edit {
                 | Self::DragSegment(..)
                 | Self::SetMemoryWord { .. }
                 | Self::SetMemory { .. }
+                | Self::RemoveMacro(..)
         )
     }
 }
@@ -145,6 +173,8 @@ pub struct Applied {
     pub memory: Option<ComponentId>,
     /// Which pins are connected may have changed (nets must be recomputed).
     pub connectivity: bool,
+    /// Macro definitions added, changed or removed.
+    pub macros: Vec<MacroId>,
 }
 
 impl Applied {
@@ -174,8 +204,17 @@ pub struct Circuit {
     /// Node of each wired pin.
     pub(crate) pin_node: HashMap<PinRef, NodeId>,
     /// Memory contents; a memory without an entry is all zeros.
-    memories: BTreeMap<ComponentId, MemoryImage>,
+    pub(crate) memories: BTreeMap<ComponentId, MemoryImage>,
     next_component: u32,
+    /// Macro definitions (root circuit only; empty in definition bodies).
+    pub(crate) macros: MacroTable,
+    /// Instances of each definition in this circuit.
+    pub(crate) macro_index: BTreeMap<MacroId, BTreeSet<ComponentId>>,
+    /// Primitive components (not macro instances, not tags).
+    pub(crate) prims: u64,
+    /// A definition body: macro instances are checked against the
+    /// project's table when the definition is stored, not here.
+    pub(crate) body: bool,
     /// Changes of the edit being applied.
     pub(crate) log: WireLog,
 }
@@ -233,15 +272,44 @@ impl TryFrom<CircuitRaw> for Circuit {
     type Error = CircuitError;
 
     fn try_from(raw: CircuitRaw) -> Result<Self, Self::Error> {
-        let mut c = Self::default();
+        Self::from_raw(raw, &MacroTable::default(), false)
+    }
+}
+
+impl Circuit {
+    /// Builds a validated circuit from file records, resolving macro
+    /// instances against `table`. A root circuit (`body == false`) takes a
+    /// copy of the table as its own.
+    ///
+    /// # Errors
+    /// Any invariant violation, an unknown macro, or a root whose
+    /// flattened size exceeds [`MAX_FLAT_COMPONENTS`].
+    pub fn from_raw(mut raw: CircuitRaw, table: &MacroTable, body: bool) -> Result<Self, CircuitError> {
+        for comp in &mut raw.components {
+            if let ComponentKind::Macro(s) = comp.kind {
+                let e = table.get(s.def).ok_or(CircuitError::NoSuchMacro(s.def))?;
+                comp.kind = ComponentKind::Macro(e.shape);
+            }
+        }
+        let mut c = Self { body, ..Self::default() };
+        if !body {
+            c.macros = table.clone();
+        }
         for comp in raw.components {
             if !comp.kind.is_valid() {
                 return Err(CircuitError::InvalidComponent(comp.id));
             }
             let next = comp.id.0.checked_add(1).ok_or(CircuitError::IdSpaceExhausted)?;
             c.next_component = c.next_component.max(next);
+            c.index_kind(comp.id, &comp.kind, true);
             if c.components.insert(comp.id, comp.clone()).is_some() {
                 return Err(CircuitError::DuplicateComponent(comp.id));
+            }
+        }
+        if !body {
+            let flat = c.flat_size();
+            if flat > MAX_FLAT_COMPONENTS {
+                return Err(CircuitError::MacroTooLarge { size: flat, limit: MAX_FLAT_COMPONENTS });
             }
         }
         c.load_wiring(raw.nodes, raw.segments)?;
@@ -259,12 +327,207 @@ impl TryFrom<CircuitRaw> for Circuit {
         }
         Ok(c)
     }
-}
 
-impl Circuit {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty definition body (see [`MacroDef::body`]).
+    #[must_use]
+    pub fn new_body() -> Self {
+        Self { body: true, ..Self::default() }
+    }
+
+    /// Is this a definition body?
+    #[must_use]
+    pub fn is_body(&self) -> bool {
+        self.body
+    }
+
+    /// The project's macro definitions (empty in a definition body).
+    #[must_use]
+    pub fn macros(&self) -> &MacroTable {
+        &self.macros
+    }
+
+    /// Instances of definition `id` in this circuit.
+    #[must_use]
+    pub fn instances_of(&self, id: MacroId) -> Vec<ComponentId> {
+        self.macro_index.get(&id).map(|s| s.iter().copied().collect()).unwrap_or_default()
+    }
+
+    /// Total instances of `id` in the design: in this circuit and, through
+    /// every definition that contains it, nested (counted per path).
+    #[must_use]
+    pub fn total_instances(&self, id: MacroId) -> u64 {
+        fn count(t: &MacroTable, d: MacroId, target: MacroId, memo: &mut HashMap<MacroId, u64>) -> u64 {
+            if let Some(&v) = memo.get(&d) {
+                return v;
+            }
+            let Some(e) = t.get(d) else { return 0 };
+            let mut n = 0u64;
+            for c in e.def.body.components() {
+                if let ComponentKind::Macro(s) = c.kind {
+                    n = n.saturating_add(if s.def == target { 1 } else { count(t, s.def, target, memo) });
+                }
+            }
+            memo.insert(d, n);
+            n
+        }
+        let mut memo: HashMap<MacroId, u64> = HashMap::new();
+        let mut n = 0u64;
+        for (&d, insts) in &self.macro_index {
+            let per = if d == id { 1 } else { count(&self.macros, d, id, &mut memo) };
+            n = n.saturating_add(per.saturating_mul(insts.len() as u64));
+        }
+        n
+    }
+
+    /// Primitive components of the design with every macro expanded.
+    #[must_use]
+    pub fn flat_size(&self) -> u64 {
+        let mut n = self.prims;
+        for (d, insts) in &self.macro_index {
+            let per = self.macros.get(*d).map_or(0, |e| e.flat);
+            n = n.saturating_add(per.saturating_mul(insts.len() as u64));
+        }
+        n
+    }
+
+    /// Same components, wiring and memory contents (definition equality).
+    #[must_use]
+    pub fn content_eq(&self, o: &Self) -> bool {
+        self.components == o.components && self.memories == o.memories && self.wiring_records() == o.wiring_records()
+    }
+
+    /// Keeps the macro index and the primitive count up to date.
+    fn index_kind(&mut self, id: ComponentId, kind: &ComponentKind, add: bool) {
+        match kind {
+            ComponentKind::Macro(s) => {
+                if add {
+                    self.macro_index.entry(s.def).or_default().insert(id);
+                } else if let Some(set) = self.macro_index.get_mut(&s.def) {
+                    set.remove(&id);
+                    if set.is_empty() {
+                        self.macro_index.remove(&s.def);
+                    }
+                }
+            }
+            ComponentKind::Tag { .. } => {}
+            _ => {
+                if add {
+                    self.prims += 1;
+                } else {
+                    self.prims = self.prims.saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    /// Checks a macro instance kind against the table (root circuits) and
+    /// the flattened size limit with `extra` more components.
+    fn check_macro_kind(&self, id: ComponentId, kind: &ComponentKind) -> Result<(), CircuitError> {
+        let add = match kind {
+            ComponentKind::Macro(s) => {
+                if self.body {
+                    return Ok(());
+                }
+                let e = self.macros.get(s.def).ok_or(CircuitError::NoSuchMacro(s.def))?;
+                if e.shape != *s {
+                    return Err(CircuitError::InvalidComponent(id));
+                }
+                e.flat
+            }
+            ComponentKind::Tag { .. } => 0,
+            _ => 1,
+        };
+        if !self.body {
+            let size = self.flat_size().saturating_add(add);
+            if size > MAX_FLAT_COMPONENTS {
+                return Err(CircuitError::MacroTooLarge { size, limit: MAX_FLAT_COMPONENTS });
+            }
+        }
+        Ok(())
+    }
+
+    /// Changes an instance's layout, re-attaching wires per `map` (old pin
+    /// → new pin; unmapped wired pins are detached).
+    pub(crate) fn reshape_instance(&mut self, id: ComponentId, kind: ComponentKind, map: &[Option<u8>]) {
+        let Some(old) = self.components.get(&id).map(|c| c.kind) else { return };
+        self.remap_pins(id, old.pin_count(), map);
+        self.index_kind(id, &old, false);
+        self.index_kind(id, &kind, true);
+        if let Some(c) = self.components.get_mut(&id) {
+            c.kind = kind;
+        }
+        self.follow_pins(id);
+    }
+
+    /// Stores definition `id` (see [`Edit::DefineMacro`]); returns the
+    /// root instances that changed and the definitions updated.
+    fn define_macro(
+        &mut self,
+        id: MacroId,
+        def: &Arc<MacroDef>,
+    ) -> Result<(Vec<ComponentId>, Vec<MacroId>), CircuitError> {
+        if self.body {
+            return Err(CircuitError::NotRoot);
+        }
+        let mut table = self.macros.clone();
+        let entry = table.evaluate(id, Arc::clone(def))?;
+        let old = table.get(id).cloned();
+        let new_shape = entry.shape;
+        let remap = old.as_ref().filter(|o| o.shape != new_shape).map(|o| pin_remap(&o.def, def));
+        let mut changed = vec![id];
+        table.insert(id, entry);
+        for anc in table.ancestors(id) {
+            let Some(cur) = table.get(anc).map(|e| Arc::clone(&e.def)) else { continue };
+            let next = match &remap {
+                Some(map) if cur.body.macro_index.contains_key(&id) => {
+                    let mut d = (*cur).clone();
+                    for inst in d.body.instances_of(id) {
+                        d.body.reshape_instance(inst, ComponentKind::Macro(new_shape), map);
+                    }
+                    d.body.log = crate::wiring::WireLog::default();
+                    Arc::new(d)
+                }
+                _ => cur,
+            };
+            let e = table.evaluate(anc, next)?;
+            table.insert(anc, e);
+            changed.push(anc);
+        }
+        // The whole design must still fit when flattened.
+        let mut size = self.prims;
+        for (d, insts) in &self.macro_index {
+            let per = table.get(*d).map_or(0, |e| e.flat);
+            size = size.saturating_add(per.saturating_mul(insts.len() as u64));
+        }
+        if size > MAX_FLAT_COMPONENTS {
+            return Err(CircuitError::MacroTooLarge { size, limit: MAX_FLAT_COMPONENTS });
+        }
+        self.macros = table;
+        let insts = self.instances_of(id);
+        if let Some(map) = &remap {
+            for &inst in &insts {
+                self.reshape_instance(inst, ComponentKind::Macro(new_shape), map);
+            }
+        }
+        changed.sort_unstable();
+        Ok((if remap.is_some() || old.is_none() { insts } else { Vec::new() }, changed))
+    }
+
+    fn remove_macro(&mut self, id: MacroId) -> Result<(), CircuitError> {
+        if self.body {
+            return Err(CircuitError::NotRoot);
+        }
+        self.macros.get(id).ok_or(CircuitError::NoSuchMacro(id))?;
+        if self.macro_index.contains_key(&id) || !self.macros.users(id).is_empty() {
+            return Err(CircuitError::MacroInUse(id));
+        }
+        self.macros.remove(id);
+        Ok(())
     }
 
     #[must_use]
@@ -308,7 +571,9 @@ impl Circuit {
         if !kind.is_valid() {
             return Err(CircuitError::InvalidComponent(id));
         }
+        self.check_macro_kind(id, &kind)?;
         self.next_component = self.next_component.checked_add(1).ok_or(CircuitError::IdSpaceExhausted)?;
+        self.index_kind(id, &kind, true);
         self.components.insert(id, Component { id, kind, pos, rotation });
         Ok(id)
     }
@@ -323,6 +588,7 @@ impl Circuit {
         let pins = self.components.get(&id).ok_or(CircuitError::NoSuchComponent(id))?.kind.pin_count();
         self.detach_pins(id, pins);
         let comp = self.components.remove(&id).ok_or(CircuitError::NoSuchComponent(id))?;
+        self.index_kind(id, &comp.kind, false);
         self.memories.remove(&id);
         Ok(comp)
     }
@@ -369,12 +635,17 @@ impl Circuit {
         }
         let c = self.components.get(&id).ok_or(CircuitError::NoSuchComponent(id))?;
         let same_pins = c.kind.input_count() == kind.input_count() && c.kind.output_count() == kind.output_count();
-        if (!same_pins || c.kind.tristate_outputs() != kind.tristate_outputs())
-            && self.has_wires(id, c.kind.pin_count())
-        {
+        if (!same_pins || c.kind.tristate_mask() != kind.tristate_mask()) && self.has_wires(id, c.kind.pin_count()) {
             return Err(CircuitError::InvalidComponent(id));
         }
+        let old = c.kind;
+        self.index_kind(id, &old, false);
+        let check = self.check_macro_kind(id, &kind);
+        self.index_kind(id, &old, true);
+        check?;
         self.pins_room(id)?;
+        self.index_kind(id, &old, false);
+        self.index_kind(id, &kind, true);
         if let Some(c) = self.components.get_mut(&id) {
             c.kind = kind;
         }
@@ -447,6 +718,7 @@ impl Circuit {
         self.log = WireLog::default();
         let mut components = Vec::new();
         let mut memory = None;
+        let mut macros = Vec::new();
         let r = match edit {
             Edit::AddComponent { kind, pos, rotation } => {
                 self.add_component(*kind, *pos, *rotation).map(|id| components.push(id))
@@ -463,6 +735,11 @@ impl Circuit {
                 self.set_memory_word(*id, *addr, *value).map(|()| memory = Some(*id))
             }
             Edit::SetMemory { id, words } => self.set_memory(*id, words).map(|()| memory = Some(*id)),
+            Edit::DefineMacro { id, def } => self.define_macro(*id, def).map(|(insts, defs)| {
+                components = insts;
+                macros = defs;
+            }),
+            Edit::RemoveMacro(id) => self.remove_macro(*id).map(|()| macros.push(*id)),
         };
         let log = std::mem::take(&mut self.log);
         r?;
@@ -473,6 +750,7 @@ impl Circuit {
             pins: log.pins,
             memory,
             connectivity: edit.affects_netlist(),
+            macros,
         };
         a.segments.sort_unstable();
         a.segments.dedup();

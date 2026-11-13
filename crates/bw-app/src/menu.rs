@@ -19,6 +19,13 @@ pub enum MenuAction {
     StressTest,
     ToggleContinuousRepaint,
     Style(SymbolStyle),
+    CreateMacro,
+    NewMacro,
+    EditMacro,
+    UpLevel,
+    PartsCentre,
+    ImportMacro,
+    StressMacros,
 }
 
 const ITEMS: &[(&str, MenuAction)] = &[
@@ -35,6 +42,13 @@ const ITEMS: &[(&str, MenuAction)] = &[
     ("debug.repaint", MenuAction::ToggleContinuousRepaint),
     ("view.ansi", MenuAction::Style(SymbolStyle::Ansi)),
     ("view.iec", MenuAction::Style(SymbolStyle::Iec)),
+    ("macro.create", MenuAction::CreateMacro),
+    ("macro.new", MenuAction::NewMacro),
+    ("macro.edit", MenuAction::EditMacro),
+    ("macro.up", MenuAction::UpLevel),
+    ("macro.parts", MenuAction::PartsCentre),
+    ("macro.import", MenuAction::ImportMacro),
+    ("debug.stress_macros", MenuAction::StressMacros),
 ];
 
 pub struct NativeMenu {
@@ -124,6 +138,19 @@ fn build(ctx: &egui::Context) -> Result<NativeMenu, muda::Error> {
             &item("circuit.step", "Step", Some("F12")),
         ],
     )?;
+    let macros = Submenu::with_items(
+        "Macro",
+        true,
+        &[
+            &item("macro.create", "Create Macro from Selection…", Some("CmdOrCtrl+Shift+M")),
+            &item("macro.new", "New Macro", None),
+            &item("macro.edit", "Edit Macro", Some("CmdOrCtrl+E")),
+            &item("macro.up", "Up One Level", Some("CmdOrCtrl+Up")),
+            &PredefinedMenuItem::separator(),
+            &item("macro.parts", "Parts Centre", Some("CmdOrCtrl+Shift+P")),
+            &item("macro.import", "Import .bwmacro…", None),
+        ],
+    )?;
     let ansi = CheckMenuItem::with_id("view.ansi", "ANSI Symbols (distinctive shapes)", true, true, None);
     let iec = CheckMenuItem::with_id("view.iec", "IEC Symbols (rectangular)", true, false, None);
     let view = Submenu::with_items("View", true, &[&ansi, &iec])?;
@@ -132,10 +159,11 @@ fn build(ctx: &egui::Context) -> Result<NativeMenu, muda::Error> {
         true,
         &[
             &item("debug.stress", "Spawn Stress Test (100k components)", Some("CmdOrCtrl+Shift+T")),
+            &item("debug.stress_macros", "Spawn Macro Stress Test (2 500 nested cells)", None),
             &CheckMenuItem::with_id("debug.repaint", "Continuous Repaint", true, false, None),
         ],
     )?;
-    let menu = Menu::with_items(&[&app_menu, &file, &view, &circuit, &debug])?;
+    let menu = Menu::with_items(&[&app_menu, &file, &view, &circuit, &macros, &debug])?;
     menu.init_for_nsapp();
 
     let (tx, rx) = crossbeam_channel::unbounded();

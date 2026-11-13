@@ -444,7 +444,9 @@ impl Circuit {
     }
 
     fn is_tristate(&self, p: PinRef) -> bool {
-        self.components.get(&p.component).is_some_and(|c| c.kind.tristate_outputs())
+        self.components
+            .get(&p.component)
+            .is_some_and(|c| c.kind.output_tristate(p.pin.saturating_sub(c.kind.input_count())))
     }
 
     /// Checks the driver rule for a set of output pins on one net.
@@ -1003,6 +1005,42 @@ impl Circuit {
                 self.free_seg(s);
             }
             self.free_node(n);
+        }
+        self.cleanup(work);
+    }
+
+    /// Renumbers the wired pins of a component whose kind is about to
+    /// change: `map[old] = Some(new)` moves the pin's node to the new pin,
+    /// `None` detaches it (its segments go, dangling ends are trimmed).
+    pub(crate) fn remap_pins(&mut self, id: crate::ComponentId, old_pins: u8, map: &[Option<u8>]) {
+        let mut work = Vec::new();
+        let mut moved = Vec::new();
+        for pin in 0..old_pins {
+            let pr = PinRef { component: id, pin };
+            let Some(n) = self.pin_node(pr) else { continue };
+            match map.get(usize::from(pin)).copied().flatten() {
+                None => {
+                    for s in self.adj(n) {
+                        work.extend(self.segment(s).map(|sg| sg.other(n)));
+                        self.free_seg(s);
+                    }
+                    self.free_node(n);
+                }
+                Some(new) => {
+                    self.pin_node.remove(&pr);
+                    self.log.pins.push(pr);
+                    moved.push((n, new));
+                }
+            }
+        }
+        for (n, new) in moved {
+            let pr = PinRef { component: id, pin: new };
+            if let Some(w) = self.node_mut(n) {
+                w.pin = Some(pr);
+            }
+            self.pin_node.insert(pr, n);
+            self.log.pins.push(pr);
+            self.log.nodes.push(n);
         }
         self.cleanup(work);
     }

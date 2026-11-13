@@ -789,3 +789,99 @@ fn stress_frame_cost() {
         patch.iter().copied().fold(0.0, f64::max),
     );
 }
+
+/// Imports a built-in library part into `c`.
+fn import_part(c: &mut Circuit, key: &str) -> bw_core::MacroId {
+    let e = bw_io::library::builtin().iter().find(|e| e.key == key).unwrap();
+    let (defs, root) = c.macros().import_plan(&e.file.table, e.file.root).unwrap();
+    for (id, def) in defs {
+        c.apply(&Edit::DefineMacro { id, def }).unwrap();
+    }
+    root
+}
+
+/// Macro instances are drawn with their definition's mesh (automatic box
+/// and DIL template), appended to the atlas on demand; redefining a macro
+/// appends only its new mesh, and growing the atlas (many definitions)
+/// keeps the meshes already uploaded.
+#[test]
+fn renders_macro_bodies_and_dil_templates() {
+    let Some(g) = gpu() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let mut c = Circuit::new();
+    let ha = import_part(&mut c, "builtin/half-adder");
+    let dff = import_part(&mut c, "builtin/dual-dff");
+    let shape = |c: &Circuit, id| ComponentKind::Macro(c.macros().get(id).unwrap().shape);
+    let a = c.add_component(shape(&c, ha), GridPos::new(0, 0), Rotation::R0).unwrap();
+    let b = c.add_component(shape(&c, dff), GridPos::new(20, 0), Rotation::R0).unwrap();
+    let mut scene = Scene::build(&c, 1);
+    let (w, h) = (960u32, 640u32);
+    let t = Target::new(&g, w, h, 1);
+    let v = view(Vec2::new(14.0, 7.0), 30.0, w, h);
+    let at = |px: &[[u8; 4]], wx: f32, wy: f32| {
+        let s = v.camera.world_to_screen(Vec2::new(wx, wy), v.viewport_points);
+        px[(s.y as u32 * w + s.x as u32) as usize]
+    };
+    let mut r = CanvasRenderer::new(&g.device, FORMAT, 1);
+    r.sync_macros(&g.device, &g.queue, c.macros());
+    assert_eq!(r.macro_mesh_stats().0, c.macros().len());
+    let nets = Levels::new(&[(1, &[(a, 0)])]);
+    let _ = t.frame(&g, &mut r, &mut scene, &v, Some(&nets), true);
+    let px = t.read(&g);
+    if let Ok(dir) = std::env::var("BW_SYMBOL_PNG") {
+        let raw: Vec<u8> = px.iter().flatten().copied().collect();
+        image::RgbaImage::from_raw(w, h, raw).unwrap().save(std::path::Path::new(&dir).join("macros.png")).unwrap();
+    }
+    let ca = c.component(a).unwrap().clone();
+    let (aw, ah) = ca.kind.size();
+    // Auto box: filled body, input stubs at the pins, lit output stub (S = 1).
+    assert!(!is_grid(at(&px, aw as f32 / 2.0, 0.5)), "box outline/fill");
+    for pin in 0..2 {
+        let p = ca.pin_pos(pin).unwrap();
+        assert!(!is_grid(at(&px, p.x as f32 + 0.25, p.y as f32)), "input stub {pin}");
+    }
+    let s_out = ca.pin_pos(2).unwrap();
+    let lit = at(&px, s_out.x as f32 - 0.2, s_out.y as f32);
+    assert!(lit[1] > 200 && lit[0] < 120, "S output stub shows its high level {lit:?}");
+    assert!(is_grid(at(&px, aw as f32 + 1.5, ah as f32 / 2.0 + 0.5)), "nothing right of the box");
+    // DIL: 14 pins, 7 per side; every assigned pin has a stub at its pin
+    // position on either side, and the package notch is on top.
+    let cb = c.component(b).unwrap().clone();
+    let (bw, bh) = cb.kind.size();
+    assert_eq!(bh, 14);
+    for pin in 0..cb.kind.pin_count() {
+        let p = cb.pin_pos(pin).unwrap();
+        let dx = if p.x == 20 { 0.25 } else { -0.25 };
+        assert!(!is_grid(at(&px, p.x as f32 + dx, p.y as f32)), "DIL stub of pin {pin} at {p:?}");
+    }
+    assert!(!is_grid(at(&px, 21.0, 0.2)), "DIL top edge");
+    assert!(is_grid(at(&px, 20.0 + bw as f32 / 2.0, 0.4)), "DIL notch");
+
+    // Redefining the half adder (new name) rebuilds one mesh only.
+    let mut d = (**c.macros().def(ha).unwrap()).clone();
+    d.name = "HA".into();
+    let applied = c.apply(&Edit::DefineMacro { id: ha, def: std::sync::Arc::new(d) }).unwrap();
+    scene.apply(&c, &applied, 2);
+    r.sync_macros(&g.device, &g.queue, c.macros());
+    assert_eq!(r.macro_mesh_stats().0, 1);
+
+    // Many large definitions: the atlas grows on the GPU, old meshes stay.
+    let base = (**c.macros().def(dff).unwrap()).clone();
+    for i in 0..120 {
+        let mut d = base.clone();
+        d.name = format!("Copy {i} of a long name");
+        let id = c.macros().free_id().unwrap();
+        c.apply(&Edit::DefineMacro { id, def: std::sync::Arc::new(d) }).unwrap();
+    }
+    r.sync_macros(&g.device, &g.queue, c.macros());
+    assert!(r.macro_mesh_stats().1 > 1 << 16, "beyond the initial headroom");
+    let _ = t.frame(&g, &mut r, &mut scene, &v, Some(&nets), true);
+    let px2 = t.read(&g);
+    let p = cb.pin_pos(0).unwrap();
+    assert!(!is_grid(at(&px2, p.x as f32 + 0.25, p.y as f32)), "DIL mesh survives the atlas growth");
+    let s_out = c.component(a).unwrap().pin_pos(2).unwrap();
+    let lit = at(&px2, s_out.x as f32 - 0.2, s_out.y as f32);
+    assert!(lit[1] > 200, "half adder mesh survives the atlas growth {lit:?}");
+}

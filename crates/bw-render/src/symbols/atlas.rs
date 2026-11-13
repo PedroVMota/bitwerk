@@ -7,6 +7,13 @@ use std::sync::LazyLock;
 
 use super::{KIND_CODES, SymVertex, Symbol, SymbolKind, SymbolStyle, VARIANT_SLOTS};
 
+/// Start (in `u32` words) of the per-definition macro mesh table in the GPU
+/// info buffer: `(start, count)` of the mesh of definition `id` at
+/// `INFO_MACRO + 2 * id` (written by the renderer as definitions appear).
+pub const INFO_MACRO: usize = INFO_TABLE + (2 * KIND_CODES * VARIANT_SLOTS * 2) as usize;
+/// Macro mesh slots in the info buffer (one per possible definition id).
+pub const MACRO_SLOTS: usize = bw_core::MAX_MACRO_DEFS;
+
 /// Sub-range of the atlas vertex array.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MeshRange {
@@ -15,10 +22,11 @@ pub struct MeshRange {
 }
 
 /// Layout of the GPU info table (`u32` words), shared with the shaders:
-/// `[0, 17)` per-bucket base of the culled body list (written by the GPU),
-/// `[17, 34)` per-bucket vertex count of the indirect draws (max over input
+/// `[0, 19)` per-bucket base of the culled body list (written by the GPU),
+/// `[19, 38)` per-bucket vertex count of the indirect draws (max over input
 /// variants and styles), then `(start, count)` pairs indexed by
-/// `(style * KIND_CODES + code) * VARIANT_SLOTS + variant`.
+/// `(style * KIND_CODES + code) * VARIANT_SLOTS + variant`, then the macro
+/// table ([`INFO_MACRO`]).
 pub const INFO_BASE: usize = 0;
 pub const INFO_VCOUNT: usize = KIND_CODES as usize;
 pub const INFO_TABLE: usize = 2 * KIND_CODES as usize;
@@ -83,7 +91,9 @@ impl Atlas {
         for (&(kind, style), r) in &ranges {
             let Some(code) = kind.code() else { continue };
             let slots: Vec<u32> = match kind {
-                SymbolKind::Gate(..) | SymbolKind::FlipFlop(..) | SymbolKind::Memory(..) => vec![kind.variant()],
+                SymbolKind::Gate(..) | SymbolKind::FlipFlop(..) | SymbolKind::Memory(..) | SymbolKind::Tag(..) => {
+                    vec![kind.variant()]
+                }
                 // Single variant: fill every slot so any packing finds it.
                 _ => (0..VARIANT_SLOTS).collect(),
             };

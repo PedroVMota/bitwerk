@@ -48,8 +48,10 @@ pub struct BodyInstance {
     pub min: [f32; 2],
     pub size: [f32; 2],
     /// Packed: kind code (bits 0..8, see [`kind_code`]), mesh variant
-    /// (8..16: gate input count, flip-flop trigger, memory size) and
-    /// rotation (16..18); [`HIDDEN_KIND`] for a free slot. See [`body_kind`].
+    /// (8..16: gate input count, flip-flop trigger, memory size, tag
+    /// direction), rotation (16..18) and, for macro instances, the
+    /// definition id (18..32: its mesh in the per-definition table);
+    /// [`HIDDEN_KIND`] for a free slot. See [`body_kind`].
     pub kind: u32,
     /// First signal slot of the body's outputs (output `k` is `net + k`),
     /// or for an LED the signal slot driving it, or [`NO_NET`].
@@ -145,8 +147,15 @@ pub fn body_kind(c: &Component) -> u32 {
         Rotation::R270 => 3,
     };
     let sym = SymbolKind::of(&c.kind);
-    sym.code().unwrap_or(0) | ((sym.variant() & 0xff) << 8) | (rot << 16)
+    let def = match c.kind {
+        ComponentKind::Macro(s) => s.def.0.min(MAX_MACRO_SLOT) << 18,
+        _ => 0,
+    };
+    sym.code().unwrap_or(0) | ((sym.variant() & 0xff) << 8) | (rot << 16) | def
 }
+
+/// Largest macro definition id the packed body kind can hold (14 bits).
+pub const MAX_MACRO_SLOT: u32 = (1 << 14) - 1;
 
 /// Packed `kind` of a junction dot.
 #[must_use]
@@ -276,6 +285,12 @@ fn pick_driver(circuit: &Circuit, best: &mut Option<PinRef>, pin: Option<PinRef>
 }
 
 impl Scene {
+    /// Marks the scene as reflecting circuit `revision` (a scene that a
+    /// change elsewhere in the project did not affect).
+    pub fn set_revision(&mut self, revision: u64) {
+        self.revision = revision;
+    }
+
     fn empty(revision: u64) -> Self {
         Self {
             id: NEXT_SCENE_ID.fetch_add(1, Ordering::Relaxed),

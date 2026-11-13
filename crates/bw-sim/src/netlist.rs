@@ -19,9 +19,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use bw_core::{Circuit, ComponentId, ComponentKind, FfTrigger, FlipFlopType, GateOp, MemoryImage, MemoryType};
+use bw_core::{Circuit, ComponentId, ComponentKind, FfTrigger, FlipFlopType, GateOp, MemoryImage, MemoryType, TagDir};
 
 use crate::SimError;
+use crate::flatten::{CompileStats, Flat, FlattenCache, Local, NO_HANDLE};
 use crate::logic::{self, FfState, L0, L1, X, Z};
 
 /// Sentinel for "input pin not connected" (reads as Z).
@@ -46,7 +47,8 @@ enum NodeOp {
 
 #[derive(Debug, Clone, Copy)]
 struct FfCfg {
-    component: ComponentId,
+    /// Flat primitive index (see [`Hier`]).
+    prim: u32,
     ty: FlipFlopType,
     trigger: FfTrigger,
     preset_clear: bool,
@@ -54,7 +56,7 @@ struct FfCfg {
 
 #[derive(Debug, Clone)]
 struct MemCfg {
-    component: ComponentId,
+    prim: u32,
     ram: bool,
     addr_bits: u8,
     data_bits: u8,
@@ -64,7 +66,8 @@ struct MemCfg {
 
 /// Which output pins drive each net, for mapping net levels onto the
 /// renderer's per-pin signal slots: the drivers of net `n` are
-/// `pins[start[n]..start[n + 1]]`, as (component, output index).
+/// `pins[start[n]..start[n + 1]]`, as (component, output index) of the
+/// circuit being viewed (the root, or the body of one macro instance).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NetMap {
     pub start: Vec<u32>,
@@ -84,12 +87,24 @@ struct Hot {
     in_len: u8,
 }
 
+/// The hierarchy behind a flat netlist: instance scopes, each primitive's
+/// origin and the net of every net handle (inside views, error paths).
+#[derive(Debug)]
+pub struct Hier {
+    pub flat: Flat,
+    /// Node of each flat primitive (`NO_NET` for LEDs).
+    prim_node: Vec<u32>,
+    /// Net of each net handle (`NO_NET` if undriven).
+    handle_net: Vec<u32>,
+}
+
 /// Flat netlist.
 #[derive(Debug, Clone)]
 pub struct Netlist {
     hot: Vec<Hot>,
     op: Vec<NodeOp>,
-    node_comp: Vec<ComponentId>,
+    /// Flat primitive of each node.
+    node_prim: Vec<u32>,
     in_start: Vec<u32>,
     in_len: Vec<u8>,
     /// Flattened input net indices of all nodes (or [`NO_NET`]).
@@ -107,12 +122,15 @@ pub struct Netlist {
     /// CSR fan-out: nodes reading net `n` are `fanout[fan_start[n]..fan_start[n+1]]`.
     fan_start: Vec<u32>,
     fanout: Vec<u32>,
-    /// Component id → node index.
+    /// Root-level component id → node index.
     node_of: HashMap<ComponentId, u32>,
     /// Indices of clock nodes.
     clocks: Vec<u32>,
+    /// Initial level of switch nodes (by node).
+    src_init: Vec<u8>,
     ffs: Vec<FfCfg>,
     mems: Vec<MemCfg>,
+    hier: Arc<Hier>,
 }
 
 fn u32_of(n: usize) -> Result<u32, SimError> {
@@ -130,87 +148,98 @@ fn find(parent: &mut [u32], mut i: u32) -> u32 {
 }
 
 impl Netlist {
-    /// Compiles a circuit.
+    /// Compiles a circuit (flattening its macros) without a template cache.
+    ///
+    /// # Errors
+    /// Returns [`SimError::TooLarge`] if the circuit cannot be indexed with `u32`.
+    pub fn compile(circuit: &Circuit) -> Result<Self, SimError> {
+        Self::compile_cached(circuit, &mut FlattenCache::default()).map(|(n, _)| n)
+    }
+
+    /// Compiles a circuit, reusing cached definition templates.
     ///
     /// # Errors
     /// Returns [`SimError::TooLarge`] if the circuit cannot be indexed with `u32`.
     #[allow(clippy::too_many_lines, reason = "one linear compilation pass")]
-    pub fn compile(circuit: &Circuit) -> Result<Self, SimError> {
-        let n_guess = circuit.component_count();
+    pub fn compile_cached(circuit: &Circuit, cache: &mut FlattenCache) -> Result<(Self, CompileStats), SimError> {
+        let mut stats = CompileStats::default();
+        let mut flat = Flat::expand(circuit, cache, &mut stats)?;
+        let t0 = std::time::Instant::now();
+        let n_guess = flat.prims.len();
         let mut op = Vec::with_capacity(n_guess);
-        let mut node_comp = Vec::with_capacity(n_guess);
+        let mut node_prim = Vec::with_capacity(n_guess);
         let mut node_ins: Vec<u8> = Vec::with_capacity(n_guess);
         let mut out_start = Vec::with_capacity(n_guess + 1);
-        let mut node_of = HashMap::with_capacity(n_guess);
+        let mut node_of = HashMap::new();
+        let mut prim_node = vec![NO_NET; n_guess];
         let mut clocks = Vec::new();
+        let mut src_init = Vec::with_capacity(n_guess);
         let mut ffs = Vec::new();
         let mut mems = Vec::new();
         let mut drivers: u32 = 0;
 
         // Pass 1: nodes and their drivers.
-        for c in circuit.components() {
-            let this_op = match c.kind {
+        for (pi, p) in flat.prims.iter().enumerate() {
+            let prim = u32_of(pi)?;
+            let this_op = match p.kind {
                 ComponentKind::Gate { op, .. } => NodeOp::Gate(op),
                 ComponentKind::Not => NodeOp::Not,
                 ComponentKind::Switch { .. } => NodeOp::Switch,
                 ComponentKind::Clock { half_period } => NodeOp::Clock { half_period },
                 ComponentKind::TriState => NodeOp::TriState,
                 ComponentKind::FlipFlop { ty, trigger, preset_clear } => {
-                    ffs.push(FfCfg { component: c.id, ty, trigger, preset_clear });
+                    ffs.push(FfCfg { prim, ty, trigger, preset_clear });
                     NodeOp::FlipFlop(u32_of(ffs.len() - 1)?)
                 }
                 ComponentKind::Memory { ty, addr_bits, data_bits } => {
-                    let init = circuit.memory(c.id).unwrap_or_default();
-                    mems.push(MemCfg { component: c.id, ram: ty == MemoryType::Ram, addr_bits, data_bits, init });
+                    let init = p.mem.clone().unwrap_or_else(|| Arc::new(vec![0; p.kind.memory_words()]));
+                    mems.push(MemCfg { prim, ram: ty == MemoryType::Ram, addr_bits, data_bits, init });
                     NodeOp::Memory(u32_of(mems.len() - 1)?)
                 }
-                ComponentKind::Led => continue,
+                ComponentKind::Led | ComponentKind::Tag { .. } | ComponentKind::Macro(_) => continue,
             };
             let node = u32_of(op.len())?;
             if matches!(this_op, NodeOp::Clock { .. }) {
                 clocks.push(node);
             }
+            src_init.push(match p.kind {
+                ComponentKind::Switch { on } => u8::from(on),
+                _ => L0,
+            });
             op.push(this_op);
-            node_comp.push(c.id);
-            node_ins.push(c.kind.input_count());
-            node_of.insert(c.id, node);
+            node_prim.push(prim);
+            prim_node[pi] = node;
+            node_ins.push(p.kind.input_count());
+            if p.scope == 0 {
+                node_of.insert(p.id, node);
+            }
             out_start.push(drivers);
-            drivers = drivers.checked_add(u32::from(c.kind.output_count())).ok_or(SimError::TooLarge)?;
+            drivers = drivers.checked_add(u32::from(p.kind.output_count())).ok_or(SimError::TooLarge)?;
         }
         out_start.push(drivers);
         let n = op.len();
         let nd = drivers as usize;
 
-        // Pass 2: drivers on the same wire net (connected component of the
-        // wire graph) share a net; each input reads its net's first driver.
-        let driver_of = |pin: bw_core::PinRef| -> Option<u32> {
-            let node = *node_of.get(&pin.component)? as usize;
-            let k = pin.pin.checked_sub(node_ins[node])?;
-            let d = out_start[node] + u32::from(k);
-            (d < out_start[node + 1]).then_some(d)
-        };
+        // Pass 2: drivers whose pins share a (flattened) net share a net;
+        // each input reads its net's first driver.
         let mut parent: Vec<u32> = (0..drivers).collect();
-        let wire_nets = circuit.nets();
-        let mut first: HashMap<(ComponentId, u8), u32> = HashMap::with_capacity(wire_nets.pins.len());
-        for i in 0..wire_nets.len() {
-            let pins = wire_nets.net(i);
-            let mut root: Option<u32> = None;
-            for &p in pins {
-                let Some(d) = driver_of(p) else { continue };
-                match root {
-                    None => root = Some(d),
-                    Some(f) => {
-                        let (a, b) = (find(&mut parent, f), find(&mut parent, d));
-                        if a != b {
-                            parent[a.max(b) as usize] = a.min(b);
-                        }
-                    }
+        let mut first = vec![NO_NET; flat.handle_count()];
+        for node in 0..n {
+            let prim = node_prim[node] as usize;
+            let ps = flat.pin_start[prim] as usize + usize::from(node_ins[node]);
+            for d in out_start[node]..out_start[node + 1] {
+                let h = flat.pin_handle[ps + (d - out_start[node]) as usize];
+                if h == NO_HANDLE {
+                    continue;
                 }
-            }
-            let Some(r) = root else { continue };
-            for &p in pins {
-                if driver_of(p).is_none() {
-                    first.insert((p.component, p.pin), r);
+                let r = flat.find(h) as usize;
+                if first[r] == NO_NET {
+                    first[r] = d;
+                } else {
+                    let (a, b) = (find(&mut parent, first[r]), find(&mut parent, d));
+                    if a != b {
+                        parent[a.max(b) as usize] = a.min(b);
+                    }
                 }
             }
         }
@@ -252,21 +281,27 @@ impl Netlist {
                 if multi { net | BUS } else { net }
             })
             .collect();
+        // Net of every handle (views): the net of its set's first driver.
+        let mut handle_net = vec![NO_NET; flat.handle_count()];
+        for (h, slot) in handle_net.iter_mut().enumerate() {
+            let r = flat.find(u32_of(h)?) as usize;
+            if first[r] != NO_NET {
+                *slot = drv_net[first[r] as usize];
+            }
+        }
 
         // Pass 4: inputs of every node.
         let mut in_start = Vec::with_capacity(n);
         let mut in_len = Vec::with_capacity(n);
         let mut inputs: Vec<u32> = Vec::new();
-        for c in circuit.components() {
-            if !node_of.contains_key(&c.id) {
-                continue;
-            }
+        for node in 0..n {
             in_start.push(u32_of(inputs.len())?);
-            let count = c.kind.input_count();
+            let count = node_ins[node];
             in_len.push(count);
-            for pin in 0..count {
-                let net = first.get(&(c.id, pin)).map_or(NO_NET, |&d| drv_net[d as usize]);
-                inputs.push(net);
+            let ps = flat.pin_start[node_prim[node] as usize] as usize;
+            for pin in 0..usize::from(count) {
+                let h = flat.pin_handle[ps + pin];
+                inputs.push(if h == NO_HANDLE { NO_NET } else { handle_net[h as usize] });
             }
         }
 
@@ -304,25 +339,35 @@ impl Netlist {
                 in_len: in_len[i],
             })
             .collect();
-        Ok(Self {
-            hot,
-            op,
-            node_comp,
-            in_start,
-            in_len,
-            inputs,
-            out_start,
-            drv_net,
-            drv_tag,
-            net_drv_start,
-            net_drvs,
-            fan_start,
-            fanout,
-            node_of,
-            clocks,
-            ffs,
-            mems,
-        })
+        // The pin tables are only needed while compiling.
+        flat.pin_handle = Vec::new();
+        flat.pin_start = Vec::new();
+        stats.nets = nets;
+        stats.netlist = t0.elapsed();
+        Ok((
+            Self {
+                hot,
+                op,
+                node_prim,
+                in_start,
+                in_len,
+                inputs,
+                out_start,
+                drv_net,
+                drv_tag,
+                net_drv_start,
+                net_drvs,
+                fan_start,
+                fanout,
+                node_of,
+                clocks,
+                src_init,
+                ffs,
+                mems,
+                hier: Arc::new(Hier { flat, prim_node, handle_net }),
+            },
+            stats,
+        ))
     }
 
     #[must_use]
@@ -335,25 +380,108 @@ impl Netlist {
         self.op.len()
     }
 
-    /// Net driven by output `k` (0-based among the outputs) of a component.
+    /// The flattened hierarchy (scopes, primitive origins).
     #[must_use]
-    pub fn output_net(&self, id: ComponentId, k: u8) -> Option<u32> {
-        let node = *self.node_of.get(&id)? as usize;
-        let d = self.out_start[node] + u32::from(k);
-        (d < self.out_start[node + 1]).then(|| self.drv_net[d as usize])
+    pub fn hierarchy(&self) -> &Arc<Hier> {
+        &self.hier
     }
 
-    /// The drivers of every net as (component, output index).
+    /// Net driven by output `k` (0-based among the outputs) of a root-level
+    /// component.
     #[must_use]
-    pub fn net_map(&self) -> NetMap {
-        let mut drv_pin = vec![(ComponentId(u32::MAX), 0u8); self.drv_net.len()];
-        for (node, &comp) in self.node_comp.iter().enumerate() {
-            let (s, e) = (self.out_start[node], self.out_start[node + 1]);
-            for d in s..e {
-                drv_pin[d as usize] = (comp, u8::try_from(d - s).unwrap_or(u8::MAX));
+    pub fn output_net(&self, id: ComponentId, k: u8) -> Option<u32> {
+        self.view_output_net(&[], id, k)
+    }
+
+    /// Net of output `k` of component `id` as seen inside the instance at
+    /// `path` (`[]` = root): a primitive's output, a nested instance's
+    /// output port, or the net an `In` tag brings in.
+    #[must_use]
+    pub fn view_output_net(&self, path: &[ComponentId], id: ComponentId, k: u8) -> Option<u32> {
+        let h = &self.hier;
+        let s = h.flat.scope_of(path)?;
+        self.scope_output_net(s, id, k)
+    }
+
+    fn scope_output_net(&self, s: u32, id: ComponentId, k: u8) -> Option<u32> {
+        let h = &self.hier;
+        let sc = &h.flat.scopes[s as usize];
+        let net = match *sc.template.local.get(&id)? {
+            Local::Prim(j) => {
+                let node = *h.prim_node.get((sc.prim_base + j) as usize)?;
+                if node == NO_NET {
+                    return None;
+                }
+                let d = self.out_start[node as usize] + u32::from(k);
+                if d >= self.out_start[node as usize + 1] {
+                    return None;
+                }
+                self.drv_net[d as usize]
+            }
+            Local::Inst(j) => {
+                let inst = sc.template.insts.get(j as usize)?;
+                let cs = *h.flat.child.get(&(s, inst.id))?;
+                let port = usize::from(inst.inputs) + usize::from(k);
+                let ph = *h.flat.scopes[cs as usize].ports.get(port)?;
+                h.handle_net[ph as usize]
+            }
+            Local::Port(p) => {
+                if k != 0 || sc.template.port_dir.get(usize::from(p)) != Some(&TagDir::In) {
+                    return None;
+                }
+                let ph = *sc.ports.get(usize::from(p))?;
+                h.handle_net[ph as usize]
+            }
+        };
+        (net != NO_NET).then_some(net)
+    }
+
+    /// The output pins driving each net, as components of the circuit
+    /// viewed at instance `path` (`[]` = the root circuit). `None` if the
+    /// path does not exist in this compilation.
+    #[must_use]
+    pub fn view_map(&self, path: &[ComponentId]) -> Option<NetMap> {
+        let h = &self.hier;
+        let s = h.flat.scope_of(path)?;
+        let t = &h.flat.scopes[s as usize].template;
+        let mut pairs: Vec<(u32, ComponentId, u8)> = Vec::with_capacity(t.local.len());
+        let mut push_outputs = |id: ComponentId, outs: u8| {
+            for k in 0..outs {
+                if let Some(net) = self.scope_output_net(s, id, k) {
+                    pairs.push((net, id, k));
+                }
+            }
+        };
+        for p in &t.prims {
+            push_outputs(p.id, p.kind.output_count());
+        }
+        for i in &t.insts {
+            push_outputs(i.id, i.outputs);
+        }
+        for (&id, l) in &t.local {
+            if matches!(l, Local::Port(_)) {
+                push_outputs(id, 1);
             }
         }
-        NetMap { start: self.net_drv_start.clone(), pins: self.net_drvs.iter().map(|&d| drv_pin[d as usize]).collect() }
+        pairs.sort_unstable();
+        let nn = self.net_count();
+        let mut start = vec![0u32; nn + 1];
+        for &(net, ..) in &pairs {
+            if (net as usize) < nn {
+                start[net as usize + 1] += 1;
+            }
+        }
+        for i in 0..nn {
+            start[i + 1] += start[i];
+        }
+        let pins = pairs.into_iter().filter(|&(net, ..)| (net as usize) < nn).map(|(_, id, k)| (id, k)).collect();
+        Some(NetMap { start, pins })
+    }
+
+    /// The drivers of every net as root-level (component, output index).
+    #[must_use]
+    pub fn net_map(&self) -> NetMap {
+        self.view_map(&[]).unwrap_or_default()
     }
 
     fn drivers_of(&self, net: u32) -> &[u32] {
@@ -365,6 +493,15 @@ impl Netlist {
     fn node_of_driver(&self, d: u32) -> usize {
         // out_start is sorted: the node is the last start <= d.
         self.out_start.partition_point(|&s| s <= d).saturating_sub(1)
+    }
+
+    /// Instance path + id of a node's primitive.
+    fn node_path(&self, node: usize) -> Vec<ComponentId> {
+        self.hier.flat.prim_path(self.node_prim.get(node).copied().unwrap_or(u32::MAX) as usize)
+    }
+
+    fn node_place(&self, node: usize) -> String {
+        self.hier.flat.describe(self.node_prim.get(node).copied().unwrap_or(u32::MAX) as usize)
     }
 }
 
@@ -422,16 +559,11 @@ pub fn packed_level(packed: &[u32], i: usize) -> u8 {
 
 impl SimState {
     #[must_use]
-    pub fn new(net: Netlist, circuit: &Circuit) -> Self {
+    pub fn new(net: Netlist, _circuit: &Circuit) -> Self {
         let n = net.node_count();
         let nn = net.net_count();
         let nd = net.drv_net.len();
-        let mut src = vec![L0; n];
-        for c in circuit.components() {
-            if let (ComponentKind::Switch { on }, Some(&i)) = (c.kind, net.node_of.get(&c.id)) {
-                src[i as usize] = u8::from(on);
-            }
-        }
+        let src = net.src_init.clone();
         let ff = vec![FfState::RESET; net.ffs.len()];
         let mem = net.mems.iter().map(|m| MemState { words: m.init.to_vec(), generation: 0 }).collect();
         Self {
@@ -484,19 +616,21 @@ impl SimState {
     /// an earlier compilation (matched by component id and compatible
     /// parameters), so that editing a running circuit does not wipe them.
     pub fn transfer_from(&mut self, old: &Self) {
-        let old_ff: HashMap<ComponentId, (FlipFlopType, FfState)> =
-            old.net.ffs.iter().zip(&old.ff).map(|(c, s)| (c.component, (c.ty, *s))).collect();
+        // Matched by full instance path + component id.
+        let path = |net: &Netlist, prim: u32| net.hier.flat.prim_path(prim as usize);
+        let old_ff: HashMap<Vec<ComponentId>, (FlipFlopType, FfState)> =
+            old.net.ffs.iter().zip(&old.ff).map(|(c, s)| (path(&old.net, c.prim), (c.ty, *s))).collect();
         for (cfg, st) in self.net.ffs.iter().zip(&mut self.ff) {
-            if let Some(&(ty, s)) = old_ff.get(&cfg.component) {
+            if let Some(&(ty, s)) = old_ff.get(&path(&self.net, cfg.prim)) {
                 if ty == cfg.ty {
                     *st = FfState { clk: X, ..s };
                 }
             }
         }
-        let old_mem: HashMap<ComponentId, (usize, u8)> =
-            old.net.mems.iter().enumerate().map(|(i, m)| (m.component, (i, m.data_bits))).collect();
+        let old_mem: HashMap<Vec<ComponentId>, (usize, u8)> =
+            old.net.mems.iter().enumerate().map(|(i, m)| (path(&old.net, m.prim), (i, m.data_bits))).collect();
         for (i, cfg) in self.net.mems.iter().enumerate() {
-            if let Some(&(j, bits)) = old_mem.get(&cfg.component) {
+            if let Some(&(j, bits)) = old_mem.get(&path(&self.net, cfg.prim)) {
                 if bits == cfg.data_bits && old.mem[j].words.len() == self.mem[i].words.len() {
                     self.mem[i].words.clone_from(&old.mem[j].words);
                     self.mem[i].generation = old.mem[j].generation + 1;
@@ -803,7 +937,11 @@ impl SimState {
                 let node = self.pending.first().copied().unwrap_or(0) as usize;
                 let net = self.net.drv_net.get(self.net.out_start[node] as usize).copied().unwrap_or(0);
                 self.pending.clear();
-                return Err(SimError::RaceCondition { net });
+                return Err(SimError::RaceCondition {
+                    net,
+                    path: self.net.node_path(node),
+                    place: self.net.node_place(node),
+                });
             }
             // Phase 1: evaluate all pending nodes against current values.
             self.changes.clear();
@@ -876,10 +1014,11 @@ impl SimState {
             let active: Vec<u32> =
                 self.net.drivers_of(net).iter().copied().filter(|&d| self.drv[d as usize] <= L1).collect();
             if active.len() > 1 {
-                let mut drivers: Vec<ComponentId> =
-                    active.iter().map(|&d| self.net.node_comp[self.net.node_of_driver(d)]).collect();
-                drivers.dedup();
-                return Err(SimError::BusContention { net, drivers });
+                let mut nodes: Vec<usize> = active.iter().map(|&d| self.net.node_of_driver(d)).collect();
+                nodes.dedup();
+                let drivers = nodes.iter().map(|&n| self.net.node_path(n)).collect();
+                let place = nodes.iter().map(|&n| self.net.node_place(n)).collect::<Vec<_>>().join(" and ");
+                return Err(SimError::BusContention { net, drivers, place });
             }
         }
         Ok(())

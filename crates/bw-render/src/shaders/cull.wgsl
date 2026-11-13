@@ -20,24 +20,24 @@ struct DrawArgs {
     first_instance: u32,
 };
 
-// Body buckets (kind codes: 16 component kinds + junction dots) and columns
-// (buckets + wires).
-const NB: u32 = 17u;
-const NCOL: u32 = 18u;
+// Body buckets (kind codes: 16 primitive kinds, macro tags, macro instances,
+// junction dots) and columns (buckets + wires).
+const NB: u32 = 19u;
+const NCOL: u32 = 20u;
 const NONE: u32 = 0xffffu;
-// sym_info layout (symbols/atlas.rs): [0, 17) bucket bases, [17, 34) vertex
+// sym_info layout (symbols/atlas.rs): [0, 19) bucket bases, [19, 38) vertex
 // counts of the per-bucket symbol draws.
-const INFO_VCOUNT: u32 = 17u;
+const INFO_VCOUNT: u32 = 19u;
 // The junction bucket is last; far-zoom quads leave it out (dots are only
 // drawn as symbols).
-const JUNCTION_BUCKET: u32 = 16u;
+const JUNCTION_BUCKET: u32 = 18u;
 
 @group(1) @binding(0) var<storage, read> c_bodies: array<Body>;
 @group(1) @binding(1) var<storage, read> c_wires: array<Wire>;
 @group(1) @binding(2) var<storage, read_write> c_vis_bodies: array<u32>;
 @group(1) @binding(3) var<storage, read_write> c_vis_wires: array<u32>;
 // [0] all bodies as quads, [1] wires, [2 + b] symbols of bucket b.
-@group(1) @binding(4) var<storage, read_write> c_args: array<DrawArgs, 19>;
+@group(1) @binding(4) var<storage, read_write> c_args: array<DrawArgs, 21>;
 // Column-major: [col * cull_groups + group] counts, replaced by offsets.
 @group(1) @binding(5) var<storage, read_write> c_groups: array<u32>;
 @group(1) @binding(6) var<storage, read_write> c_info: array<u32>;

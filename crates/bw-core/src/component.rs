@@ -16,6 +16,128 @@ pub const DATA_WIDTHS: [u8; 5] = [1, 2, 4, 8, 16];
 /// Largest memory in words (`2^MAX_ADDR_BITS`).
 pub const MAX_MEMORY_WORDS: usize = 1 << MAX_ADDR_BITS;
 
+/// Largest DIL package (pins).
+pub const MAX_DIL_PINS: usize = 28;
+/// DIL package sizes a macro template may use.
+pub const DIL_SIZES: [u8; 7] = [8, 14, 16, 18, 20, 24, 28];
+/// Maximum inputs (and, separately, outputs) of a macro.
+pub const MAX_MACRO_SIDE_PINS: u8 = 32;
+/// Body width limits of a macro instance (grid units).
+pub const MIN_MACRO_WIDTH: u8 = 4;
+pub const MAX_MACRO_WIDTH: u8 = 32;
+
+/// Stable identifier of a macro definition in a project's definition table
+/// (see [`crate::MacroTable`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct MacroId(pub u32);
+
+/// Direction of a macro tag (an interface pin of a macro definition), seen
+/// from outside the macro: an `In` tag brings a signal into the body (it
+/// drives the inner net), an `Out` tag takes one out (it reads the inner
+/// net).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TagDir {
+    In,
+    Out,
+}
+
+/// The pin layout of a macro instance, derived from its definition (see
+/// [`crate::MacroDef::shape`]). Kept in the component kind so pin geometry
+/// stays a pure function of the kind; the definition table keeps every
+/// instance's shape in sync when a definition changes.
+///
+/// On disk only the definition id is stored; the loader resolves the rest
+/// from the definitions table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MacroShape {
+    pub def: MacroId,
+    pub inputs: u8,
+    pub outputs: u8,
+    /// Body width in grid units.
+    pub width: u8,
+    /// 0 = automatic box (inputs left, outputs right); otherwise the pin
+    /// count of a DIL package.
+    pub dil: u8,
+    /// Bit `k` set: output `k` is tri-state (may share a bus).
+    pub tristate: u32,
+    /// DIL package pin number (1-based) of each instance pin (inputs, then
+    /// outputs); unused for the automatic box.
+    pub dil_pins: [u8; MAX_DIL_PINS],
+}
+
+impl MacroShape {
+    /// A shape that only names its definition (as read from a file, before
+    /// the loader resolves it); never valid on its own.
+    #[must_use]
+    pub const fn unresolved(def: MacroId) -> Self {
+        Self { def, inputs: 0, outputs: 0, width: 0, dil: 0, tristate: 0, dil_pins: [0; MAX_DIL_PINS] }
+    }
+
+    /// Body height in grid units.
+    #[must_use]
+    pub const fn height(&self) -> i32 {
+        if self.dil > 0 {
+            self.dil as i32
+        } else {
+            let rows = if self.inputs > self.outputs { self.inputs } else { self.outputs };
+            2 * if rows == 0 { 1 } else { rows as i32 }
+        }
+    }
+
+    /// Internal consistency (not that it matches its definition).
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        let pins = self.inputs as usize + self.outputs as usize;
+        if self.inputs > MAX_MACRO_SIDE_PINS || self.outputs > MAX_MACRO_SIDE_PINS {
+            return false;
+        }
+        if self.width < MIN_MACRO_WIDTH || self.width > MAX_MACRO_WIDTH || self.width % 2 != 0 {
+            return false;
+        }
+        if self.outputs < 32 && self.tristate >> self.outputs != 0 {
+            return false;
+        }
+        if self.dil == 0 {
+            return true;
+        }
+        let mut ok_size = false;
+        let mut i = 0;
+        while i < DIL_SIZES.len() {
+            if DIL_SIZES[i] == self.dil {
+                ok_size = true;
+            }
+            i += 1;
+        }
+        if !ok_size || pins > self.dil as usize {
+            return false;
+        }
+        // Every pin has a distinct package pin number in 1..=dil.
+        let mut seen = 0u32;
+        let mut k = 0;
+        while k < pins {
+            let n = self.dil_pins[k];
+            if n == 0 || n > self.dil || seen & (1 << n) != 0 {
+                return false;
+            }
+            seen |= 1 << n;
+            k += 1;
+        }
+        true
+    }
+}
+
+impl Serialize for MacroShape {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.def.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for MacroShape {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        MacroId::deserialize(d).map(Self::unresolved)
+    }
+}
+
 /// Stable identifier of a component inside a [`crate::Circuit`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ComponentId(pub u32);
@@ -200,6 +322,13 @@ pub enum ComponentKind {
     /// RAM or ROM with `2^addr_bits` words of `data_bits` bits. Tri-state
     /// data outputs, active-low chip select and (RAM) R/W̅.
     Memory { ty: MemoryType, addr_bits: u8, data_bits: u8 },
+    /// Interface pin of a macro definition (only meaningful inside a
+    /// definition's body): an `In` tag has one output (it drives the inner
+    /// net from the instance's input pin), an `Out` tag one input. A
+    /// tri-state `Out` tag makes the instance's output tri-state.
+    Tag { dir: TagDir, tristate: bool },
+    /// An instance of a macro definition (a reference, not a copy).
+    Macro(MacroShape),
 }
 
 /// Where a pin sits on the body edge (unrotated).
@@ -228,21 +357,23 @@ impl ComponentKind {
     pub const fn input_count(&self) -> u8 {
         match self {
             Self::Gate { inputs, .. } => *inputs,
-            Self::Not | Self::Led => 1,
-            Self::Switch { .. } | Self::Clock { .. } => 0,
+            Self::Not | Self::Led | Self::Tag { dir: TagDir::Out, .. } => 1,
+            Self::Switch { .. } | Self::Clock { .. } | Self::Tag { dir: TagDir::In, .. } => 0,
             Self::TriState => 2,
             Self::FlipFlop { ty, preset_clear, .. } => ty.sync_inputs() + if *preset_clear { 2 } else { 0 },
             Self::Memory { ty: MemoryType::Ram, addr_bits, data_bits } => *addr_bits + *data_bits + 2,
             Self::Memory { ty: MemoryType::Rom, addr_bits, .. } => *addr_bits + 1,
+            Self::Macro(m) => m.inputs,
         }
     }
 
     #[must_use]
     pub const fn output_count(&self) -> u8 {
         match self {
-            Self::Led => 0,
+            Self::Led | Self::Tag { dir: TagDir::Out, .. } => 0,
             Self::FlipFlop { .. } => 2,
             Self::Memory { data_bits, .. } => *data_bits,
+            Self::Macro(m) => m.outputs,
             _ => 1,
         }
     }
@@ -252,11 +383,39 @@ impl ComponentKind {
         self.input_count() + self.output_count()
     }
 
-    /// Is output `k` (0-based among the outputs) a tri-state output, which
-    /// may share a net with other tri-state outputs?
+    /// Are all outputs tri-state outputs (which may share a net with other
+    /// tri-state outputs)? See [`Self::output_tristate`] for macros, whose
+    /// outputs differ.
     #[must_use]
     pub const fn tristate_outputs(&self) -> bool {
         matches!(self, Self::TriState | Self::Memory { .. })
+    }
+
+    /// Is output `k` (0-based among the outputs) a tri-state output?
+    #[must_use]
+    pub const fn output_tristate(&self, k: u8) -> bool {
+        match self {
+            Self::TriState | Self::Memory { .. } => true,
+            Self::Macro(m) => k < 32 && m.tristate & (1 << k) != 0,
+            _ => false,
+        }
+    }
+
+    /// Tri-state outputs as a bit mask (bit `k` = output `k`).
+    #[must_use]
+    pub const fn tristate_mask(&self) -> u32 {
+        match self {
+            Self::TriState => 1,
+            Self::Memory { data_bits, .. } => {
+                if *data_bits >= 32 {
+                    u32::MAX
+                } else {
+                    (1u32 << *data_bits) - 1
+                }
+            }
+            Self::Macro(m) => m.tristate,
+            _ => 0,
+        }
     }
 
     /// Body size in grid units (width, height), unrotated.
@@ -264,7 +423,7 @@ impl ComponentKind {
     pub const fn size(&self) -> (i32, i32) {
         match self {
             Self::Gate { inputs, .. } => (4, 2 * (*inputs as i32)),
-            Self::Not => (4, 2),
+            Self::Not | Self::Tag { .. } => (4, 2),
             Self::Switch { .. } | Self::Clock { .. } | Self::Led => (2, 2),
             Self::TriState => (4, 3),
             Self::FlipFlop { ty, .. } => {
@@ -276,6 +435,7 @@ impl ComponentKind {
                 let outs = self.output_count() as i32;
                 (8, 2 * if ins > outs { ins } else { outs })
             }
+            Self::Macro(m) => (m.width as i32, m.height()),
         }
     }
 
@@ -291,7 +451,10 @@ impl ComponentKind {
             Self::Memory { addr_bits, data_bits, .. } => {
                 *addr_bits >= MIN_ADDR_BITS && *addr_bits <= MAX_ADDR_BITS && data_width_index(*data_bits).is_some()
             }
-            Self::Not | Self::Switch { .. } | Self::Led | Self::TriState | Self::FlipFlop { .. } => true,
+            Self::Macro(m) => m.is_valid(),
+            Self::Not | Self::Switch { .. } | Self::Led | Self::TriState | Self::FlipFlop { .. } | Self::Tag { .. } => {
+                true
+            }
         }
     }
 
@@ -308,6 +471,9 @@ impl ComponentKind {
             Self::FlipFlop { ty: FlipFlopType::Rs, .. } => "RS-FF",
             Self::FlipFlop { ty: FlipFlopType::Jk, .. } => "JK-FF",
             Self::Memory { ty, .. } => ty.name(),
+            Self::Tag { dir: TagDir::In, .. } => "In tag",
+            Self::Tag { dir: TagDir::Out, .. } => "Out tag",
+            Self::Macro(_) => "Macro",
         }
     }
 
@@ -353,13 +519,20 @@ impl ComponentKind {
                     (w, h - 1)
                 }
             }
-            Self::Memory { .. } => {
+            Self::Macro(m) if m.dil > 0 => {
+                let n = i32::from(m.dil_pins[usize::from(pin)]);
+                let half = i32::from(m.dil) / 2;
+                if n <= half { (0, 2 * n - 1) } else { (w, 2 * (i32::from(m.dil) - n) + 1) }
+            }
+            Self::Memory { .. } | Self::Macro(_) => {
                 if pin < ins {
                     (0, row(pin))
                 } else {
                     (w, row(pin - ins))
                 }
             }
+            Self::Tag { dir: TagDir::In, .. } => (w, 1),
+            Self::Tag { dir: TagDir::Out, .. } => (0, 1),
             _ => {
                 if pin < ins {
                     (0, row(pin))
@@ -403,7 +576,17 @@ impl ComponentKind {
                     "out".into()
                 }
             }
-            Self::Switch { .. } | Self::Clock { .. } => "out".into(),
+            Self::Switch { .. } | Self::Clock { .. } | Self::Tag { dir: TagDir::In, .. } => "out".into(),
+            Self::Tag { dir: TagDir::Out, .. } => "in".into(),
+            Self::Macro(m) => {
+                if pin < ins {
+                    format!("in{pin}")
+                } else if m.dil > 0 {
+                    format!("out{} (pin {})", pin - ins, m.dil_pins[usize::from(pin)])
+                } else {
+                    format!("out{}", pin - ins)
+                }
+            }
             Self::TriState => ["IN", "EN", "OUT"][usize::from(pin.min(2))].into(),
             Self::FlipFlop { ty, .. } => {
                 let sync = ty.sync_inputs();

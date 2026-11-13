@@ -34,7 +34,7 @@ use std::f32::consts::PI;
 
 use bw_core::{
     ComponentKind, DATA_WIDTHS, FfTrigger, FlipFlopType, GateOp, MAX_ADDR_BITS, MIN_ADDR_BITS, MIN_GATE_INPUTS,
-    MemoryType, PinDir, data_width_index,
+    MacroDef, MacroShape, MemoryType, PinDir, TagDir, data_width_index,
 };
 
 pub use atlas::{Atlas, MeshRange, atlas};
@@ -185,6 +185,13 @@ pub enum SymbolKind {
     FlipFlop(FlipFlopType, FfTrigger, bool),
     /// Type, address lines, data bits.
     Memory(MemoryType, u8, u8),
+    /// Macro tag (interface pin inside a definition): direction, tri-state.
+    Tag(TagDir, bool),
+    /// Macro instance / generic IC. Instances are drawn with their own
+    /// definition's mesh ([`macro_symbol`], appended to the GPU atlas when
+    /// the definition appears or changes); the static mesh is a generic IC
+    /// box used for icons.
+    Macro,
     // ---- not simulated yet (symbol only) ----
     SevenSegment,
     NumericOutput,
@@ -192,18 +199,20 @@ pub enum SymbolKind {
     Ground,
     SequenceGenerator,
     InteractiveInput,
-    /// Generic macro / IC (DIL-style box); [`Symbol::macro_ic`] builds named
-    /// variants with any pin count.
-    Macro,
     Text,
     /// Solder dot where three or more wires meet (drawn automatically, not
     /// a component; its own GPU bucket).
     Junction,
 }
 
-/// Number of GPU kind codes (see [`crate::kind_code`]): the 16 component
-/// kinds plus the junction dot.
-pub const KIND_CODES: u32 = 17;
+/// Number of GPU kind codes (see [`crate::kind_code`]): the 16 primitive
+/// component kinds, macro tags, macro instances and the junction dot.
+pub const KIND_CODES: u32 = 19;
+/// Kind code of macro instances (their mesh comes from the per-definition
+/// table, see `symbols::atlas::INFO_MACRO`).
+pub const MACRO_CODE: u32 = 17;
+/// Kind code of junction dots (the last bucket).
+pub const JUNCTION_CODE: u32 = 18;
 /// Variant slots per kind in the GPU mesh table: the gate input count, the
 /// flip-flop trigger + preset/clear, or the memory size (see
 /// [`SymbolKind::variant`]); 8 bits of the packed instance kind.
@@ -219,14 +228,13 @@ pub fn memory_variant(addr_bits: u8, data_bits: u8) -> u32 {
 
 impl SymbolKind {
     /// Symbols of components that are not simulated yet.
-    pub const FUTURE: [Self; 8] = [
+    pub const FUTURE: [Self; 7] = [
         Self::SevenSegment,
         Self::NumericOutput,
         Self::Vcc,
         Self::Ground,
         Self::SequenceGenerator,
         Self::InteractiveInput,
-        Self::Macro,
         Self::Text,
     ];
 
@@ -243,6 +251,8 @@ impl SymbolKind {
             ComponentKind::TriState => Self::TriState,
             ComponentKind::FlipFlop { ty, trigger, preset_clear } => Self::FlipFlop(ty, trigger, preset_clear),
             ComponentKind::Memory { ty, addr_bits, data_bits } => Self::Memory(ty, addr_bits, data_bits),
+            ComponentKind::Tag { dir, tristate } => Self::Tag(dir, tristate && dir == TagDir::Out),
+            ComponentKind::Macro(_) => Self::Macro,
         }
     }
 
@@ -274,6 +284,8 @@ impl SymbolKind {
                 }
             }
         }
+        v.extend([Self::Tag(TagDir::In, false), Self::Tag(TagDir::Out, false), Self::Tag(TagDir::Out, true)]);
+        v.push(Self::Macro);
         v.push(Self::Junction);
         v.extend(Self::FUTURE);
         v
@@ -287,6 +299,7 @@ impl SymbolKind {
             Self::Gate(_, n) => u32::from(n),
             Self::FlipFlop(_, trigger, pc) => u32::from(trigger.index()) | (u32::from(pc) << 2),
             Self::Memory(_, a, d) => memory_variant(a, d),
+            Self::Tag(TagDir::Out, tri) => 1 + u32::from(tri),
             _ => 0,
         }
     }
@@ -318,7 +331,9 @@ impl SymbolKind {
             Self::FlipFlop(FlipFlopType::Jk, ..) => 13,
             Self::Memory(MemoryType::Ram, ..) => 14,
             Self::Memory(MemoryType::Rom, ..) => 15,
-            Self::Junction => 16,
+            Self::Tag(..) => 16,
+            Self::Macro => MACRO_CODE,
+            Self::Junction => JUNCTION_CODE,
             _ => return None,
         })
     }
@@ -350,6 +365,9 @@ impl SymbolKind {
             Self::SequenceGenerator => "Sequence generator",
             Self::InteractiveInput => "Interactive input",
             Self::Macro => "Macro / IC",
+            Self::Tag(TagDir::In, _) => "Macro tag (input)",
+            Self::Tag(TagDir::Out, false) => "Macro tag (output)",
+            Self::Tag(TagDir::Out, true) => "Macro tag (tri-state output)",
             Self::Junction => "Wire junction",
             Self::Text => "Text",
         }
@@ -372,6 +390,7 @@ impl SymbolKind {
             Self::Vcc => [0.95, 0.45, 0.35],
             Self::Ground => [0.60, 0.66, 0.75],
             Self::Macro => [0.78, 0.78, 0.84],
+            Self::Tag(..) => [0.95, 0.80, 0.35],
             Self::Junction => [0.45, 0.50, 0.58],
             Self::Text => [0.80, 0.82, 0.86],
         }
@@ -538,6 +557,40 @@ impl B {
         let pin = u8::try_from(self.outputs.len()).unwrap_or(u8::MAX);
         self.line(vec![[x_start, y], [w, y]], Role::PinOut, Width::Pin).pin = pin;
         self.outputs.push(SymPin { at: [w, y], dir: PinDir::Output });
+    }
+
+    /// Input pin on the right edge (DIL packages), stub from `x_start`.
+    fn input_right(&mut self, y: f32, x_start: f32) {
+        let w = self.size[0];
+        self.line(vec![[w, y], [x_start, y]], Role::PinIn, Width::Pin);
+        self.inputs.push(SymPin { at: [w, y], dir: PinDir::Input });
+    }
+
+    /// Output pin on the right edge with an explicit output index.
+    fn output_at(&mut self, y: f32, x_start: f32, k: u8) {
+        let w = self.size[0];
+        self.line(vec![[x_start, y], [w, y]], Role::PinOut, Width::Pin).pin = k;
+        self.outputs.push(SymPin { at: [w, y], dir: PinDir::Output });
+    }
+
+    /// Output pin on the left edge (DIL packages).
+    fn output_left(&mut self, y: f32, x_start: f32, k: u8) {
+        self.line(vec![[x_start, y], [0.0, y]], Role::PinOut, Width::Pin).pin = k;
+        self.outputs.push(SymPin { at: [0.0, y], dir: PinDir::Output });
+    }
+
+    /// Text stacked vertically (one upright glyph per line) centred on
+    /// `(cx, cy)`: names along the long axis of narrow DIL packages.
+    #[allow(clippy::cast_precision_loss)]
+    fn text_vertical(&mut self, s: &str, cx: f32, cy: f32, h: f32) {
+        let step = h * 1.35;
+        let n = s.chars().count();
+        let y0 = cy - step * (n as f32 - 1.0) / 2.0;
+        for (i, c) in s.chars().enumerate() {
+            if c != ' ' {
+                self.text(&c.to_string(), cx, y0 + step * i as f32, h);
+            }
+        }
     }
 
     fn finish(self) -> Symbol {
@@ -971,6 +1024,137 @@ fn text_note() -> Symbol {
     b.finish()
 }
 
+/// A macro tag: a flag pointing out of the body (input tags) or into it
+/// (output tags), filled with the level of its net; tri-state output tags
+/// carry a small ▽.
+fn tag(dir: TagDir, tristate: bool) -> Symbol {
+    let mut b = B::new(4.0, 2.0);
+    match dir {
+        TagDir::In => {
+            b.push(
+                vec![[0.2, 0.3], [2.6, 0.3], [3.3, 1.0], [2.6, 1.7], [0.2, 1.7]],
+                true,
+                Some(Role::State),
+                Some((Role::Outline, Width::Outline)),
+            );
+            b.output(1.0, 3.3);
+        }
+        TagDir::Out => {
+            b.input(1.0, 0.7);
+            b.push(
+                vec![[0.7, 1.0], [1.4, 0.3], [3.8, 0.3], [3.8, 1.7], [1.4, 1.7]],
+                true,
+                Some(Role::State),
+                Some((Role::Outline, Width::Outline)),
+            );
+            if tristate {
+                b.loop_line(vec![[2.2, 0.75], [3.2, 0.75], [2.7, 1.3]], Role::Text, Width::Thin);
+            }
+        }
+    }
+    b.finish()
+}
+
+/// Longest label that fits `w` units at cap height `h` (characters).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn fit_chars(w: f32, h: f32) -> usize {
+    ((w / (0.9 * h)).floor().max(1.0)) as usize
+}
+
+fn clip(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+/// The symbol of a macro definition's instances: the automatic box (inputs
+/// left, outputs right, name in the middle, pin names inside the edges) or
+/// a DIL package (notch, pin 1 dot, package pin numbers outside the body
+/// and pin names inside, unassigned package pins as short dim stubs).
+/// Pins match [`bw_core::ComponentKind::pin_offset`] for `shape`.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn macro_symbol(def: &MacroDef, shape: &MacroShape) -> Symbol {
+    let kind = ComponentKind::Macro(*shape);
+    let (w, h) = kind.size();
+    let (w, h) = (w as f32, h as f32);
+    let mut b = B::new(w, h);
+    let iface = def.interface();
+    let ins = usize::from(shape.inputs);
+    let name_of = |k: usize| iface.get(k).map_or(String::new(), |p| def.pins[p.index].name.clone());
+    let th = 0.55;
+    let (x0, x1) = (0.6, w - 0.6);
+    if shape.dil > 0 {
+        let mut body = vec![[x0, 0.2]];
+        path::join(&mut body, &arc([w / 2.0, 0.2], 0.45, PI, 0.0, 10));
+        path::join(&mut body, &[[x1, 0.2], [x1, h - 0.2], [x0, h - 0.2]]);
+        b.body(body);
+        b.dot([x0 + 0.45, 0.75], 0.12, Role::Outline);
+        let half = shape.dil / 2;
+        let at = |n: u8| -> (f32, bool) {
+            if n <= half { (2.0 * f32::from(n) - 1.0, true) } else { (2.0 * f32::from(shape.dil - n) + 1.0, false) }
+        };
+        let used: Vec<u8> = shape.dil_pins[..ins + usize::from(shape.outputs)].to_vec();
+        for n in 1..=shape.dil {
+            if !used.contains(&n) {
+                let (y, left) = at(n);
+                let (a, z) = if left { ([0.25, y], [x0, y]) } else { ([w - 0.25, y], [x1, y]) };
+                b.line(vec![a, z], Role::Outline, Width::Thin);
+            }
+            let (y, left) = at(n);
+            let nx = if left { x0 + 0.55 } else { x1 - 0.55 };
+            b.text(&n.to_string(), nx, y - 0.55, 0.38);
+        }
+        let room = fit_chars(w / 2.0 - 1.4, th);
+        for (k, &n) in used.iter().enumerate() {
+            let (y, left) = at(n);
+            let out = k >= ins;
+            match (left, out) {
+                (true, false) => b.input(y, x0),
+                (false, false) => b.input_right(y, x1),
+                (true, true) => b.output_left(y, x0, u8::try_from(k - ins).unwrap_or(0)),
+                (false, true) => b.output_at(y, x1, u8::try_from(k - ins).unwrap_or(0)),
+            }
+            let label = clip(&name_of(k), room);
+            let lw = font::text_width(label.chars().count(), th);
+            let cx = if left { x0 + 0.35 + lw / 2.0 } else { x1 - 0.35 - lw / 2.0 };
+            b.text(&label, cx, y + 0.3, th);
+        }
+        // The name runs down the middle, between the two label columns.
+        let nh = 0.55f32;
+        let fit = ((h - 1.0) / (nh * 1.35)).floor().max(1.0);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let name = clip(&def.name, fit as usize);
+        b.text_vertical(&name, w / 2.0, h / 2.0, nh);
+    } else {
+        b.body(rect(x0, 0.2, x1, h - 0.2));
+        let room = fit_chars(w / 2.0 - 1.0, th);
+        let mut lw_in = 0.0f32;
+        let mut lw_out = 0.0f32;
+        for k in 0..ins {
+            let y = 2.0 * k as f32 + 1.0;
+            b.input(y, x0);
+            let label = clip(&name_of(k), room);
+            let lw = font::text_width(label.chars().count(), th);
+            lw_in = lw_in.max(lw);
+            b.text(&label, x0 + 0.35 + lw / 2.0, y, th);
+        }
+        for k in 0..usize::from(shape.outputs) {
+            let y = 2.0 * k as f32 + 1.0;
+            b.output(y, x1);
+            let label = clip(&name_of(ins + k), room);
+            let lw = font::text_width(label.chars().count(), th);
+            lw_out = lw_out.max(lw);
+            b.text(&label, x1 - 0.35 - lw / 2.0, y, th);
+        }
+        // Name in the space between the two label columns.
+        let (l, r) = (x0 + 0.7 + lw_in, x1 - 0.7 - lw_out);
+        let n = def.name.chars().count().max(1) as f32;
+        let nh = 0.65f32.min((r - l).max(0.5) / (0.9 * n)).max(0.3);
+        let label = clip(&def.name, fit_chars((r - l).max(0.5), nh));
+        b.text(&label, f32::midpoint(l, r), h / 2.0, nh);
+    }
+    b.finish()
+}
+
 impl Symbol {
     /// The symbol of `kind` in `style`.
     #[must_use]
@@ -991,6 +1175,7 @@ impl Symbol {
             SymbolKind::SequenceGenerator => sequence_generator(),
             SymbolKind::InteractiveInput => interactive_input(),
             SymbolKind::Macro => Self::macro_ic("IC", 4, 4),
+            SymbolKind::Tag(dir, tri) => tag(dir, tri),
             SymbolKind::Junction => junction(),
             SymbolKind::Text => text_note(),
         }
@@ -1125,6 +1310,38 @@ mod tests {
                 assert_eq!(outs, expect, "{kind:?} output stub indices");
             }
         }
+    }
+
+    /// Macro symbols (automatic box and DIL, every built-in part) put each
+    /// pin stub exactly on the pin `bw-core` computes for the shape, and the
+    /// GPU constant of the macro table matches the atlas layout.
+    #[test]
+    #[allow(clippy::cast_precision_loss, clippy::float_cmp)]
+    fn macro_symbols_match_core_pins() {
+        for e in bw_io::library::builtin() {
+            let entry = e.file.table.get(e.file.root).unwrap();
+            let shape = entry.shape;
+            let kind = ComponentKind::Macro(shape);
+            let comp = Component { id: ComponentId(0), kind, pos: GridPos::new(0, 0), rotation: Rotation::R0 };
+            let sym = macro_symbol(&entry.def, &shape);
+            let (w, h) = kind.size();
+            assert_eq!(sym.size, [w as f32, h as f32], "{}", e.key);
+            assert_eq!(sym.pins.len(), usize::from(kind.pin_count()), "{}", e.key);
+            for (i, p) in sym.pins.iter().enumerate() {
+                let i = u8::try_from(i).unwrap();
+                let (lx, ly) = comp.pin_local_offset(i).unwrap();
+                assert_eq!(p.at, [lx as f32, ly as f32], "{} pin {i}", e.key);
+                assert_eq!(Some(p.dir), comp.pin_dir(i));
+            }
+            let mesh = sym.tessellate();
+            assert!(!mesh.is_empty() && mesh.len() < 1 << atlas::LOCAL_BITS, "{}: {} vertices", e.key, mesh.len());
+            for v in &mesh {
+                assert!(v.pos[0] >= -1e-3 && v.pos[0] <= w as f32 + 1e-3 && v.pos[1] >= -0.2, "{} {:?}", e.key, v.pos);
+            }
+        }
+        let src = crate::shader_source();
+        assert!(src.contains(&format!("const SYM_INFO_MACRO: u32 = {}u;", atlas::INFO_MACRO)), "shader constant");
+        assert!(src.contains(&format!("const SYM_MACRO_CODE: u32 = {MACRO_CODE}u;")));
     }
 
     #[test]

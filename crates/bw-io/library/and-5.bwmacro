@@ -1,0 +1,437 @@
+(
+    format: "bitwerk-macro",
+    version: 1,
+    root: (12),
+    macros: [
+        (
+            id: (12),
+            name: "AND-5",
+            pins: [
+                (
+                    tag: (0),
+                    name: "A",
+                    dil: 0,
+                ),
+                (
+                    tag: (1),
+                    name: "B",
+                    dil: 0,
+                ),
+                (
+                    tag: (2),
+                    name: "C",
+                    dil: 0,
+                ),
+                (
+                    tag: (3),
+                    name: "D",
+                    dil: 0,
+                ),
+                (
+                    tag: (4),
+                    name: "E",
+                    dil: 0,
+                ),
+                (
+                    tag: (8),
+                    name: "Y",
+                    dil: 0,
+                ),
+            ],
+            datasheet: "5-input AND\n\nY is 1 only while every input is 1. Built as a two-level tree of smaller gates.",
+            hash: 10949219570881908910,
+            body: (
+                components: [
+                    (
+                        id: (0),
+                        kind: Tag(
+                            dir: In,
+                            tristate: false,
+                        ),
+                        pos: (
+                            x: 0,
+                            y: 0,
+                        ),
+                        rotation: R0,
+                    ),
+                    (
+                        id: (1),
+                        kind: Tag(
+                            dir: In,
+                            tristate: false,
+                        ),
+                        pos: (
+                            x: 0,
+                            y: 4,
+                        ),
+                        rotation: R0,
+                    ),
+                    (
+                        id: (2),
+                        kind: Tag(
+                            dir: In,
+                            tristate: false,
+                        ),
+                        pos: (
+                            x: 0,
+                            y: 8,
+                        ),
+                        rotation: R0,
+                    ),
+                    (
+                        id: (3),
+                        kind: Tag(
+                            dir: In,
+                            tristate: false,
+                        ),
+                        pos: (
+                            x: 0,
+                            y: 12,
+                        ),
+                        rotation: R0,
+                    ),
+                    (
+                        id: (4),
+                        kind: Tag(
+                            dir: In,
+                            tristate: false,
+                        ),
+                        pos: (
+                            x: 0,
+                            y: 16,
+                        ),
+                        rotation: R0,
+                    ),
+                    (
+                        id: (5),
+                        kind: Gate(
+                            op: And,
+                            inputs: 3,
+                        ),
+                        pos: (
+                            x: 16,
+                            y: 0,
+                        ),
+                        rotation: R0,
+                    ),
+                    (
+                        id: (6),
+                        kind: Gate(
+                            op: And,
+                            inputs: 2,
+                        ),
+                        pos: (
+                            x: 16,
+                            y: 12,
+                        ),
+                        rotation: R0,
+                    ),
+                    (
+                        id: (7),
+                        kind: Gate(
+                            op: And,
+                            inputs: 2,
+                        ),
+                        pos: (
+                            x: 32,
+                            y: 6,
+                        ),
+                        rotation: R0,
+                    ),
+                    (
+                        id: (8),
+                        kind: Tag(
+                            dir: Out,
+                            tristate: false,
+                        ),
+                        pos: (
+                            x: 44,
+                            y: 6,
+                        ),
+                        rotation: R0,
+                    ),
+                ],
+                nodes: [
+                    (
+                        id: (0),
+                        at: Pin((
+                            component: (2),
+                            pin: 0,
+                        )),
+                    ),
+                    (
+                        id: (1),
+                        at: Pin((
+                            component: (5),
+                            pin: 2,
+                        )),
+                    ),
+                    (
+                        id: (2),
+                        at: Free((
+                            x: 15,
+                            y: 9,
+                        )),
+                    ),
+                    (
+                        id: (3),
+                        at: Free((
+                            x: 15,
+                            y: 5,
+                        )),
+                    ),
+                    (
+                        id: (4),
+                        at: Pin((
+                            component: (0),
+                            pin: 0,
+                        )),
+                    ),
+                    (
+                        id: (5),
+                        at: Pin((
+                            component: (5),
+                            pin: 0,
+                        )),
+                    ),
+                    (
+                        id: (6),
+                        at: Pin((
+                            component: (1),
+                            pin: 0,
+                        )),
+                    ),
+                    (
+                        id: (7),
+                        at: Pin((
+                            component: (5),
+                            pin: 1,
+                        )),
+                    ),
+                    (
+                        id: (8),
+                        at: Free((
+                            x: 14,
+                            y: 5,
+                        )),
+                    ),
+                    (
+                        id: (9),
+                        at: Free((
+                            x: 14,
+                            y: 3,
+                        )),
+                    ),
+                    (
+                        id: (10),
+                        at: Pin((
+                            component: (3),
+                            pin: 0,
+                        )),
+                    ),
+                    (
+                        id: (11),
+                        at: Pin((
+                            component: (6),
+                            pin: 0,
+                        )),
+                    ),
+                    (
+                        id: (12),
+                        at: Pin((
+                            component: (4),
+                            pin: 0,
+                        )),
+                    ),
+                    (
+                        id: (13),
+                        at: Pin((
+                            component: (6),
+                            pin: 1,
+                        )),
+                    ),
+                    (
+                        id: (14),
+                        at: Free((
+                            x: 15,
+                            y: 17,
+                        )),
+                    ),
+                    (
+                        id: (15),
+                        at: Free((
+                            x: 15,
+                            y: 15,
+                        )),
+                    ),
+                    (
+                        id: (16),
+                        at: Pin((
+                            component: (5),
+                            pin: 3,
+                        )),
+                    ),
+                    (
+                        id: (17),
+                        at: Pin((
+                            component: (7),
+                            pin: 0,
+                        )),
+                    ),
+                    (
+                        id: (18),
+                        at: Free((
+                            x: 31,
+                            y: 3,
+                        )),
+                    ),
+                    (
+                        id: (19),
+                        at: Free((
+                            x: 31,
+                            y: 7,
+                        )),
+                    ),
+                    (
+                        id: (20),
+                        at: Pin((
+                            component: (6),
+                            pin: 2,
+                        )),
+                    ),
+                    (
+                        id: (21),
+                        at: Pin((
+                            component: (7),
+                            pin: 1,
+                        )),
+                    ),
+                    (
+                        id: (22),
+                        at: Free((
+                            x: 31,
+                            y: 14,
+                        )),
+                    ),
+                    (
+                        id: (23),
+                        at: Free((
+                            x: 31,
+                            y: 9,
+                        )),
+                    ),
+                    (
+                        id: (24),
+                        at: Pin((
+                            component: (7),
+                            pin: 2,
+                        )),
+                    ),
+                    (
+                        id: (25),
+                        at: Pin((
+                            component: (8),
+                            pin: 0,
+                        )),
+                    ),
+                    (
+                        id: (26),
+                        at: Free((
+                            x: 43,
+                            y: 8,
+                        )),
+                    ),
+                    (
+                        id: (27),
+                        at: Free((
+                            x: 43,
+                            y: 7,
+                        )),
+                    ),
+                ],
+                segments: [
+                    (
+                        a: (0),
+                        b: (2),
+                    ),
+                    (
+                        a: (2),
+                        b: (3),
+                    ),
+                    (
+                        a: (3),
+                        b: (1),
+                    ),
+                    (
+                        a: (4),
+                        b: (5),
+                    ),
+                    (
+                        a: (6),
+                        b: (8),
+                    ),
+                    (
+                        a: (8),
+                        b: (9),
+                    ),
+                    (
+                        a: (9),
+                        b: (7),
+                    ),
+                    (
+                        a: (10),
+                        b: (11),
+                    ),
+                    (
+                        a: (12),
+                        b: (14),
+                    ),
+                    (
+                        a: (14),
+                        b: (15),
+                    ),
+                    (
+                        a: (15),
+                        b: (13),
+                    ),
+                    (
+                        a: (16),
+                        b: (18),
+                    ),
+                    (
+                        a: (18),
+                        b: (19),
+                    ),
+                    (
+                        a: (19),
+                        b: (17),
+                    ),
+                    (
+                        a: (20),
+                        b: (22),
+                    ),
+                    (
+                        a: (22),
+                        b: (23),
+                    ),
+                    (
+                        a: (23),
+                        b: (21),
+                    ),
+                    (
+                        a: (24),
+                        b: (26),
+                    ),
+                    (
+                        a: (26),
+                        b: (27),
+                    ),
+                    (
+                        a: (27),
+                        b: (25),
+                    ),
+                ],
+            ),
+        ),
+    ],
+)

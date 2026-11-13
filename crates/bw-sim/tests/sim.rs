@@ -243,9 +243,9 @@ fn bus_contention_halts_naming_net_and_drivers() {
     let mut s = sim(&c);
     set(&mut s, ea, L1);
     let err = s.set_switch(eb, true).unwrap_err();
-    let SimError::BusContention { net, drivers } = &err else { panic!("{err:?}") };
+    let SimError::BusContention { net, drivers, .. } = &err else { panic!("{err:?}") };
     assert_eq!(*net, s.netlist().output_net(t1, 0).unwrap());
-    assert_eq!(drivers, &vec![t1, t2]);
+    assert_eq!(drivers, &vec![vec![t1], vec![t2]]);
     let msg = err.to_string();
     assert!(msg.contains("bus contention") && msg.contains(&format!("#{}", t1.0)), "{msg}");
 }
@@ -764,7 +764,7 @@ fn engine_halts_on_bus_contention() {
     h.send(Command::SetSwitch(eb, true));
     let s = wait_for(&h, |s| s.state == RunState::Halted);
     match &s.error {
-        Some(SimError::BusContention { drivers, .. }) => assert_eq!(drivers, &vec![t1, t2]),
+        Some(SimError::BusContention { drivers, .. }) => assert_eq!(drivers, &vec![vec![t1], vec![t2]]),
         e => panic!("{e:?}"),
     }
 }

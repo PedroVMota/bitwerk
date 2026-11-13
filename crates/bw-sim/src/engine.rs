@@ -9,6 +9,7 @@ use bw_core::{Circuit, ComponentId, ComponentKind, Edit};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use crate::SimError;
+use crate::flatten::{CompileStats, FlattenCache};
 use crate::netlist::{NetMap, Netlist, SimState};
 
 /// Minimum interval between two published snapshots (caps UI upload work).
@@ -57,6 +58,11 @@ pub enum Command {
         revision: u64,
     },
     SetSwitch(ComponentId, bool),
+    /// Which circuit the UI shows: `[]` = the root, otherwise the instance
+    /// path of one macro instance (each id is an instance in the previous
+    /// level). Snapshots then map nets onto that circuit's components, so
+    /// the inside view shows *that* instance's live state.
+    SetView(Vec<ComponentId>),
     /// Publish the live contents of this memory (throttled, only when they
     /// change) through [`SimHandle::memory_view`]; `None` stops it.
     WatchMemory(Option<ComponentId>),
@@ -86,8 +92,13 @@ pub struct Snapshot {
     /// Output pins driving each net. Shared by all snapshots of one
     /// compilation, so cloning it is free.
     pub net_map: Arc<NetMap>,
-    /// Changes whenever the net numbering changes (each compilation).
+    /// Changes whenever the net numbering or the viewed circuit changes.
     pub compile_id: u64,
+    /// The instance path `net_map` refers to (see [`Command::SetView`]);
+    /// `None` if that path does not exist (any more) in the compilation.
+    pub view: Option<Arc<[ComponentId]>>,
+    /// Timings of the latest compilation.
+    pub compile_stats: CompileStats,
     pub error: Option<SimError>,
 }
 
@@ -102,6 +113,8 @@ impl Snapshot {
             net_count: 0,
             net_map: Arc::new(NetMap::default()),
             compile_id: 0,
+            view: Some(Arc::from(Vec::new())),
+            compile_stats: CompileStats::default(),
             error: None,
         }
     }
@@ -176,6 +189,7 @@ impl Drop for SimHandle {
     }
 }
 
+#[allow(clippy::struct_excessive_bools, reason = "independent worker flags")]
 struct Worker {
     rx: Receiver<Command>,
     out: Arc<ArcSwap<Snapshot>>,
@@ -192,6 +206,11 @@ struct Worker {
     fresh: bool,
     net_map: Arc<NetMap>,
     compile_id: u64,
+    /// Viewed instance path and whether it exists in the compilation.
+    view: Arc<[ComponentId]>,
+    view_ok: bool,
+    cache: FlattenCache,
+    stats: CompileStats,
     /// Memory whose contents are published, and the (compilation, change
     /// counter) last published.
     watched: Option<ComponentId>,
@@ -227,6 +246,10 @@ impl Worker {
             fresh: true,
             net_map: Arc::new(NetMap::default()),
             compile_id: 0,
+            view: Arc::from(Vec::new()),
+            view_ok: true,
+            cache: FlattenCache::default(),
+            stats: CompileStats::default(),
             watched: None,
             watched_published: None,
             mem_generation: 0,
@@ -321,9 +344,20 @@ impl Worker {
         }
         self.needs_compile = false;
         let tick = self.sim.as_ref().map_or(0, |s| s.tick);
-        match Netlist::compile(&self.circuit) {
-            Ok(net) => {
-                self.net_map = Arc::new(net.net_map());
+        match Netlist::compile_cached(&self.circuit, &mut self.cache) {
+            Ok((net, stats)) => {
+                self.stats = stats;
+                tracing::debug!(
+                    instances = stats.instances,
+                    primitives = stats.primitives,
+                    templates_built = stats.templates_built,
+                    flatten_ms = stats.flatten.as_secs_f64() * 1000.0,
+                    netlist_ms = stats.netlist.as_secs_f64() * 1000.0,
+                    "compiled"
+                );
+                let map = net.view_map(&self.view);
+                self.view_ok = map.is_some();
+                self.net_map = Arc::new(map.unwrap_or_default());
                 self.compile_id += 1;
                 let mut sim = SimState::new(net, &self.circuit);
                 // An edit keeps the flip-flop states and memory contents of
@@ -379,6 +413,13 @@ impl Worker {
                 if id.is_none() {
                     self.mem_out.store(None);
                 }
+            }
+            Command::SetView(path) => {
+                self.view = Arc::from(path);
+                let map = self.sim.as_ref().and_then(|s| s.netlist().view_map(&self.view));
+                self.view_ok = map.is_some();
+                self.net_map = Arc::new(map.unwrap_or_default());
+                self.compile_id += 1;
             }
             Command::SetSwitch(id, on) => {
                 // Keep the copy in sync so a later recompilation keeps the level.
@@ -532,6 +573,8 @@ impl Worker {
             net_count,
             net_map: Arc::clone(&self.net_map),
             compile_id: self.compile_id,
+            view: self.view_ok.then(|| Arc::clone(&self.view)),
+            compile_stats: self.stats,
             error: self.error.clone(),
         }));
         self.dirty = false;

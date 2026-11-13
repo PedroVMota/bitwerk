@@ -83,8 +83,9 @@ fn level_color(lvl: u32) -> vec3<f32> {
 
 // kind code: 0..5 gates (AND OR NAND NOR XOR XNOR), 6 NOT, 7 switch, 8 clock,
 // 9 LED, 10 tri-state, 11..13 D / RS / JK flip-flops, 14 RAM, 15 ROM,
-// 16 junction dot (mirrors SymbolKind::accent).
-const JUNCTION_CODE: u32 = 16u;
+// 16 macro tag, 17 macro instance, 18 junction dot (mirrors
+// SymbolKind::accent).
+const JUNCTION_CODE: u32 = 18u;
 fn kind_accent(kind: u32) -> vec3<f32> {
     switch kind {
         case 0u, 2u: { return vec3<f32>(0.35, 0.62, 0.95); }
@@ -95,7 +96,9 @@ fn kind_accent(kind: u32) -> vec3<f32> {
         case 8u: { return vec3<f32>(0.40, 0.85, 0.85); }
         case 11u, 12u, 13u: { return vec3<f32>(0.95, 0.55, 0.78); }
         case 14u, 15u: { return vec3<f32>(0.55, 0.78, 0.95); }
-        case 16u: { return vec3<f32>(0.45, 0.50, 0.58); }
+        case 16u: { return vec3<f32>(0.95, 0.80, 0.35); }
+        case 17u: { return vec3<f32>(0.78, 0.78, 0.84); }
+        case 18u: { return vec3<f32>(0.45, 0.50, 0.58); }
         default: { return vec3<f32>(0.95, 0.35, 0.35); }
     }
 }

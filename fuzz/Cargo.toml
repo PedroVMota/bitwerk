@@ -32,3 +32,10 @@ path = "fuzz_targets/load_memory_map.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "load_macro"
+path = "fuzz_targets/load_macro.rs"
+test = false
+doc = false
+bench = false

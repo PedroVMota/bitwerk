@@ -257,7 +257,10 @@ impl Sweep {
             1 => app.edit_rotate(target),
             2 => {
                 let Some(c) = app.circuit.component(target).cloned() else { return };
-                match app.edit_place(ComponentKind::Not, GridPos::new(c.pos.x + 1, c.pos.y + 6)) {
+                // With macros (`--stress-macros`): place another instance of
+                // the target's macro instead of a NOT.
+                let kind = if matches!(c.kind, ComponentKind::Macro(_)) { c.kind } else { ComponentKind::Not };
+                match app.edit_place(kind, GridPos::new(c.pos.x + 1, c.pos.y + 6)) {
                     Ok(not) => {
                         self.added.push(not);
                         true
@@ -279,6 +282,14 @@ impl Sweep {
                 })
             }
             4 => branch_seg(app).is_some_and(|s| app.apply_edit(Edit::DragSegment(s, 1)).is_ok()),
+            5 if matches!(app.circuit.component(target).map(|c| c.kind), Some(ComponentKind::Macro(_))) => {
+                // Redefine the target's macro (every instance follows; the
+                // simulator recompiles in the background).
+                let Some(ComponentKind::Macro(shape)) = app.circuit.component(target).map(|c| c.kind) else { return };
+                let Some(mut def) = app.circuit.macros().def(shape.def).map(|d| (**d).clone()) else { return };
+                def.datasheet = format!("revision {i}");
+                app.redefine(shape.def, def).is_ok()
+            }
             5 => {
                 // Move a bend of the branch (geometry only).
                 let bend = branch_seg(app).and_then(|s| {

@@ -333,3 +333,74 @@ fn random_edit_sequence_matches_full_build() {
     }
     assert!(applied > 400 && wiring > 150, "only {applied} edits ({wiring} wiring) applied");
 }
+
+/// Macro instances: placing, wiring and redefining (the interface changes,
+/// so every instance changes size and its wires are re-attached or
+/// detached) patch the scene exactly like a full rebuild.
+#[test]
+fn macro_instances_and_definition_edits_match_full_build() {
+    use bw_core::{MacroDef, MacroId, TagDir};
+    use std::sync::Arc;
+    let tag = |dir| ComponentKind::Tag { dir, tristate: false };
+    let mut d = MacroDef::new("Gate pair");
+    let a = d.body.add_component(tag(TagDir::In), GridPos::new(0, 0), Rotation::R0).unwrap();
+    let b = d.body.add_component(tag(TagDir::In), GridPos::new(0, 4), Rotation::R0).unwrap();
+    let g = d.body.add_component(and2(), GridPos::new(10, 0), Rotation::R0).unwrap();
+    let y = d.body.add_component(tag(TagDir::Out), GridPos::new(20, 0), Rotation::R0).unwrap();
+    for (f, t) in [((a, 0), (g, 0)), ((b, 0), (g, 1)), ((g, 2), (y, 0))] {
+        d.body
+            .apply(&Edit::AddWire {
+                from: WireEnd::Pin(PinRef { component: f.0, pin: f.1 }),
+                to: WireEnd::Pin(PinRef { component: t.0, pin: t.1 }),
+                via: vec![],
+            })
+            .unwrap();
+    }
+    d.sync_pins();
+    let mut c = Circuit::new();
+    let mut s = Scene::build(&c, 0);
+    let id = MacroId(0);
+    edit(&mut c, &mut s, &Edit::DefineMacro { id, def: Arc::new(d.clone()) }, 1);
+    let shape = ComponentKind::Macro(c.macros().get(id).unwrap().shape);
+    let mut insts = Vec::new();
+    for i in 0..6 {
+        insts.push(add(&mut c, &mut s, shape, 20, 12 * i));
+    }
+    let sw = add(&mut c, &mut s, ComponentKind::Switch { on: true }, 0, 0);
+    for &m in &insts {
+        connect(&mut c, &mut s, sw, m, 1);
+    }
+    let led = add(&mut c, &mut s, ComponentKind::Led, 50, 0);
+    connect(&mut c, &mut s, insts[0], led, 0);
+    s.validate(&c).unwrap();
+    // The instance output drives the LED's net.
+    let led_body = s.bodies()[s.body_slot(led).unwrap() as usize];
+    assert_eq!(led_body.net, s.signal_slot(insts[0], 0).unwrap());
+    // Redefine: drop input A (pin 0), add a second output.
+    d.body.remove_component(a).unwrap();
+    let z = d.body.add_component(tag(TagDir::Out), GridPos::new(20, 6), Rotation::R0).unwrap();
+    d.body
+        .apply(&Edit::AddWire {
+            from: WireEnd::Pin(PinRef { component: g, pin: 2 }),
+            to: WireEnd::Pin(PinRef { component: z, pin: 0 }),
+            via: vec![],
+        })
+        .unwrap();
+    d.sync_pins();
+    let a = edit(&mut c, &mut s, &Edit::DefineMacro { id, def: Arc::new(d) }, 2);
+    assert_eq!(a.components, insts);
+    s.validate(&c).unwrap();
+    for &m in &insts {
+        let k = c.component(m).unwrap().kind;
+        assert_eq!((k.input_count(), k.output_count()), (1, 2));
+        assert!(c.pin_node(PinRef { component: m, pin: 0 }).is_some(), "B (was pin 1) keeps its wire");
+    }
+    // Remove instances and the definition.
+    for &m in &insts {
+        edit(&mut c, &mut s, &Edit::RemoveComponent(m), 3);
+        s.validate(&c).unwrap();
+    }
+    edit(&mut c, &mut s, &Edit::RemoveMacro(id), 4);
+    assert!(c.macros().is_empty());
+    s.validate(&c).unwrap();
+}

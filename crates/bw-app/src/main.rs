@@ -11,9 +11,12 @@
 
 mod app;
 mod canvas;
+mod hier;
 mod icons;
+mod macro_props;
 mod memwin;
 mod menu;
+mod parts;
 mod scene_worker;
 mod stress;
 mod sweep;
