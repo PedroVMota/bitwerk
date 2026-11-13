@@ -16,9 +16,16 @@
 //! The resulting circuit goes through the same validation as a project
 //! file. Imported projects use the Digital Works compatible simulation mode
 //! ([`bw_core::EvalMode::Sequential`]).
+//!
+//! Export is the reverse: [`export`] builds the object graph of a circuit
+//! or macro (collecting an [`ExportReport`] of what had to be approximated
+//! or dropped) and [`writer`] serialises it with the reader's own field
+//! programs. Every exported file is parsed again before it is returned.
 
 pub mod convert;
+pub mod export;
 pub mod reader;
+pub mod writer;
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -112,6 +119,137 @@ impl ImportReport {
     pub fn total(&self, sev: Severity) -> usize {
         self.notes.iter().filter(|n| n.severity == sev).map(|n| n.count).sum()
     }
+}
+
+/// What an export did.
+#[derive(Debug, Clone, Default)]
+pub struct ExportReport {
+    /// Target file name (no directories).
+    pub target: String,
+    /// Circuit / macro name written to the header.
+    pub name: String,
+    /// Format version written (34).
+    pub version: u8,
+    /// Written objects by category, in display order.
+    pub counts: Vec<(String, usize)>,
+    /// Embedded macro copies written and distinct definitions.
+    pub macro_copies: usize,
+    pub macro_defs: usize,
+    /// Objects in the stream and file size.
+    pub objects: usize,
+    pub bytes: usize,
+    pub notes: Vec<ImportNote>,
+    pub elapsed: Duration,
+}
+
+impl ExportReport {
+    /// Plain-text report (for the report window and the clipboard).
+    #[must_use]
+    pub fn to_text(&self) -> String {
+        let mut t = String::new();
+        let _ = writeln!(t, "Digital Works export: {}", self.target);
+        let _ = writeln!(t, "Name: {}", self.name);
+        let _ = writeln!(t, "Format version: {} (Digital Works 3.x)", self.version);
+        let _ = writeln!(t, "Size: {} bytes, {} objects", self.bytes, self.objects);
+        let _ = writeln!(t, "Time: {:.1} ms", self.elapsed.as_secs_f64() * 1000.0);
+        let _ = writeln!(t, "\nWritten:");
+        for (what, n) in &self.counts {
+            let _ = writeln!(t, "  {n:>7}  {what}");
+        }
+        if self.macro_copies > 0 {
+            let _ = writeln!(t, "  {:>7}  embedded macro copies of {} definitions", self.macro_copies, self.macro_defs);
+        }
+        for (sev, title) in [
+            (Severity::Unsupported, "Dropped (Digital Works cannot represent it)"),
+            (Severity::Warning, "Warnings"),
+            (Severity::Approximation, "Approximations"),
+        ] {
+            let list: Vec<&ImportNote> = self.notes.iter().filter(|n| n.severity == sev).collect();
+            if list.is_empty() {
+                continue;
+            }
+            let _ = writeln!(t, "\n{title}:");
+            for n in list {
+                let _ = writeln!(t, "  {:>5} x  {}", n.count, n.message);
+            }
+        }
+        if self.notes.is_empty() {
+            let _ = writeln!(t, "\nNothing was approximated or dropped.");
+        }
+        t
+    }
+
+    /// Number of notes of a severity (sum of counts).
+    #[must_use]
+    pub fn total(&self, sev: Severity) -> usize {
+        self.notes.iter().filter(|n| n.severity == sev).map(|n| n.count).sum()
+    }
+}
+
+/// Serialises a built graph, checks that it reads back, and makes the
+/// report.
+fn finish_export(
+    built: Result<(reader::Graph, export::Exporter<'_>), export::ExportError>,
+    file_name: &str,
+    t0: std::time::Instant,
+) -> Result<(Vec<u8>, ExportReport), IoError> {
+    let (g, ex) = built.map_err(|e| IoError::Dwm(e.0))?;
+    let bytes = writer::write(&g).map_err(|e| IoError::Dwm(e.0))?;
+    // Never hand out a file our own reader would refuse.
+    let back = reader::parse(&bytes)
+        .map_err(|e| IoError::Dwm(format!("internal error: exported file does not read back: {e}")))?;
+    let report = ExportReport {
+        target: file_stem_full(file_name),
+        name: g.header.name.clone(),
+        version: g.header.version,
+        counts: export::ordered_counts(&ex.notes),
+        macro_copies: ex.copies,
+        macro_defs: ex.definitions(),
+        objects: back.objects.len(),
+        bytes: bytes.len(),
+        notes: ex.notes.into_list(),
+        elapsed: t0.elapsed(),
+    };
+    Ok((bytes, report))
+}
+
+/// Exports a project as a Digital Works 3 circuit (`.dwm`, version 34).
+/// Lossy: see the report.
+///
+/// # Errors
+/// The circuit is too large for a Digital Works file (macros are copied
+/// per instance), or an internal consistency failure.
+pub fn export_project(project: &Project, file_name: &str) -> Result<(Vec<u8>, ExportReport), IoError> {
+    export_circuit(&project.circuit, &project.name, file_name)
+}
+
+/// [`export_project`] for a circuit and its name (no copy of the circuit
+/// needed).
+///
+/// # Errors
+/// As [`export_project`].
+pub fn export_circuit(
+    circuit: &bw_core::Circuit,
+    name: &str,
+    file_name: &str,
+) -> Result<(Vec<u8>, ExportReport), IoError> {
+    let t0 = std::time::Instant::now();
+    let name = if name.trim().is_empty() { file_stem(file_name).to_string() } else { name.to_string() };
+    finish_export(export::project_graph(circuit, &name), file_name, t0)
+}
+
+/// Exports macro definition `root` of `table` as a Digital Works macro
+/// (`.dwm` whose tags are the interface).
+///
+/// # Errors
+/// As [`export_project`]; an unknown definition.
+pub fn export_macro(
+    table: &bw_core::MacroTable,
+    root: bw_core::MacroId,
+    file_name: &str,
+) -> Result<(Vec<u8>, ExportReport), IoError> {
+    let t0 = std::time::Instant::now();
+    finish_export(export::macro_graph(table, root), file_name, t0)
 }
 
 /// Is this a Digital Works circuit / macro file (by its magic number)?

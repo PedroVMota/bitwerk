@@ -65,7 +65,7 @@ impl Notes {
         *self.notes.entry((sev, msg.into())).or_default() += 1;
     }
 
-    fn count(&mut self, what: &'static str, n: usize) {
+    pub(crate) fn count(&mut self, what: &'static str, n: usize) {
         if n > 0 {
             *self.counts.entry(what).or_default() += n;
         }

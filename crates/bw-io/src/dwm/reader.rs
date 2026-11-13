@@ -220,6 +220,68 @@ impl Cls {
     pub const fn is_pin(self) -> bool {
         matches!(self, Self::Pin | Self::MacroPin)
     }
+
+    /// The Digital Works class name written for this class (the inverse of
+    /// [`Self::from_name`] for every concrete class; abstract classes get
+    /// the name of their family's base class).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::SerializeList => "TSerializeList",
+            Self::FloatPoint => "TFloatPoint",
+            Self::GraphicList => "TGraphicList",
+            Self::Segment => "TSegment",
+            Self::Polyline => "TPolyline",
+            Self::Polygon => "TPolygon",
+            Self::GraphicBox => "TGraphicBox",
+            Self::MessageBox => "TMessageBox",
+            Self::GraphicText => "TGraphicText",
+            Self::Pin => "TPin",
+            Self::MacroPin => "TMacroPin",
+            Self::Wire => "TWire",
+            Self::Solder => "TSolder",
+            Self::Gate(op, n) => gate_name(op, n),
+            Self::TriState => "TTriState",
+            Self::DFlipFlop => "TDFlipFlop",
+            Self::JkFlipFlop => "TJKFlipFlop",
+            Self::RsFlipFlop => "TRSFlipFlop",
+            Self::Device => "TDevice",
+            Self::TextDevice => "TTextDevice",
+            Self::HistoryDevice => "THistoryDevice",
+            Self::InputDevice => "TInputDevice",
+            Self::Supply => "TSupply",
+            Self::Ground => "TGround",
+            Self::InteractiveInput => "TInteractiveInput",
+            Self::SeqInput => "TSeqInputDevice",
+            Self::Clock => "TClockDevice",
+            Self::BitGenerator => "TBitGenerator",
+            Self::InteractiveSwitch => "TInteractiveSwitch",
+            Self::OutputDevice => "TOutputDevice",
+            Self::Led => "TLEDDevice",
+            Self::LedSegment => "TLEDSegmentDevice",
+            Self::Numeric => "TNumericDevice",
+            Self::Memory => "TMemoryDevice",
+            Self::Tag => "TTagDevice",
+            Self::Macro => "TMacro",
+        }
+    }
+}
+
+/// Class name of a gate (operation index as in [`Cls::Gate`]).
+const fn gate_name(op: u8, n: u8) -> &'static str {
+    const NAMES: [[&str; 5]; 6] = [
+        ["TAndGate", "TAndGate", "T2AndGate", "T3AndGate", "T4AndGate"],
+        ["TNandGate", "TNandGate", "T2NandGate", "T3NandGate", "T4NandGate"],
+        ["TOrGate", "TOrGate", "T2OrGate", "T3OrGate", "T4OrGate"],
+        ["TNorGate", "TNorGate", "T2NorGate", "T3NorGate", "T4NorGate"],
+        ["TXorGate", "TXorGate", "T2XorGate", "TXorGate", "TXorGate"],
+        ["TXnorGate", "TXnorGate", "T2XnorGate", "TXnorGate", "TXnorGate"],
+    ];
+    if op >= 6 {
+        return "TNotGate";
+    }
+    let n = if n > 4 { 0 } else { n };
+    NAMES[op as usize][n as usize]
 }
 
 /// Field names (what a value means; see the class layouts in the notes).
@@ -395,9 +457,10 @@ impl Obj {
     }
 }
 
-/// One read instruction of a class program.
+/// One read instruction of a class program (shared with the writer, so
+/// both sides follow the same field layout).
 #[derive(Debug, Clone, Copy)]
-enum Op {
+pub(crate) enum Op {
     Int(F),
     Bool(F),
     Str(F),
@@ -428,8 +491,8 @@ const DEVICE: &[Op] = &[
 const TEXT_DEVICE: &[Op] =
     &[Op::Bool(F::HasLabel), Op::IfTrue(F::HasLabel, 2), Op::Int(F::TextPos), Op::Obj(F::NameLabel)];
 
-/// The read program of a class (parents first).
-fn program(c: Cls) -> Vec<Op> {
+/// The read (and write) program of a class (parents first).
+pub(crate) fn program(c: Cls) -> Vec<Op> {
     let mut p: Vec<Op> = Vec::new();
     let polygon = |p: &mut Vec<Op>| {
         p.extend_from_slice(SEGMENT);
@@ -564,6 +627,20 @@ pub struct Header {
     pub datasheet: String,
     /// Other header properties (id, value as text), kept for the report.
     pub other: Vec<(i32, String)>,
+    /// Every version 34 header property in file order, with its kind (the
+    /// writer reproduces them exactly).
+    pub props: Vec<(i32, HeaderValue)>,
+    /// Version 30 header: the leading boolean and the trailing integer.
+    pub v30_flag: bool,
+    pub v30_int: i32,
+}
+
+/// Value of a version 34 header property.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeaderValue {
+    Str(String),
+    Int(i32),
+    Bool(bool),
 }
 
 /// A parsed file: header, object table and the root object(s).
@@ -712,13 +789,16 @@ impl Cursor<'_> {
     }
 }
 
+/// Windows-1252 characters of the bytes 0x80–0x9F (the rest are Latin-1;
+/// undefined bytes map to the C1 control of the same value).
+pub(crate) const CP1252_HIGH: [char; 32] = [
+    '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž', '\u{8f}', '\u{90}', '‘', '’',
+    '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}', 'ž', 'Ÿ',
+];
+
 /// Windows-1252 byte to char.
 fn cp1252(b: u8) -> char {
-    const HIGH: [char; 32] = [
-        '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž', '\u{8f}', '\u{90}', '‘',
-        '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}', 'ž', 'Ÿ',
-    ];
-    if (0x80..0xA0).contains(&b) { HIGH[usize::from(b - 0x80)] } else { char::from(b) }
+    if (0x80..0xA0).contains(&b) { CP1252_HIGH[usize::from(b - 0x80)] } else { char::from(b) }
 }
 
 /// An object being read.
@@ -969,10 +1049,11 @@ pub fn parse(bytes: &[u8]) -> Result<Graph, ReadError> {
     if !template {
         match version {
             0x1E => {
-                let _ = c.bool()?;
+                header.v30_flag = c.bool()?;
                 header.name = c.string()?;
                 let s2 = c.string()?;
                 let i = c.int()?;
+                header.v30_int = i;
                 // The second string is the datasheet path (as property 101
                 // of version 34).
                 header.datasheet = s2;
@@ -990,12 +1071,18 @@ pub fn parse(bytes: &[u8]) -> Result<Graph, ReadError> {
                     }
                     let kind = c.int()?;
                     let id = c.int()?;
-                    let value = match kind {
-                        1 => c.string()?,
-                        2 => c.int()?.to_string(),
-                        3 => c.bool()?.to_string(),
+                    let raw = match kind {
+                        1 => HeaderValue::Str(c.string()?),
+                        2 => HeaderValue::Int(c.int()?),
+                        3 => HeaderValue::Bool(c.bool()?),
                         k => return c.err(format!("bad header property kind {k}")),
                     };
+                    let value = match &raw {
+                        HeaderValue::Str(s) => s.clone(),
+                        HeaderValue::Int(i) => i.to_string(),
+                        HeaderValue::Bool(b) => b.to_string(),
+                    };
+                    header.props.push((id, raw));
                     match id {
                         100 => header.name = value,
                         101 => header.datasheet = value,
