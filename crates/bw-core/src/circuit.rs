@@ -1,57 +1,67 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::component::{Component, ComponentId, ComponentKind, PinDir, PinRef, Rotation};
+use crate::component::{Component, ComponentId, ComponentKind, PinRef, Rotation};
 use crate::geom::GridPos;
+use crate::memenc;
+use crate::wiring::{NodeId, NodeRecord, Segment, SegmentId, SegmentRecord, WireEnd, WireLog, WireNode};
 
-/// Maximum number of intermediate vertices of a single wire.
+/// Maximum number of bend points of one wire drawn in a single edit.
 pub const MAX_WIRE_VERTICES: usize = 256;
-
-/// Stable identifier of a wire inside a [`Circuit`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct WireId(pub u32);
-
-/// A point-to-point connection from an output pin to an input pin.
-///
-/// TODO: wire joints / solder points (wire-to-wire connections) — for now
-/// fan-out is expressed as several wires leaving the same output pin.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Wire {
-    pub id: WireId,
-    pub from: PinRef,
-    pub to: PinRef,
-    /// Intermediate routing vertices (purely visual).
-    #[serde(default)]
-    pub via: Vec<GridPos>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CircuitError {
     #[error("duplicate component id {0:?}")]
     DuplicateComponent(ComponentId),
-    #[error("duplicate wire id {0:?}")]
-    DuplicateWire(WireId),
     #[error("component {0:?} does not exist")]
     NoSuchComponent(ComponentId),
-    #[error("wire {0:?} does not exist")]
-    NoSuchWire(WireId),
     #[error("component {0:?} has invalid parameters")]
     InvalidComponent(ComponentId),
     #[error("pin {0:?} does not exist")]
     NoSuchPin(PinRef),
-    #[error("wire must start at an output pin")]
-    SourceNotOutput,
-    #[error("unable to connect two outputs")]
-    TwoOutputs,
-    #[error("input pin {0:?} is already driven")]
-    InputAlreadyDriven(PinRef),
+    #[error("wire node {0:?} does not exist")]
+    NoSuchNode(NodeId),
+    #[error("wire segment {0:?} does not exist")]
+    NoSuchSegment(SegmentId),
+    #[error("duplicate wire node id {0:?}")]
+    DuplicateNode(NodeId),
+    #[error("pin {0:?} has more than one wire node")]
+    DuplicatePinNode(PinRef),
+    #[error("wire segment {0:?}–{1:?} is invalid (same node twice, diagonal, zero length or duplicated)")]
+    BadSegment(NodeId, NodeId),
+    #[error("wire node {0:?} is a dangling end")]
+    DanglingNode(NodeId),
+    #[error("point ({}, {}) is not on that wire", .0.x, .0.y)]
+    NotOnSegment(GridPos),
+    #[error("a wire needs two different ends")]
+    SameNode,
+    #[error(
+        "cannot join two outputs on one net (component #{} pin {} and component #{} pin {}): only tri-state outputs may share a net",
+        .0.component.0, .0.pin, .1.component.0, .1.pin
+    )]
+    TwoDrivers(PinRef, PinRef),
+    #[error("only junctions and bends can be moved (node {0:?} is a pin)")]
+    NotFreeNode(NodeId),
+    #[error("wire segment {0:?} has no length and cannot be dragged")]
+    ZeroLengthSegment(SegmentId),
     #[error("wire has too many vertices (max {MAX_WIRE_VERTICES})")]
     TooManyVertices,
     #[error("identifier space exhausted")]
     IdSpaceExhausted,
+    #[error("component {0:?} is not a memory")]
+    NotAMemory(ComponentId),
+    #[error("memory address {addr} out of range")]
+    AddressOutOfRange { addr: u32 },
+    #[error("memory contents of {0:?}: {1}")]
+    BadMemory(ComponentId, memenc::MemEncError),
 }
+
+/// Contents of one memory device (exactly `kind.memory_words()` words, each
+/// within the data width). Shared copy-on-write between circuit copies.
+pub type MemoryImage = Arc<Vec<u16>>;
 
 /// One atomic model change. Both the UI and the simulation thread apply the
 /// same sequence of edits to their own copy of a [`Circuit`] (ids are
@@ -59,23 +69,90 @@ pub enum CircuitError {
 /// edit reach the simulator without cloning or sharing the whole circuit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Edit {
-    AddComponent { kind: ComponentKind, pos: GridPos, rotation: Rotation },
+    AddComponent {
+        kind: ComponentKind,
+        pos: GridPos,
+        rotation: Rotation,
+    },
+    /// Removes a component and its pins' wire nodes (dangling wire ends are
+    /// trimmed).
     RemoveComponent(ComponentId),
+    /// Moves a component; attached wires are rubber-banded orthogonally.
     MoveComponent(ComponentId, GridPos),
     SetRotation(ComponentId, Rotation),
     SetKind(ComponentId, ComponentKind),
-    Connect { from: PinRef, to: PinRef, via: Vec<GridPos> },
-    Disconnect(WireId),
+    /// Draws a wire from one end to the other through the bend points
+    /// `via` (orthogonal; a missing corner is added, horizontal first). An
+    /// end on the middle of a segment splits it (a junction). Joining two
+    /// nets is refused if it would put two non-tri-state drivers together.
+    AddWire {
+        from: WireEnd,
+        to: WireEnd,
+        via: Vec<GridPos>,
+    },
+    /// Deletes one segment; dangling bits are removed and straight bends
+    /// merged.
+    RemoveSegment(SegmentId),
+    /// Moves a junction or bend (geometry only).
+    MoveNode(NodeId, GridPos),
+    /// Drags a segment perpendicular to itself (geometry only).
+    DragSegment(SegmentId, i32),
+    /// Sets one word of a memory's contents (masked to the data width).
+    SetMemoryWord {
+        id: ComponentId,
+        addr: u32,
+        value: u16,
+    },
+    /// Replaces a memory's contents: longer data is truncated, shorter data
+    /// is zero-filled, values are masked to the data width.
+    SetMemory {
+        id: ComponentId,
+        words: Arc<[u16]>,
+    },
 }
 
-/// What an applied [`Edit`] created or touched.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Applied {
-    /// The edit created, changed or removed this component (wires attached
-    /// to a removed component are removed with it).
-    Component(ComponentId),
-    /// The edit created or removed this wire; `to` is the driven component.
-    Wire { id: WireId, to: ComponentId },
+impl Edit {
+    /// Does this edit change what the simulator computes (its netlist)?
+    /// Moves, rotations, wire geometry and memory contents do not: they
+    /// never change which pins are connected.
+    #[must_use]
+    pub const fn affects_netlist(&self) -> bool {
+        !matches!(
+            self,
+            Self::MoveComponent(..)
+                | Self::SetRotation(..)
+                | Self::MoveNode(..)
+                | Self::DragSegment(..)
+                | Self::SetMemoryWord { .. }
+                | Self::SetMemory { .. }
+        )
+    }
+}
+
+/// What an applied [`Edit`] created, changed or removed (each list sorted,
+/// without duplicates). The render scene patches exactly these objects.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Applied {
+    /// Components added, changed or removed.
+    pub components: Vec<ComponentId>,
+    /// Segments added, moved or removed.
+    pub segments: Vec<SegmentId>,
+    /// Nodes added, moved, removed or whose segment count changed.
+    pub nodes: Vec<NodeId>,
+    /// Pins that gained or lost their wire node.
+    pub pins: Vec<PinRef>,
+    /// Memory whose contents changed (no geometry).
+    pub memory: Option<ComponentId>,
+    /// Which pins are connected may have changed (nets must be recomputed).
+    pub connectivity: bool,
+}
+
+impl Applied {
+    /// The (first) component the edit touched.
+    #[must_use]
+    pub fn component(&self) -> Option<ComponentId> {
+        self.components.first().copied()
+    }
 }
 
 /// A flat (single-level) circuit.
@@ -85,31 +162,70 @@ pub enum Applied {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(try_from = "CircuitRaw")]
 pub struct Circuit {
-    components: BTreeMap<ComponentId, Component>,
-    wires: BTreeMap<WireId, Wire>,
-    /// Input pins currently driven by a wire (derived index).
-    driven: HashSet<PinRef>,
+    pub(crate) components: BTreeMap<ComponentId, Component>,
+    /// Wire graph nodes (slab indexed by [`NodeId`]; `None` = free slot).
+    pub(crate) nodes: Vec<Option<WireNode>>,
+    pub(crate) node_free: Vec<u32>,
+    pub(crate) node_live: usize,
+    /// Wire segments (slab indexed by [`SegmentId`]).
+    pub(crate) segs: Vec<Option<Segment>>,
+    pub(crate) seg_free: Vec<u32>,
+    pub(crate) seg_live: usize,
+    /// Node of each wired pin.
+    pub(crate) pin_node: HashMap<PinRef, NodeId>,
+    /// Memory contents; a memory without an entry is all zeros.
+    memories: BTreeMap<ComponentId, MemoryImage>,
     next_component: u32,
-    next_wire: u32,
+    /// Changes of the edit being applied.
+    pub(crate) log: WireLog,
+}
+
+/// On-disk shape of a memory's contents (see [`crate::memenc`]).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryRecord {
+    pub id: ComponentId,
+    pub words: String,
 }
 
 /// On-disk shape of a circuit; converted to [`Circuit`] only after validation.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CircuitRaw {
     pub components: Vec<Component>,
-    pub wires: Vec<Wire>,
+    #[serde(default)]
+    pub nodes: Vec<NodeRecord>,
+    #[serde(default)]
+    pub segments: Vec<SegmentRecord>,
+    #[serde(default)]
+    pub memories: Vec<MemoryRecord>,
+}
+
+#[derive(Serialize)]
+struct MemoryRecordOut {
+    id: ComponentId,
+    words: String,
 }
 
 #[derive(Serialize)]
 struct CircuitRef<'a> {
     components: Vec<&'a Component>,
-    wires: Vec<&'a Wire>,
+    nodes: Vec<NodeRecord>,
+    segments: Vec<SegmentRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    memories: Vec<MemoryRecordOut>,
 }
 
 impl Serialize for Circuit {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        CircuitRef { components: self.components.values().collect(), wires: self.wires.values().collect() }.serialize(s)
+        let memories = self
+            .memories
+            .iter()
+            .filter(|(_, m)| m.iter().any(|&w| w != 0))
+            .map(|(&id, m)| MemoryRecordOut { id, words: memenc::encode(m) })
+            .collect();
+        let (nodes, segments) = self.wiring_records();
+        CircuitRef { components: self.components.values().collect(), nodes, segments, memories }.serialize(s)
     }
 }
 
@@ -128,15 +244,18 @@ impl TryFrom<CircuitRaw> for Circuit {
                 return Err(CircuitError::DuplicateComponent(comp.id));
             }
         }
-        for wire in raw.wires {
-            let next = wire.id.0.checked_add(1).ok_or(CircuitError::IdSpaceExhausted)?;
-            c.next_wire = c.next_wire.max(next);
-            if c.wires.contains_key(&wire.id) {
-                return Err(CircuitError::DuplicateWire(wire.id));
+        c.load_wiring(raw.nodes, raw.segments)?;
+        for rec in raw.memories {
+            let kind = c.components.get(&rec.id).ok_or(CircuitError::NoSuchComponent(rec.id))?.kind;
+            let ComponentKind::Memory { data_bits, .. } = kind else {
+                return Err(CircuitError::NotAMemory(rec.id));
+            };
+            if c.memories.contains_key(&rec.id) {
+                return Err(CircuitError::DuplicateComponent(rec.id));
             }
-            c.check_connection(wire.from, wire.to, &wire.via)?;
-            c.driven.insert(wire.to);
-            c.wires.insert(wire.id, wire);
+            let words = memenc::decode(&rec.words, kind.memory_words(), data_bits)
+                .map_err(|e| CircuitError::BadMemory(rec.id, e))?;
+            c.memories.insert(rec.id, Arc::new(words));
         }
         Ok(c)
     }
@@ -153,21 +272,10 @@ impl Circuit {
         self.components.len()
     }
 
-    #[must_use]
-    pub fn wire_count(&self) -> usize {
-        self.wires.len()
-    }
-
     /// Components in ascending id order (deterministic).
     #[must_use]
     pub fn components(&self) -> impl ExactSizeIterator<Item = &Component> + Clone {
         self.components.values()
-    }
-
-    /// Wires in ascending id order (deterministic).
-    #[must_use]
-    pub fn wires(&self) -> impl ExactSizeIterator<Item = &Wire> + Clone {
-        self.wires.values()
     }
 
     #[must_use]
@@ -175,9 +283,15 @@ impl Circuit {
         self.components.get(&id)
     }
 
+    /// Contents of a memory component (`None` for other kinds). A memory
+    /// that was never written returns a zero-filled image.
     #[must_use]
-    pub fn wire(&self, id: WireId) -> Option<&Wire> {
-        self.wires.get(&id)
+    pub fn memory(&self, id: ComponentId) -> Option<MemoryImage> {
+        let kind = self.components.get(&id)?.kind;
+        if !matches!(kind, ComponentKind::Memory { .. }) {
+            return None;
+        }
+        Some(self.memories.get(&id).cloned().unwrap_or_else(|| Arc::new(vec![0; kind.memory_words()])))
     }
 
     /// Adds a component and returns its new id.
@@ -199,45 +313,53 @@ impl Circuit {
         Ok(id)
     }
 
-    /// Removes a component and every wire attached to it.
+    /// Removes a component together with its pins' wire nodes and the
+    /// segments ending there (dangling wire ends are trimmed). Cost: the
+    /// wires attached to it, not the circuit size.
     ///
     /// # Errors
     /// Fails if the component does not exist.
     pub fn remove_component(&mut self, id: ComponentId) -> Result<Component, CircuitError> {
+        let pins = self.components.get(&id).ok_or(CircuitError::NoSuchComponent(id))?.kind.pin_count();
+        self.detach_pins(id, pins);
         let comp = self.components.remove(&id).ok_or(CircuitError::NoSuchComponent(id))?;
-        let driven = &mut self.driven;
-        self.wires.retain(|_, w| {
-            let touches = w.from.component == id || w.to.component == id;
-            if touches {
-                driven.remove(&w.to);
-            }
-            !touches
-        });
+        self.memories.remove(&id);
         Ok(comp)
     }
 
-    /// Moves a component to a new position.
+    /// Moves a component; its wires are rubber-banded.
     ///
     /// # Errors
     /// Fails if the component does not exist.
     pub fn move_component(&mut self, id: ComponentId, pos: GridPos) -> Result<(), CircuitError> {
-        let c = self.components.get_mut(&id).ok_or(CircuitError::NoSuchComponent(id))?;
-        c.pos = pos;
+        self.components.get(&id).ok_or(CircuitError::NoSuchComponent(id))?;
+        self.pins_room(id)?;
+        if let Some(c) = self.components.get_mut(&id) {
+            c.pos = pos;
+        }
+        self.follow_pins(id);
         Ok(())
     }
 
-    /// Sets a component's rotation (wires follow the pins automatically).
+    /// Sets a component's rotation (wires are rubber-banded to the pins).
     ///
     /// # Errors
     /// Fails if the component does not exist.
     pub fn set_rotation(&mut self, id: ComponentId, rotation: Rotation) -> Result<(), CircuitError> {
-        let c = self.components.get_mut(&id).ok_or(CircuitError::NoSuchComponent(id))?;
-        c.rotation = rotation;
+        self.components.get(&id).ok_or(CircuitError::NoSuchComponent(id))?;
+        self.pins_room(id)?;
+        if let Some(c) = self.components.get_mut(&id) {
+            c.rotation = rotation;
+        }
+        self.follow_pins(id);
         Ok(())
     }
 
     /// Replaces a component's kind (e.g. to toggle a switch or change a
-    /// parameter). The pin count must not change while wires are attached.
+    /// parameter). While wires are attached the pin counts must not change,
+    /// and neither may the tri-state capability of the outputs (it decides
+    /// whether an output may share a net). Memory contents follow the new
+    /// size and width (truncated / zero-filled / masked).
     ///
     /// # Errors
     /// Fails if the component does not exist or the kind is invalid.
@@ -245,97 +367,127 @@ impl Circuit {
         if !kind.is_valid() {
             return Err(CircuitError::InvalidComponent(id));
         }
-        let c = self.components.get_mut(&id).ok_or(CircuitError::NoSuchComponent(id))?;
-        if c.kind.input_count() != kind.input_count() || c.kind.output_count() != kind.output_count() {
-            let attached = self.wires.values().any(|w| w.from.component == id || w.to.component == id);
-            if attached {
-                return Err(CircuitError::InvalidComponent(id));
+        let c = self.components.get(&id).ok_or(CircuitError::NoSuchComponent(id))?;
+        let same_pins = c.kind.input_count() == kind.input_count() && c.kind.output_count() == kind.output_count();
+        if (!same_pins || c.kind.tristate_outputs() != kind.tristate_outputs())
+            && self.has_wires(id, c.kind.pin_count())
+        {
+            return Err(CircuitError::InvalidComponent(id));
+        }
+        self.pins_room(id)?;
+        if let Some(c) = self.components.get_mut(&id) {
+            c.kind = kind;
+        }
+        self.follow_pins(id);
+        match kind {
+            ComponentKind::Memory { data_bits, .. } => {
+                if let Some(m) = self.memories.get_mut(&id) {
+                    let mask = memenc::width_mask(data_bits);
+                    let m = Arc::make_mut(m);
+                    m.resize(kind.memory_words(), 0);
+                    for w in m.iter_mut() {
+                        *w &= mask;
+                    }
+                }
+            }
+            _ => {
+                self.memories.remove(&id);
             }
         }
-        c.kind = kind;
         Ok(())
     }
 
-    fn pin_dir(&self, pin: PinRef) -> Result<PinDir, CircuitError> {
-        let comp = self.components.get(&pin.component).ok_or(CircuitError::NoSuchComponent(pin.component))?;
-        comp.pin_dir(pin.pin).ok_or(CircuitError::NoSuchPin(pin))
+    fn memory_kind(&self, id: ComponentId) -> Result<(usize, u16), CircuitError> {
+        let kind = self.components.get(&id).ok_or(CircuitError::NoSuchComponent(id))?.kind;
+        match kind {
+            ComponentKind::Memory { data_bits, .. } => Ok((kind.memory_words(), memenc::width_mask(data_bits))),
+            _ => Err(CircuitError::NotAMemory(id)),
+        }
     }
 
-    fn check_connection(&self, from: PinRef, to: PinRef, via: &[GridPos]) -> Result<(), CircuitError> {
-        if via.len() > MAX_WIRE_VERTICES {
-            return Err(CircuitError::TooManyVertices);
-        }
-        if self.pin_dir(from)? != PinDir::Output {
-            return Err(CircuitError::SourceNotOutput);
-        }
-        if self.pin_dir(to)? != PinDir::Input {
-            return Err(CircuitError::TwoOutputs);
-        }
-        if self.driven.contains(&to) {
-            return Err(CircuitError::InputAlreadyDriven(to));
-        }
+    /// Writes one memory word (masked to the data width).
+    ///
+    /// # Errors
+    /// Not a memory, or the address is out of range.
+    pub fn set_memory_word(&mut self, id: ComponentId, addr: u32, value: u16) -> Result<(), CircuitError> {
+        let (len, mask) = self.memory_kind(id)?;
+        let i = usize::try_from(addr).ok().filter(|&i| i < len).ok_or(CircuitError::AddressOutOfRange { addr })?;
+        let m = self.memories.entry(id).or_insert_with(|| Arc::new(vec![0; len]));
+        Arc::make_mut(m)[i] = value & mask;
         Ok(())
     }
 
-    /// Connects an output pin to an input pin.
+    /// Replaces a memory's contents (truncated / zero-filled / masked).
     ///
     /// # Errors
-    /// Fails if the pins do not exist, have the wrong direction, the input is
-    /// already driven, or ids are exhausted.
-    pub fn connect(&mut self, from: PinRef, to: PinRef, via: Vec<GridPos>) -> Result<WireId, CircuitError> {
-        self.check_connection(from, to, &via)?;
-        let id = WireId(self.next_wire);
-        self.next_wire = self.next_wire.checked_add(1).ok_or(CircuitError::IdSpaceExhausted)?;
-        self.driven.insert(to);
-        self.wires.insert(id, Wire { id, from, to, via });
-        Ok(id)
+    /// Not a memory.
+    pub fn set_memory(&mut self, id: ComponentId, words: &[u16]) -> Result<(), CircuitError> {
+        let (len, mask) = self.memory_kind(id)?;
+        let mut v: Vec<u16> = words.iter().take(len).map(|&w| w & mask).collect();
+        v.resize(len, 0);
+        self.memories.insert(id, Arc::new(v));
+        Ok(())
     }
 
-    /// Removes a wire.
+    /// Wires pin `from` to pin `to` along `via` (a convenience for
+    /// [`Edit::AddWire`] between two pins; missing corners are added).
     ///
     /// # Errors
-    /// Fails if the wire does not exist.
-    pub fn disconnect(&mut self, id: WireId) -> Result<Wire, CircuitError> {
-        let w = self.wires.remove(&id).ok_or(CircuitError::NoSuchWire(id))?;
-        self.driven.remove(&w.to);
-        Ok(w)
+    /// See [`Edit::AddWire`].
+    pub fn connect(&mut self, from: PinRef, to: PinRef, via: Vec<GridPos>) -> Result<Applied, CircuitError> {
+        self.apply(&Edit::AddWire { from: WireEnd::Pin(from), to: WireEnd::Pin(to), via })
     }
 
-    /// Applies one [`Edit`].
+    /// Applies one [`Edit`] and reports what changed.
     ///
     /// # Errors
     /// Same as the corresponding individual operation; on error the circuit
     /// is unchanged.
     pub fn apply(&mut self, edit: &Edit) -> Result<Applied, CircuitError> {
-        match edit {
+        self.log = WireLog::default();
+        let mut components = Vec::new();
+        let mut memory = None;
+        let r = match edit {
             Edit::AddComponent { kind, pos, rotation } => {
-                self.add_component(*kind, *pos, *rotation).map(Applied::Component)
+                self.add_component(*kind, *pos, *rotation).map(|id| components.push(id))
             }
-            Edit::RemoveComponent(id) => self.remove_component(*id).map(|_| Applied::Component(*id)),
-            Edit::MoveComponent(id, pos) => self.move_component(*id, *pos).map(|()| Applied::Component(*id)),
-            Edit::SetRotation(id, rot) => self.set_rotation(*id, *rot).map(|()| Applied::Component(*id)),
-            Edit::SetKind(id, kind) => self.set_kind(*id, *kind).map(|()| Applied::Component(*id)),
-            Edit::Connect { from, to, via } => {
-                self.connect(*from, *to, via.clone()).map(|id| Applied::Wire { id, to: to.component })
+            Edit::RemoveComponent(id) => self.remove_component(*id).map(|_| components.push(*id)),
+            Edit::MoveComponent(id, pos) => self.move_component(*id, *pos).map(|()| components.push(*id)),
+            Edit::SetRotation(id, rot) => self.set_rotation(*id, *rot).map(|()| components.push(*id)),
+            Edit::SetKind(id, kind) => self.set_kind(*id, *kind).map(|()| components.push(*id)),
+            Edit::AddWire { from, to, via } => self.add_wire(*from, *to, via),
+            Edit::RemoveSegment(s) => self.remove_segment(*s),
+            Edit::MoveNode(n, p) => self.move_node(*n, *p),
+            Edit::DragSegment(s, d) => self.drag_segment(*s, *d),
+            Edit::SetMemoryWord { id, addr, value } => {
+                self.set_memory_word(*id, *addr, *value).map(|()| memory = Some(*id))
             }
-            Edit::Disconnect(id) => self.disconnect(*id).map(|w| Applied::Wire { id: *id, to: w.to.component }),
-        }
-    }
-
-    /// Returns the wire driving a given input pin, if any.
-    #[must_use]
-    pub fn driver_of(&self, input: PinRef) -> Option<&Wire> {
-        if !self.driven.contains(&input) {
-            return None;
-        }
-        self.wires.values().find(|w| w.to == input)
+            Edit::SetMemory { id, words } => self.set_memory(*id, words).map(|()| memory = Some(*id)),
+        };
+        let log = std::mem::take(&mut self.log);
+        r?;
+        let mut a = Applied {
+            components,
+            segments: log.segments,
+            nodes: log.nodes,
+            pins: log.pins,
+            memory,
+            connectivity: edit.affects_netlist(),
+        };
+        a.segments.sort_unstable();
+        a.segments.dedup();
+        a.nodes.sort_unstable();
+        a.nodes.dedup();
+        a.pins.sort_unstable();
+        a.pins.dedup();
+        Ok(a)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::GateOp;
+    use crate::component::{FlipFlopType, GateOp, MemoryType};
 
     fn and2() -> ComponentKind {
         ComponentKind::Gate { op: GateOp::And, inputs: 2 }
@@ -345,35 +497,91 @@ mod tests {
     fn connect_rules() {
         let mut c = Circuit::new();
         let s = c.add_component(ComponentKind::Switch { on: false }, GridPos::new(0, 0), Rotation::R0).unwrap();
+        let s2 = c.add_component(ComponentKind::Switch { on: false }, GridPos::new(0, 6), Rotation::R0).unwrap();
         let g = c.add_component(and2(), GridPos::new(4, 0), Rotation::R0).unwrap();
         let out = PinRef { component: s, pin: 0 };
         let in0 = PinRef { component: g, pin: 0 };
         let gout = PinRef { component: g, pin: 2 };
         c.connect(out, in0, vec![]).unwrap();
-        assert_eq!(c.connect(out, in0, vec![]), Err(CircuitError::InputAlreadyDriven(in0)));
-        assert_eq!(c.connect(out, gout, vec![]), Err(CircuitError::TwoOutputs));
-        assert_eq!(c.connect(in0, gout, vec![]), Err(CircuitError::SourceNotOutput));
+        // A second output on the same net is refused, in either direction.
+        let s2out = PinRef { component: s2, pin: 0 };
+        assert_eq!(c.connect(s2out, in0, vec![]), Err(CircuitError::TwoDrivers(out, s2out)));
+        assert_eq!(c.connect(out, gout, vec![]), Err(CircuitError::TwoDrivers(out, gout)));
+        assert_eq!(c.connect(out, out, vec![]), Err(CircuitError::SameNode));
         c.remove_component(s).unwrap();
-        assert_eq!(c.wire_count(), 0);
+        assert_eq!((c.segment_count(), c.node_count()), (0, 0), "dangling wire removed with its driver");
+    }
+
+    /// Only tri-state outputs may share a net (a bus); a plain output can
+    /// neither join nor start one.
+    #[test]
+    fn tristate_bus_relaxes_single_driver_rule_only_for_tristates() {
+        let mut c = Circuit::new();
+        let t1 = c.add_component(ComponentKind::TriState, GridPos::new(0, 0), Rotation::R0).unwrap();
+        let t2 = c.add_component(ComponentKind::TriState, GridPos::new(0, 6), Rotation::R0).unwrap();
+        let sw = c.add_component(ComponentKind::Switch { on: true }, GridPos::new(0, 12), Rotation::R0).unwrap();
+        let led = c.add_component(ComponentKind::Led, GridPos::new(10, 0), Rotation::R0).unwrap();
+        let led2 = c.add_component(ComponentKind::Led, GridPos::new(10, 6), Rotation::R0).unwrap();
+        let o = |id| PinRef { component: id, pin: 2 };
+        let li = PinRef { component: led, pin: 0 };
+        c.connect(o(t1), li, vec![]).unwrap();
+        c.connect(o(t2), li, vec![]).unwrap();
+        assert_eq!(c.drivers_of(li).len(), 2);
+        let sw_out = PinRef { component: sw, pin: 0 };
+        assert!(matches!(c.connect(sw_out, li, vec![]), Err(CircuitError::TwoDrivers(..))), "plain output");
+        // A plain output first: no tri-state may join it.
+        let l2 = PinRef { component: led2, pin: 0 };
+        c.connect(sw_out, l2, vec![]).unwrap();
+        assert!(matches!(c.connect(o(t1), l2, vec![]), Err(CircuitError::TwoDrivers(..))));
+        c.remove_component(t1).unwrap();
+        assert_eq!(c.drivers_of(li), vec![o(t2)]);
+        // A wired tri-state cannot become a plain gate with the same pin count.
+        assert!(c.set_kind(t2, and2()).is_err());
+        c.remove_component(led).unwrap();
+        c.set_kind(t2, and2()).unwrap();
+        c.check().unwrap();
+    }
+
+    #[test]
+    fn memory_contents_follow_kind_and_edits() {
+        let mut c = Circuit::new();
+        let ram = ComponentKind::Memory { ty: MemoryType::Ram, addr_bits: 4, data_bits: 8 };
+        let m = c.add_component(ram, GridPos::default(), Rotation::R0).unwrap();
+        assert_eq!(c.memory(m).unwrap().len(), 16);
+        c.apply(&Edit::SetMemoryWord { id: m, addr: 3, value: 0x1ff }).unwrap();
+        assert_eq!(c.memory(m).unwrap()[3], 0xff, "masked to 8 bits");
+        assert!(c.set_memory_word(m, 16, 1).is_err());
+        c.apply(&Edit::SetMemory { id: m, words: Arc::from(vec![7u16; 40]) }).unwrap();
+        assert_eq!(*c.memory(m).unwrap(), vec![7; 16], "truncated");
+        let bigger = ComponentKind::Memory { ty: MemoryType::Ram, addr_bits: 5, data_bits: 2 };
+        c.set_kind(m, bigger).unwrap();
+        let img = c.memory(m).unwrap();
+        assert_eq!(img.len(), 32);
+        assert_eq!((img[0], img[31]), (3, 0), "masked to 2 bits and zero-filled");
+        let ff = c.add_component(ComponentKind::flip_flop(FlipFlopType::D), GridPos::default(), Rotation::R0).unwrap();
+        assert_eq!(c.set_memory_word(ff, 0, 1), Err(CircuitError::NotAMemory(ff)));
+        assert!(c.memory(ff).is_none());
     }
 
     #[test]
     fn edits_replay_identically() {
+        let pin = |c, p| PinRef { component: ComponentId(c), pin: p };
         let edits = [
             Edit::AddComponent {
                 kind: ComponentKind::Switch { on: true },
                 pos: GridPos::new(0, 0),
                 rotation: Rotation::R0,
             },
-            Edit::AddComponent { kind: and2(), pos: GridPos::new(4, 0), rotation: Rotation::R0 },
-            Edit::Connect {
-                from: PinRef { component: ComponentId(0), pin: 0 },
-                to: PinRef { component: ComponentId(1), pin: 0 },
-                via: vec![GridPos::new(2, 1)],
+            Edit::AddComponent { kind: and2(), pos: GridPos::new(6, 0), rotation: Rotation::R0 },
+            Edit::AddWire { from: WireEnd::Pin(pin(0, 0)), to: WireEnd::Pin(pin(1, 0)), via: vec![] },
+            Edit::AddWire {
+                from: WireEnd::OnSegment(SegmentId(0), GridPos::new(3, 1)),
+                to: WireEnd::Pin(pin(1, 1)),
+                via: vec![GridPos::new(3, 3)],
             },
             Edit::MoveComponent(ComponentId(1), GridPos::new(8, 2)),
             Edit::SetRotation(ComponentId(1), Rotation::R90),
-            Edit::Disconnect(WireId(0)),
+            Edit::RemoveSegment(SegmentId(0)),
             Edit::RemoveComponent(ComponentId(0)),
         ];
         let mut a = Circuit::new();
@@ -381,6 +589,7 @@ mod tests {
         for e in &edits {
             let ra = a.apply(e).unwrap();
             assert_eq!(b.apply(e).unwrap(), ra);
+            a.check().unwrap();
         }
         assert_eq!(a.component_count(), 1);
         assert_eq!(a.components().collect::<Vec<_>>(), b.components().collect::<Vec<_>>());

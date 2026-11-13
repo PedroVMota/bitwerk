@@ -536,6 +536,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "bw-core",
+ "bw-io",
  "crossbeam-channel",
  "thiserror 2.0.21",
  "tracing",

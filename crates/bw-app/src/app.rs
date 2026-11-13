@@ -4,9 +4,12 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bw_core::{Applied, Circuit, CircuitError, ComponentId, ComponentKind, Edit, GateOp, GridPos, PinRef, WireId};
-use bw_render::{Camera, CanvasRenderer, Change, DrawMode, FrameView, Scene, SymbolKind, SymbolStyle};
-use bw_sim::{Command, RunState, SimHandle, StepMode};
+use bw_core::{
+    Applied, Circuit, CircuitError, ComponentId, ComponentKind, DATA_WIDTHS, Edit, FfTrigger, FlipFlopType, GateOp,
+    GridPos, MemoryType, SegmentId, WireEnd,
+};
+use bw_render::{Camera, CanvasRenderer, DrawMode, FrameView, Scene, SymbolKind, SymbolStyle};
+use bw_sim::{Command, RunState, SimError, SimHandle, StepMode};
 use crossbeam_channel::Receiver;
 
 use crate::menu::{MenuAction, NativeMenu};
@@ -71,8 +74,14 @@ pub struct BitwerkApp {
     pub tool: Tool,
     pub gate_inputs: u8,
     pub selection: Option<ComponentId>,
-    pub wire_start: Option<PinRef>,
+    /// Selected wire segment (exclusive with `selection`).
+    pub selected_segment: Option<SegmentId>,
+    /// Wire being drawn with the Wire tool.
+    pub wire_draft: Option<crate::canvas::WireDraft>,
     pub drag: Option<crate::canvas::DragState>,
+    /// Net highlighted under the cursor: (revision, hovered segment, its
+    /// segments), recomputed only when either changes.
+    pub hover_net: Option<(u64, SegmentId, Vec<SegmentId>)>,
     pub status: String,
     /// Schematic symbol style (View menu / palette). Runtime only: eframe's
     /// persistence is not enabled, so there is no settings store yet.
@@ -82,6 +91,8 @@ pub struct BitwerkApp {
     confirm: Option<Pending>,
     debug: DebugOpts,
     menu: Option<NativeMenu>,
+    /// The Memory Contents window, if open.
+    pub memory_window: Option<crate::memwin::MemoryWindow>,
 
     // Stats
     frame_times: VecDeque<f32>,
@@ -135,8 +146,10 @@ impl BitwerkApp {
             tool: Tool::Select,
             gate_inputs: 2,
             selection: None,
-            wire_start: None,
+            selected_segment: None,
+            wire_draft: None,
             drag: None,
+            hover_net: None,
             status: "Ready".into(),
             style: SymbolStyle::Ansi,
             step_mode: StepMode::HalfCycle,
@@ -144,6 +157,7 @@ impl BitwerkApp {
             confirm: None,
             debug: DebugOpts::default(),
             menu,
+            memory_window: None,
             frame_times: VecDeque::with_capacity(120),
             frames_since_log: 0,
             canvas_state: (DrawMode::All(0), None),
@@ -183,6 +197,17 @@ impl BitwerkApp {
         if args.iter().any(|a| a == "--continuous") {
             app.debug.continuous_repaint = true;
         }
+        // `--run`: start the simulation right away (automation, demos).
+        if args.iter().any(|a| a == "--run") {
+            app.sim.send(Command::Run);
+        }
+        // `--memory-window ID`: open the Memory Contents window of component
+        // `ID` (automation / screenshots).
+        if let Some(id) = args.iter().position(|a| a == "--memory-window").and_then(|i| args.get(i + 1)) {
+            if let Ok(id) = id.parse::<u32>() {
+                crate::memwin::open(&mut app, ComponentId(id));
+            }
+        }
         // `--sweep` (with `--stress`): scripted, self-terminating measurement.
         if args.iter().any(|a| a == "--sweep") {
             let csv = args.iter().position(|a| a == "--sweep-csv").and_then(|i| args.get(i + 1)).map(PathBuf::from);
@@ -220,11 +245,7 @@ impl BitwerkApp {
         if self.full_build_pending {
             self.scene_worker.request(Arc::clone(&self.circuit), self.revision);
         } else {
-            let change = match &applied {
-                Applied::Component(id) => Change::Component(*id),
-                Applied::Wire { id, .. } => Change::Wire(*id),
-            };
-            self.scene.apply(&self.circuit, &[change], self.revision);
+            self.scene.apply(&self.circuit, &applied, self.revision);
             // Many deletions leave holes; compact with a background rebuild.
             if self.scene.free_ratio() > 0.5 && self.scene.slot_count() > 50_000 {
                 self.commit_rebuild();
@@ -256,9 +277,12 @@ impl BitwerkApp {
         self.name = name;
         self.path = path;
         self.dirty = false;
+        crate::memwin::close(self);
         self.selection = None;
-        self.wire_start = None;
+        self.selected_segment = None;
+        self.wire_draft = None;
         self.drag = None;
+        self.hover_net = None;
         self.fit_on_next_scene = true;
         self.sim.send(Command::Stop);
         self.commit_full();
@@ -380,8 +404,11 @@ impl BitwerkApp {
                 match res {
                     Ok(c) => {
                         self.event("circuit-arrived");
-                        self.status =
-                            format!("Stress test: {} components, {} wires", c.component_count(), c.wire_count());
+                        self.status = format!(
+                            "Stress test: {} components, {} wire segments",
+                            c.component_count(),
+                            c.segment_count()
+                        );
                         self.replace_circuit(c, "stress-test".into(), None);
                         self.dirty = true;
                     }
@@ -464,7 +491,7 @@ impl BitwerkApp {
             ui.colored_label(color, txt);
             ui.label(format!("tick {}", snap.tick));
             if let Some(e) = &snap.error {
-                ui.colored_label(egui::Color32::LIGHT_RED, e.to_string());
+                ui.colored_label(egui::Color32::LIGHT_RED, self.describe_error(e));
             }
             if self.menu.is_none() {
                 ui.separator();
@@ -479,6 +506,25 @@ impl BitwerkApp {
                 }
             }
         });
+    }
+
+    /// Error message with component names (bus contention lists the
+    /// drivers by kind and id).
+    fn describe_error(&self, e: &SimError) -> String {
+        match e {
+            SimError::BusContention { net, drivers } => {
+                let names: Vec<String> = drivers
+                    .iter()
+                    .map(|id| {
+                        let label = self.circuit.component(*id).map_or("?", |c| c.kind.label());
+                        format!("{label} #{}", id.0)
+                    })
+                    .collect();
+                format!("Bus contention, process halted: net {net} driven by {}", names.join(" and "))
+            }
+            SimError::RaceCondition { net } => format!("Race condition, process halted (net {net})"),
+            SimError::TooLarge => e.to_string(),
+        }
     }
 
     fn palette(&mut self, ui: &mut egui::Ui) {
@@ -514,6 +560,12 @@ impl BitwerkApp {
             ComponentKind::Switch { on: false },
             ComponentKind::Clock { half_period: 10 },
             ComponentKind::Led,
+            ComponentKind::TriState,
+            ComponentKind::flip_flop(FlipFlopType::D),
+            ComponentKind::flip_flop(FlipFlopType::Rs),
+            ComponentKind::flip_flop(FlipFlopType::Jk),
+            ComponentKind::memory(MemoryType::Ram),
+            ComponentKind::memory(MemoryType::Rom),
         ]);
         let style = self.style;
         egui::Grid::new("palette-components").spacing([4.0, 4.0]).show(ui, |ui| {
@@ -521,12 +573,23 @@ impl BitwerkApp {
                 let selected = matches!(self.tool, Tool::Place(k) if same_palette_entry(k, kind));
                 // Icons show the 2-input variant; the placed gate uses the
                 // input count above.
+                // Memories show a small variant (the 256 × 8 default is
+                // very tall for an icon).
                 let sym = match kind {
                     ComponentKind::Gate { op, .. } => SymbolKind::Gate(op, 2),
+                    ComponentKind::Memory { ty, .. } => SymbolKind::Memory(ty, 4, 1),
                     k => SymbolKind::of(&k),
                 };
                 let tip = match kind {
                     ComponentKind::Gate { op, inputs } => format!("{} gate ({inputs} inputs)", op.name()),
+                    ComponentKind::FlipFlop { trigger, .. } => {
+                        format!("{} ({}; change it in Properties)", SymbolKind::of(&kind).name(), trigger.name())
+                    }
+                    ComponentKind::Memory { addr_bits, data_bits, .. } => format!(
+                        "{} ({} words × {data_bits} bits; change it in Properties)",
+                        SymbolKind::of(&kind).name(),
+                        1u32 << addr_bits
+                    ),
                     k => SymbolKind::of(&k).name().to_string(),
                 };
                 if crate::icons::button(ui, sym, style, kind.label(), &tip, selected, true).clicked() {
@@ -549,17 +612,26 @@ impl BitwerkApp {
             });
         });
         ui.separator();
-        ui.small("Scroll wheel / pinch: zoom\nTrackpad scroll or drag empty space: pan\nR: rotate · Del: delete · Esc: cancel");
+        ui.small(
+            "Scroll wheel / pinch: zoom\nTrackpad scroll or drag empty space: pan\nR: rotate · Del: delete · Esc: cancel\n\
+             Wire: click a pin or a wire, click to bend, finish on a pin or a wire · / or Space: flip the L",
+        );
     }
 
+    #[allow(clippy::too_many_lines, reason = "one editor per component kind")]
     fn properties(&mut self, ui: &mut egui::Ui) {
         ui.heading("Properties");
+        if let Some(seg) = self.selected_segment {
+            self.segment_properties(ui, seg);
+            return;
+        }
         let Some(id) = self.selection else {
             ui.weak("Nothing selected");
             ui.separator();
             ui.label(format!("Project: {}{}", self.name, if self.dirty { " •" } else { "" }));
             ui.label(format!("{} components", self.circuit.component_count()));
-            ui.label(format!("{} wires", self.circuit.wire_count()));
+            ui.label(format!("{} wire segments", self.circuit.segment_count()));
+            ui.label(format!("{} junctions", self.scene.dot_count()));
             return;
         };
         let Some(comp) = self.circuit.component(id).cloned() else {
@@ -593,7 +665,45 @@ impl BitwerkApp {
             ComponentKind::Switch { on } => {
                 ui.checkbox(on, "on");
             }
-            ComponentKind::Not | ComponentKind::Led => {}
+            ComponentKind::FlipFlop { ty, trigger, preset_clear } => {
+                egui::ComboBox::from_label("type").selected_text(ty.name()).show_ui(ui, |ui| {
+                    for t in FlipFlopType::ALL {
+                        ui.selectable_value(ty, t, t.name());
+                    }
+                });
+                egui::ComboBox::from_label("trigger").selected_text(trigger.name()).show_ui(ui, |ui| {
+                    for t in FfTrigger::ALL {
+                        let ok =
+                            ComponentKind::FlipFlop { ty: *ty, trigger: t, preset_clear: *preset_clear }.is_valid();
+                        ui.add_enabled_ui(ok, |ui| ui.selectable_value(trigger, t, t.name()));
+                    }
+                });
+                if *ty == FlipFlopType::Jk && *trigger == FfTrigger::Latch {
+                    *trigger = FfTrigger::MasterSlave;
+                }
+                ui.checkbox(preset_clear, "preset / clear pins");
+            }
+            ComponentKind::Memory { ty, addr_bits, data_bits } => {
+                egui::ComboBox::from_label("type").selected_text(ty.name()).show_ui(ui, |ui| {
+                    ui.selectable_value(ty, MemoryType::Ram, "RAM");
+                    ui.selectable_value(ty, MemoryType::Rom, "ROM");
+                });
+                ui.add(
+                    egui::DragValue::new(addr_bits)
+                        .range(bw_core::MIN_ADDR_BITS..=bw_core::MAX_ADDR_BITS)
+                        .prefix("address lines "),
+                );
+                egui::ComboBox::from_label("data bits").selected_text(data_bits.to_string()).show_ui(ui, |ui| {
+                    for d in DATA_WIDTHS {
+                        ui.selectable_value(data_bits, d, d.to_string());
+                    }
+                });
+                ui.label(format!("{} words × {} bits", 1u32 << *addr_bits, *data_bits));
+                if ui.button("Edit contents…").clicked() {
+                    crate::memwin::open(self, id);
+                }
+            }
+            ComponentKind::Not | ComponentKind::Led | ComponentKind::TriState => {}
         }
         if kind != comp.kind {
             let res = if let ComponentKind::Switch { on } = kind {
@@ -609,7 +719,7 @@ impl BitwerkApp {
                 self.apply_edit(Edit::SetKind(id, kind)).map(|_| ())
             };
             if res.is_err() {
-                self.status = "Disconnect the wires before changing the pin count".into();
+                self.status = "Disconnect the wires before changing the pins of this component".into();
             }
         }
         ui.separator();
@@ -621,6 +731,33 @@ impl BitwerkApp {
         }
     }
 
+    /// Properties of a selected wire segment.
+    fn segment_properties(&mut self, ui: &mut egui::Ui, seg: SegmentId) {
+        let (Some(sg), Some((a, b))) = (self.circuit.segment(seg).copied(), self.circuit.segment_ends(seg)) else {
+            self.selected_segment = None;
+            return;
+        };
+        ui.label("Wire segment");
+        ui.label(format!("({}, {}) → ({}, {})", a.x, a.y, b.x, b.y));
+        let len = (b.x - a.x).abs() + (b.y - a.y).abs();
+        ui.label(format!("length {len}"));
+        let drivers = self.circuit.net_drivers(sg.a);
+        let net = match drivers.as_slice() {
+            [] => "net: no driver (floating)".to_string(),
+            [d] => {
+                let label = self.circuit.component(d.component).map_or("?", |c| c.kind.label());
+                format!("net driven by {label} #{}", d.component.0)
+            }
+            many => format!("net: bus of {} tri-state drivers", many.len()),
+        };
+        ui.label(net);
+        ui.separator();
+        ui.small("Drag it to move it sideways.\nDrag a junction or bend to move it.");
+        if ui.button("Delete segment (Del)").clicked() {
+            self.delete_selected();
+        }
+    }
+
     pub fn rotate_selected(&mut self) {
         if let Some(id) = self.selection {
             self.edit_rotate(id);
@@ -628,7 +765,11 @@ impl BitwerkApp {
     }
 
     pub fn delete_selected(&mut self) {
-        if let Some(id) = self.selection.take() {
+        if let Some(seg) = self.selected_segment.take() {
+            if let Err(e) = self.apply_edit(Edit::RemoveSegment(seg)) {
+                self.status = e.to_string();
+            }
+        } else if let Some(id) = self.selection.take() {
             self.edit_delete(id);
         }
     }
@@ -647,17 +788,14 @@ impl BitwerkApp {
     }
 
     pub fn edit_place(&mut self, kind: ComponentKind, origin: GridPos) -> Result<ComponentId, CircuitError> {
-        match self.apply_edit(Edit::AddComponent { kind, pos: origin, rotation: bw_core::Rotation::R0 })? {
-            Applied::Component(id) => Ok(id),
-            Applied::Wire { .. } => Err(CircuitError::IdSpaceExhausted),
-        }
+        self.apply_edit(Edit::AddComponent { kind, pos: origin, rotation: bw_core::Rotation::R0 })?
+            .component()
+            .ok_or(CircuitError::IdSpaceExhausted)
     }
 
-    pub fn edit_connect(&mut self, from: PinRef, to: PinRef) -> Result<WireId, CircuitError> {
-        match self.apply_edit(Edit::Connect { from, to, via: Vec::new() })? {
-            Applied::Wire { id, .. } => Ok(id),
-            Applied::Component(_) => Err(CircuitError::IdSpaceExhausted),
-        }
+    /// Draws a wire between two ends through `via` (see [`Edit::AddWire`]).
+    pub fn edit_wire(&mut self, from: WireEnd, to: WireEnd, via: Vec<GridPos>) -> Result<Applied, CircuitError> {
+        self.apply_edit(Edit::AddWire { from, to, via })
     }
 
     pub fn edit_delete(&mut self, id: ComponentId) -> bool {
@@ -799,12 +937,26 @@ impl BitwerkApp {
                 i.key_pressed(egui::Key::F12),
             )
         });
-        if del {
+        // Wire tool: '/' or Space flips the L of the leg being drawn.
+        let flip = ctx.input(|i| i.key_pressed(egui::Key::Slash) || i.key_pressed(egui::Key::Space));
+        if let Some(d) = self.wire_draft.as_mut() {
+            if flip {
+                d.vertical_first = !d.vertical_first;
+            }
+            if del {
+                // While drawing, Delete / Backspace removes the last bend.
+                if d.bends.pop().is_none() {
+                    self.wire_draft = None;
+                }
+            }
+        } else if del {
             self.delete_selected();
         }
         if esc {
-            if self.wire_start.is_some() {
-                self.wire_start = None;
+            if self.wire_draft.is_some() {
+                self.wire_draft = None;
+            } else if self.drag.is_some() {
+                self.drag = None;
             } else {
                 self.tool = Tool::Select;
             }
@@ -855,10 +1007,13 @@ impl BitwerkApp {
     }
 }
 
-/// Same palette entry (gates by operation, others by kind)?
+/// Same palette entry (gates by operation, flip-flops and memories by
+/// type, others by kind)?
 fn same_palette_entry(a: ComponentKind, b: ComponentKind) -> bool {
     match (a, b) {
         (ComponentKind::Gate { op: x, .. }, ComponentKind::Gate { op: y, .. }) => x == y,
+        (ComponentKind::FlipFlop { ty: x, .. }, ComponentKind::FlipFlop { ty: y, .. }) => x == y,
+        (ComponentKind::Memory { ty: x, .. }, ComponentKind::Memory { ty: y, .. }) => x == y,
         _ => std::mem::discriminant(&a) == std::mem::discriminant(&b),
     }
 }
@@ -866,10 +1021,6 @@ fn same_palette_entry(a: ComponentKind, b: ComponentKind) -> bool {
 /// Caption under a palette icon.
 fn short_name(kind: SymbolKind) -> &'static str {
     match kind {
-        SymbolKind::DFlipFlop => "D-FF",
-        SymbolKind::RsFlipFlop => "RS-FF",
-        SymbolKind::JkFlipFlop => "JK-FF",
-        SymbolKind::TriState => "Tri-state",
         SymbolKind::SevenSegment => "7-seg",
         SymbolKind::NumericOutput => "Number",
         SymbolKind::Vcc => "VCC",
@@ -946,6 +1097,7 @@ impl eframe::App for BitwerkApp {
             self.canvas_size = glam::Vec2::new(rect.width(), rect.height());
             self.stats_overlay(ui, rect);
         });
+        crate::memwin::show(self, &ctx);
         self.confirm_dialog(&ctx);
         if let Some(mut sweep) = self.sweep.take() {
             sweep.end_frame(self);

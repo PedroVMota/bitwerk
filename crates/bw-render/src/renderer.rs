@@ -14,8 +14,11 @@
 //!   shader. At far zoom (below [`SYMBOL_LOD_PX`] pixels per unit) bodies
 //!   fall back to one quad each, exactly as before.
 //! * Draw calls per frame: grid + wires + either one body draw (quads) or
-//!   one per kind code ([`crate::symbols::KIND_CODES`] = 10), independent
+//!   one per kind code ([`crate::symbols::KIND_CODES`] = 17: the component
+//!   kinds plus the junction dots), independent
 //!   of the number of objects.
+//! * Net levels are four-state (0, 1, Z, X) at 2 bits per signal slot (16
+//!   per `u32`) in one storage buffer; see [`NetLevels`].
 //!
 //! Call order per frame: [`CanvasRenderer::prepare`] (uploads; needs the
 //! mutable scene), [`CanvasRenderer::encode`] (culling compute pass, before
@@ -28,7 +31,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::Vec2;
 
 use crate::camera::Camera;
-use crate::scene::{BodyInstance, NO_NET, Scene, WireInstance};
+use crate::scene::{BodyInstance, Scene, WireInstance};
 use crate::symbols::{self, KIND_CODES, SymVertex, SymbolStyle};
 
 /// Below this many slots culling is not worth a compute pass: draw all.
@@ -100,12 +103,18 @@ struct Globals {
 pub trait NetLevels {
     /// Changes whenever the levels change.
     fn key(&self) -> u64;
-    /// Circuit revision the levels belong to.
-    fn revision(&self) -> u64;
-    /// One byte (0/1) per net.
-    fn levels(&self) -> &[u8];
-    /// Component driving each net (same length as `levels`).
-    fn net_components(&self) -> &[ComponentId];
+    /// Changes whenever the net numbering changes (a recompilation).
+    fn compile_key(&self) -> u64;
+    /// Four-state level of every net (0 low, 1 high, 2 floating, 3
+    /// unknown), packed 2 bits per net, 16 nets per word.
+    fn levels(&self) -> &[u32];
+    /// Number of nets.
+    fn net_count(&self) -> usize;
+    /// The output pins driving net `n` are
+    /// `driver_pins()[driver_start()[n]..driver_start()[n + 1]]`.
+    fn driver_start(&self) -> &[u32];
+    /// (component, output index) of each driver.
+    fn driver_pins(&self) -> &[(ComponentId, u8)];
 }
 
 /// Camera and viewport of one frame.
@@ -186,13 +195,14 @@ pub struct CanvasRenderer {
     /// This frame draws symbol meshes (else quads).
     symbols: bool,
 
-    // Net levels (one bit per body slot).
+    // Net levels (2 bits per signal slot).
     net_buf: wgpu::Buffer,
     net_buf_words: u64,
     net_bits: Vec<u32>,
     net_key: Option<u64>,
-    map_key: Option<(u64, usize, u64, u64)>,
-    slot_of_net: Vec<u32>,
+    map_key: Option<(u64, u64, u64)>,
+    /// (net, signal slot) pairs: every output pin with its net.
+    slot_of_net: Vec<(u32, u32)>,
     net_valid: bool,
     net_count: u32,
 
@@ -654,31 +664,40 @@ impl CanvasRenderer {
             self.net_valid = false;
             return;
         };
-        let comps = nets.net_components();
-        // Net index → body slot. Only depends on the simulator's compilation
+        // Net → signal slots. Only depends on the simulator's compilation
         // and on the scene's slot assignment, so it is rebuilt once per edit.
-        let map_key = (nets.revision(), comps.len(), scene.id(), scene.layout_version());
+        let map_key = (nets.compile_key(), scene.id(), scene.layout_version());
         let map_changed = self.map_key != Some(map_key);
         if map_changed {
             self.map_key = Some(map_key);
             self.slot_of_net.clear();
-            self.slot_of_net.extend(comps.iter().map(|&id| scene.body_slot(id).unwrap_or(NO_NET)));
+            let (start, pins) = (nets.driver_start(), nets.driver_pins());
+            for net in 0..nets.net_count().min(start.len().saturating_sub(1)) {
+                let (s, e) = (start[net] as usize, (start[net + 1] as usize).min(pins.len()));
+                for &(id, k) in pins.get(s..e).unwrap_or(&[]) {
+                    if let Some(slot) = scene.signal_slot(id, k) {
+                        self.slot_of_net.push((u32::try_from(net).unwrap_or(u32::MAX), slot));
+                    }
+                }
+            }
         }
         if !map_changed && self.net_key == Some(nets.key()) {
             return;
         }
         self.net_key = Some(nets.key());
-        // Levels of an older revision stay meaningful: they are mapped
+        // Levels of an older compilation stay meaningful: they are mapped
         // through component ids, so unchanged components keep their colour
-        // while the simulator recompiles after an edit.
-        let slots = scene.bodies().len();
+        // while the simulator recompiles after an edit. Slots without a
+        // known net show as floating (Z = 0b10 in every 2-bit field).
+        let slots = scene.signal_count() as usize;
         self.net_bits.clear();
-        self.net_bits.resize(slots.div_ceil(32).max(1), 0);
-        for (&lvl, &slot) in nets.levels().iter().zip(&self.slot_of_net) {
-            if lvl != 0 && slot != NO_NET {
-                if let Some(w) = self.net_bits.get_mut(slot as usize / 32) {
-                    *w |= 1 << (slot % 32);
-                }
+        self.net_bits.resize(slots.div_ceil(16).max(1), 0xAAAA_AAAA);
+        let levels = nets.levels();
+        for &(net, slot) in &self.slot_of_net {
+            let lvl = levels.get(net as usize / 16).map_or(2, |w| (w >> (2 * (net % 16))) & 3);
+            if let Some(w) = self.net_bits.get_mut(slot as usize / 16) {
+                let sh = 2 * (slot % 16);
+                *w = (*w & !(3 << sh)) | (lvl << sh);
             }
         }
         let words = self.net_bits.len() as u64;

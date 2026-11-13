@@ -17,26 +17,51 @@
 use std::time::Instant;
 
 use bw_core::{Circuit, ComponentId, ComponentKind, Edit, GridPos, Rotation};
-use bw_render::{Camera, CanvasRenderer, Change, FrameView, NetLevels, Scene};
+use bw_render::{Camera, CanvasRenderer, FrameView, NetLevels, Scene};
 use glam::Vec2;
 
+/// Test levels: one net per listed output pin (component, output index).
 struct Levels {
-    levels: Vec<u8>,
-    comps: Vec<ComponentId>,
+    packed: Vec<u32>,
+    count: usize,
+    start: Vec<u32>,
+    pins: Vec<(ComponentId, u8)>,
+    key: u64,
+}
+
+impl Levels {
+    /// `nets`: (level 0..=3, driving output pins).
+    fn new(nets: &[(u8, &[(ComponentId, u8)])]) -> Self {
+        let mut packed = vec![0u32; nets.len().div_ceil(16).max(1)];
+        let mut start = vec![0u32];
+        let mut pins = Vec::new();
+        for (i, (lvl, drivers)) in nets.iter().enumerate() {
+            packed[i / 16] |= u32::from(*lvl) << (2 * (i % 16));
+            pins.extend_from_slice(drivers);
+            start.push(pins.len() as u32);
+        }
+        Self { packed, count: nets.len(), start, pins, key: 1 }
+    }
 }
 
 impl NetLevels for Levels {
     fn key(&self) -> u64 {
+        self.key
+    }
+    fn compile_key(&self) -> u64 {
         1
     }
-    fn revision(&self) -> u64 {
-        1
+    fn levels(&self) -> &[u32] {
+        &self.packed
     }
-    fn levels(&self) -> &[u8] {
-        &self.levels
+    fn net_count(&self) -> usize {
+        self.count
     }
-    fn net_components(&self) -> &[ComponentId] {
-        &self.comps
+    fn driver_start(&self) -> &[u32] {
+        &self.start
+    }
+    fn driver_pins(&self) -> &[(ComponentId, u8)] {
+        &self.pins
     }
 }
 
@@ -193,7 +218,7 @@ fn renders_switch_body_and_grid() {
     let sw = circuit.add_component(ComponentKind::Switch { on: true }, GridPos::new(0, 0), Rotation::R0).unwrap();
     let mut scene = Scene::build(&circuit, 1);
     let mut r = CanvasRenderer::new(&g.device, FORMAT, 1);
-    let nets = Levels { levels: vec![1], comps: vec![sw] };
+    let nets = Levels::new(&[(1, &[(sw, 0)])]);
     let _ = t.frame(&g, &mut r, &mut scene, &view(Vec2::new(1.0, 1.0), 40.0, 200, 200), Some(&nets), true);
     let px = t.read(&g);
     let center = px[(100 * 200 + 100) as usize];
@@ -236,7 +261,7 @@ fn renders_symbols_with_strokes_where_expected() {
     let _not = add(&mut c, ComponentKind::Not, 12, 8, Rotation::R0);
     c.connect(PinRef { component: sw, pin: 0 }, PinRef { component: led, pin: 0 }, vec![]).unwrap();
     let mut scene = Scene::build(&c, 1);
-    let nets = Levels { levels: vec![1, 0, 0], comps: vec![sw, sw_off, and] };
+    let nets = Levels::new(&[(1, &[(sw, 0)]), (0, &[(sw_off, 0)]), (0, &[(and, 0)])]);
     let (w, h) = (960u32, 640u32);
     let t = Target::new(&g, w, h, 1);
     let zoom = 40.0;
@@ -300,44 +325,185 @@ fn renders_symbols_with_strokes_where_expected() {
     assert!(!is_grid(px[(s.y as u32 * w + s.x as u32) as usize]), "LOD quad covers the corner");
 }
 
-/// The example with every component kind (negative coordinates, rotations,
-/// all input counts) renders through the symbol path at the app's MSAA.
+/// Four-state colours: a floating net (Z) and an unknown one (X) have their
+/// own wire and LED colours; Q and Q̄ stubs of a flip-flop each show their
+/// own output's level.
 #[test]
-fn example_with_every_component_renders() {
+fn four_state_levels_colour_wires_leds_and_output_pins() {
+    use bw_core::{FfTrigger, FlipFlopType, PinRef};
     let Some(g) = gpu() else {
         eprintln!("no GPU adapter; skipping");
         return;
     };
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/all-components.bitwerk");
-    let c = bw_io::load_from_path(&path).unwrap().circuit;
+    let mut c = Circuit::new();
+    let add = |c: &mut Circuit, kind, x, y| c.add_component(kind, GridPos::new(x, y), Rotation::R0).unwrap();
+    let sw_z = add(&mut c, ComponentKind::Switch { on: false }, 0, 0);
+    let led_z = add(&mut c, ComponentKind::Led, 6, 0);
+    let sw_x = add(&mut c, ComponentKind::Switch { on: false }, 0, 3);
+    let led_x = add(&mut c, ComponentKind::Led, 6, 3);
+    let ff = add(
+        &mut c,
+        ComponentKind::FlipFlop { ty: FlipFlopType::D, trigger: FfTrigger::RisingEdge, preset_clear: false },
+        0,
+        6,
+    );
+    c.connect(PinRef { component: sw_z, pin: 0 }, PinRef { component: led_z, pin: 0 }, vec![]).unwrap();
+    c.connect(PinRef { component: sw_x, pin: 0 }, PinRef { component: led_x, pin: 0 }, vec![]).unwrap();
     let mut scene = Scene::build(&c, 1);
-    let (w, h) = (900u32, 640u32);
-    let t = Target::new(&g, w, h, 4);
-    let mut r = CanvasRenderer::new(&g.device, FORMAT, 4);
-    let mut empty = Scene::default();
-    let v = view(Vec2::new(23.0, 7.0), 13.8, w, h);
-    let _ = t.frame(&g, &mut r, &mut empty, &v, None, true);
-    let _ = t.frame(&g, &mut r, &mut scene, &v, None, true);
-    assert!(r.draws_symbols());
+    let nets = Levels::new(&[(2, &[(sw_z, 0)]), (3, &[(sw_x, 0)]), (1, &[(ff, 0)]), (0, &[(ff, 1)])]);
+    let (w, h) = (400u32, 480u32);
+    let t = Target::new(&g, w, h, 1);
+    let v = view(Vec2::new(4.0, 5.0), 40.0, w, h);
+    let mut r = CanvasRenderer::new(&g.device, FORMAT, 1);
+    let _ = t.frame(&g, &mut r, &mut scene, &v, Some(&nets), true);
     let px = t.read(&g);
-    if let Ok(dir) = std::env::var("BW_SYMBOL_PNG") {
-        let raw: Vec<u8> = px.iter().flatten().copied().collect();
-        image::RgbaImage::from_raw(w, h, raw).unwrap().save(std::path::Path::new(&dir).join("example.png")).unwrap();
+    let at = |wx: f32, wy: f32| {
+        let s = v.camera.world_to_screen(Vec2::new(wx, wy), v.viewport_points);
+        px[(s.y as u32 * w + s.x as u32) as usize]
+    };
+    let level = |l: u8| bw_render::symbols::level_color(l);
+    assert!(near(at(4.0, 1.0), level(2), 8), "floating wire {:?}", at(4.0, 1.0));
+    assert!(near(at(4.0, 4.0), level(3), 8), "unknown wire {:?}", at(4.0, 4.0));
+    assert!(near(at(7.12, 1.3), [0.32; 3], 8), "floating LED {:?}", at(7.12, 1.3));
+    assert!(near(at(7.12, 4.3), bw_render::symbols::X_COLOR, 8), "unknown LED {:?}", at(7.12, 4.3));
+    assert!(near(at(7.8, 7.0), level(1), 8), "Q stub {:?}", at(7.8, 7.0));
+    assert!(near(at(7.8, 9.0), level(0), 8), "Q-bar stub {:?}", at(7.8, 9.0));
+}
+
+/// Junction dots render through the symbol path in the net colour: a dot
+/// is wider than the wire, sits exactly on the junction, appears when a
+/// branch is added and disappears when it is deleted. Far zoom (quads)
+/// leaves dots out.
+#[test]
+fn junction_dots_render() {
+    use bw_core::{PinRef, WireEnd};
+    let Some(g) = gpu() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let mut c = Circuit::new();
+    let sw = c.add_component(ComponentKind::Switch { on: true }, GridPos::new(0, 0), Rotation::R0).unwrap();
+    let l1 = c.add_component(ComponentKind::Led, GridPos::new(12, 0), Rotation::R0).unwrap();
+    let l2 = c.add_component(ComponentKind::Led, GridPos::new(12, 6), Rotation::R0).unwrap();
+    c.connect(PinRef { component: sw, pin: 0 }, PinRef { component: l1, pin: 0 }, vec![]).unwrap();
+    let mut scene = Scene::build(&c, 1);
+    assert_eq!(scene.dot_count(), 0);
+    let nets = Levels::new(&[(1, &[(sw, 0)])]);
+    let (w, h) = (480u32, 400u32);
+    let t = Target::new(&g, w, h, 1);
+    let v = view(Vec2::new(7.0, 4.0), 40.0, w, h);
+    let mut r = CanvasRenderer::new(&g.device, FORMAT, 1);
+    let at = |px: &[[u8; 4]], wx: f32, wy: f32| {
+        let s = v.camera.world_to_screen(Vec2::new(wx, wy), v.viewport_points);
+        px[(s.y as u32 * w + s.x as u32) as usize]
+    };
+    let high = bw_render::symbols::level_color(1);
+    let _ = t.frame(&g, &mut r, &mut scene, &v, Some(&nets), true);
+    let px = t.read(&g);
+    assert!(near(at(&px, 6.0, 1.0), high, 8), "wire {:?}", at(&px, 6.0, 1.0));
+    assert!(is_grid(at(&px, 6.0, 1.15)), "no dot yet: beside the thin wire is grid");
+
+    // Branch from the middle of the wire to the second LED: a junction.
+    let seg = c.segments().next().unwrap().0;
+    let a = c
+        .apply(&Edit::AddWire {
+            from: WireEnd::OnSegment(seg, GridPos::new(6, 1)),
+            to: WireEnd::Pin(PinRef { component: l2, pin: 0 }),
+            via: vec![GridPos::new(6, 7)],
+        })
+        .unwrap();
+    scene.apply(&c, &a, 2);
+    scene.validate(&c).unwrap();
+    assert_eq!(scene.dot_count(), 1);
+    let _ = t.frame(&g, &mut r, &mut scene, &v, Some(&nets), true);
+    let px = t.read(&g);
+    let dump = |name: &str, px: &[[u8; 4]]| {
+        if let Ok(dir) = std::env::var("BW_SYMBOL_PNG") {
+            let raw: Vec<u8> = px.iter().flatten().copied().collect();
+            image::RgbaImage::from_raw(w, h, raw).unwrap().save(std::path::Path::new(&dir).join(name)).unwrap();
+        }
+    };
+    dump("junction.png", &px);
+    for (dx, dy) in [(0.0, 0.0), (0.0, -0.15), (-0.15, 0.0), (0.1, 0.1), (-0.12, -0.1)] {
+        assert!(
+            near(at(&px, 6.0 + dx, 1.0 + dy), high, 8),
+            "dot pixel at +({dx},{dy}) {:?}",
+            at(&px, 6.0 + dx, 1.0 + dy)
+        );
     }
-    // Every component's body centre region shows symbol pixels.
-    for comp in c.components() {
-        let b = comp.bounds();
-        let mut hit = false;
-        for dy in 0..=(b.max.y - b.min.y) * 4 {
-            for dx in 0..=(b.max.x - b.min.x) * 4 {
-                let wp = Vec2::new(b.min.x as f32 + dx as f32 / 4.0, b.min.y as f32 + dy as f32 / 4.0);
-                let s = v.camera.world_to_screen(wp, v.viewport_points);
-                if s.x >= 0.0 && s.y >= 0.0 && (s.x as u32) < w && (s.y as u32) < h {
-                    hit |= !is_grid(px[(s.y as u32 * w + s.x as u32) as usize]);
+    assert!(is_grid(at(&px, 6.0 - 0.3, 1.0 - 0.3)), "dot is round and small");
+    assert!(near(at(&px, 6.0, 4.0), high, 8), "branch wire carries the net colour");
+    assert!(is_grid(at(&px, 9.0, 1.15)), "only the junction has a dot");
+
+    // Far zoom (quads): the dot is not drawn as a square.
+    let far = view(Vec2::new(7.0, 4.0), 2.0, w, h);
+    let _ = t.frame(&g, &mut r, &mut scene, &far, Some(&nets), true);
+    assert!(!r.draws_symbols());
+
+    // Delete the branch: the dot goes away.
+    let branch = c.segments().map(|(id, _)| id).find(|&id| {
+        let (a, b) = c.segment_ends(id).unwrap();
+        a.x == 6 && b.x == 6
+    });
+    let a = c.apply(&Edit::RemoveSegment(branch.unwrap())).unwrap();
+    scene.apply(&c, &a, 3);
+    scene.validate(&c).unwrap();
+    assert_eq!(scene.dot_count(), 0);
+    let _ = t.frame(&g, &mut r, &mut scene, &v, Some(&nets), true);
+    let px = t.read(&g);
+    assert!(is_grid(at(&px, 6.0, 1.15)), "dot gone {:?}", at(&px, 6.0, 1.15));
+}
+
+/// The bundled examples (every component kind, negative coordinates,
+/// rotations, all input counts; flip-flops, a tri-state bus and memory)
+/// render through the symbol path at the app's MSAA: every component's body
+/// shows symbol pixels.
+#[test]
+fn examples_render_every_component() {
+    let Some(g) = gpu() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    for (file, w, h) in [
+        ("all-components", 900u32, 640u32),
+        ("flipflops-memory", 1600, 900),
+        ("half-adder", 600, 400),
+        ("bus-contention", 600, 500),
+    ] {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../examples/{file}.bitwerk"));
+        let c = bw_io::load_from_path(&path).unwrap().circuit;
+        let mut scene = Scene::build(&c, 1);
+        let (lo, hi) = scene.bounds();
+        let zoom = ((w as f32 / (hi - lo).x).min(h as f32 / (hi - lo).y) * 0.95).min(30.0);
+        let t = Target::new(&g, w, h, 4);
+        let mut r = CanvasRenderer::new(&g.device, FORMAT, 4);
+        let mut empty = Scene::default();
+        let v = view((lo + hi) * 0.5, zoom, w, h);
+        let _ = t.frame(&g, &mut r, &mut empty, &v, None, true);
+        let _ = t.frame(&g, &mut r, &mut scene, &v, None, true);
+        assert!(r.draws_symbols(), "{file}: zoom {zoom}");
+        let px = t.read(&g);
+        if let Ok(dir) = std::env::var("BW_SYMBOL_PNG") {
+            let raw: Vec<u8> = px.iter().flatten().copied().collect();
+            image::RgbaImage::from_raw(w, h, raw)
+                .unwrap()
+                .save(std::path::Path::new(&dir).join(format!("{file}.png")))
+                .unwrap();
+        }
+        for comp in c.components() {
+            let b = comp.bounds();
+            let mut hit = false;
+            for dy in 0..=(b.max.y - b.min.y) * 4 {
+                for dx in 0..=(b.max.x - b.min.x) * 4 {
+                    let wp = Vec2::new(b.min.x as f32 + dx as f32 / 4.0, b.min.y as f32 + dy as f32 / 4.0);
+                    let s = v.camera.world_to_screen(wp, v.viewport_points);
+                    if s.x >= 0.0 && s.y >= 0.0 && (s.x as u32) < w && (s.y as u32) < h {
+                        hit |= !is_grid(px[(s.y as u32 * w + s.x as u32) as usize]);
+                    }
                 }
             }
+            assert!(hit, "{file}: {:?} at {:?} not drawn", comp.kind, comp.pos);
         }
-        assert!(hit, "{:?} at {:?} not drawn", comp.kind, comp.pos);
     }
 }
 
@@ -380,8 +546,8 @@ fn gpu_culling_and_incremental_patches() {
 
     // Move the centre gate by +5,+3 → old place empty, new place drawn.
     let mid = ids[50 * 100 + 50];
-    c.apply(&Edit::MoveComponent(mid, GridPos::new(505, 503))).unwrap();
-    scene.apply(&c, &[Change::Component(mid)], 2);
+    let a = c.apply(&Edit::MoveComponent(mid, GridPos::new(505, 503))).unwrap();
+    scene.apply(&c, &a, 2);
     let _ = t.frame(&g, &mut r, &mut scene, &v, None, true);
     assert!(r.last_upload_bytes() < 1024, "only the dirty slot is uploaded, got {}", r.last_upload_bytes());
     let px = t.read(&g);
@@ -390,14 +556,15 @@ fn gpu_culling_and_incremental_patches() {
 
     // Delete it: slot hidden; a new component reuses the slot.
     let slot = scene.body_slot(mid).unwrap();
-    c.apply(&Edit::RemoveComponent(mid)).unwrap();
-    scene.apply(&c, &[Change::Component(mid)], 3);
+    let a = c.apply(&Edit::RemoveComponent(mid)).unwrap();
+    scene.apply(&c, &a, 3);
     let _ = t.frame(&g, &mut r, &mut scene, &v, None, true);
     let px = t.read(&g);
     assert!(is_grid(at(&px, 507.0, 504.0)), "deleted");
     let add = Edit::AddComponent { kind: ComponentKind::Not, pos: GridPos::new(498, 497), rotation: Rotation::R0 };
-    let bw_core::Applied::Component(new) = c.apply(&add).unwrap() else { panic!() };
-    scene.apply(&c, &[Change::Component(new)], 4);
+    let a = c.apply(&add).unwrap();
+    let new = a.component().unwrap();
+    scene.apply(&c, &a, 4);
     assert_eq!(scene.body_slot(new), Some(slot), "free slot reused");
     let _ = t.frame(&g, &mut r, &mut scene, &v, None, true);
     let px = t.read(&g);
@@ -505,8 +672,8 @@ fn stress_frame_cost() {
         for (i, &id) in ids.iter().enumerate() {
             let s = Instant::now();
             let pos = c.component(id).unwrap().pos.offset(0, 1);
-            c.apply(&Edit::MoveComponent(id, pos)).unwrap();
-            scene.apply(&c, &[Change::Component(id)], 2 + i as u64);
+            let a = c.apply(&Edit::MoveComponent(id, pos)).unwrap();
+            scene.apply(&c, &a, 2 + i as u64);
             apply.push(s.elapsed().as_secs_f64() * 1e3);
             let _ = t.frame(&g, &mut r, &mut scene, &fv(center, 6.0), None, true);
             frame.push(s.elapsed().as_secs_f64() * 1e3);
@@ -519,15 +686,99 @@ fn stress_frame_cost() {
             frame.iter().copied().fold(0.0, f64::max),
         );
     }
-    // Deletions: the model scans every wire (O(wires)), the scene does not.
+    // A running simulation: new four-state levels for every net each frame
+    // (the 2-bit remap onto signal slots + upload happen in `prepare`).
+    {
+        let t = Target::new(&g, 1280, 800, 4);
+        let mut r = CanvasRenderer::new(&g.device, FORMAT, 4);
+        let outs: Vec<(ComponentId, u8)> =
+            c.components().filter(|k| k.kind.output_count() > 0).map(|k| (k.id, 0)).collect();
+        let nets: Vec<(u8, &[(ComponentId, u8)])> =
+            outs.iter().enumerate().map(|(i, p)| ((i % 4) as u8, std::slice::from_ref(p))).collect();
+        let mut levels = Levels::new(&nets);
+        let fv = FrameView {
+            camera: Camera { center, zoom: 6.0 },
+            viewport_points: Vec2::new(896.0, 736.0),
+            pixels_per_point: 1.0,
+        };
+        while r.stream_progress().is_some() || levels.key == 1 {
+            let _ = t.frame(&g, &mut r, &mut scene, &fv, Some(&levels), true);
+            levels.key = 2;
+        }
+        let mut prep = Vec::new();
+        for f in 0..120u64 {
+            levels.key = 10 + f;
+            levels.packed.iter_mut().for_each(|w| *w = w.rotate_left(2));
+            prep.push(t.frame(&g, &mut r, &mut scene, &fv, Some(&levels), true));
+        }
+        prep.sort_by(f64::total_cmp);
+        println!(
+            "levels every frame ({} nets, 2 bits each): prepare avg {:.3} ms, p50 {:.3}, max {:.3} ms",
+            levels.count,
+            prep.iter().sum::<f64>() / prep.len() as f64,
+            prep[prep.len() / 2],
+            prep[prep.len() - 1]
+        );
+    }
+    // Wiring edits on the stress circuit: split a segment with a new
+    // branch, drag it, move its bend, delete it (model + scene patch each).
+    {
+        use bw_core::WireEnd;
+        let segs: Vec<bw_core::SegmentId> = c
+            .segments()
+            .map(|(id, _)| id)
+            .filter(|&id| {
+                let (a, b) = c.segment_ends(id).unwrap();
+                (a.x - b.x).abs() >= 2 && a.y == b.y
+            })
+            .step_by(997)
+            .take(50)
+            .collect();
+        let mut times = Vec::new();
+        for (i, &sg) in segs.iter().enumerate() {
+            let (a, b) = c.segment_ends(sg).unwrap();
+            let mid = GridPos::new(a.x.min(b.x) + 1, a.y);
+            let led = c.apply(&Edit::AddComponent {
+                kind: ComponentKind::Led,
+                pos: mid.offset(3, 3),
+                rotation: Rotation::R0,
+            });
+            let led = led.unwrap();
+            scene.apply(&c, &led, 3000 + 10 * i as u64);
+            let led = led.component().unwrap();
+            let t = Instant::now();
+            let add = Edit::AddWire {
+                from: WireEnd::OnSegment(sg, mid),
+                to: WireEnd::Pin(bw_core::PinRef { component: led, pin: 0 }),
+                via: vec![mid.offset(0, 4)],
+            };
+            let a1 = c.apply(&add).unwrap();
+            scene.apply(&c, &a1, 3001 + 10 * i as u64);
+            let branch = c.pin_node(bw_core::PinRef { component: led, pin: 0 }).unwrap();
+            let s1 = c.node(branch).unwrap().segments()[0];
+            let a2 = c.apply(&Edit::DragSegment(s1, 1)).unwrap();
+            scene.apply(&c, &a2, 3002 + 10 * i as u64);
+            let a3 = c.apply(&Edit::RemoveComponent(led)).unwrap();
+            scene.apply(&c, &a3, 3003 + 10 * i as u64);
+            times.push(t.elapsed().as_secs_f64() * 1e3 / 3.0);
+        }
+        println!(
+            "wiring edits (split + branch, drag, delete; {} each): model+scene avg {:.3} ms / max {:.3} ms per edit",
+            times.len(),
+            times.iter().sum::<f64>() / times.len().max(1) as f64,
+            times.iter().copied().fold(0.0, f64::max)
+        );
+        scene.validate(&c).unwrap();
+    }
+    // Deletions: model and scene both touch only the wires at the part.
     let ids: Vec<ComponentId> = c.components().map(|k| k.id).step_by(1009).take(50).collect();
     let (mut model, mut patch) = (Vec::new(), Vec::new());
     for (i, &id) in ids.iter().enumerate() {
         let s = Instant::now();
-        c.apply(&Edit::RemoveComponent(id)).unwrap();
+        let a = c.apply(&Edit::RemoveComponent(id)).unwrap();
         model.push(s.elapsed().as_secs_f64() * 1e3);
         let s = Instant::now();
-        scene.apply(&c, &[Change::Component(id)], 1000 + i as u64);
+        scene.apply(&c, &a, 1000 + i as u64);
         patch.push(s.elapsed().as_secs_f64() * 1e3);
     }
     println!(

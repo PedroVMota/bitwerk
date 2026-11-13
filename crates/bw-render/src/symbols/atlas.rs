@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use super::{INPUT_SLOTS, KIND_CODES, SymVertex, Symbol, SymbolKind, SymbolStyle};
+use super::{KIND_CODES, SymVertex, Symbol, SymbolKind, SymbolStyle, VARIANT_SLOTS};
 
 /// Sub-range of the atlas vertex array.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,13 +15,13 @@ pub struct MeshRange {
 }
 
 /// Layout of the GPU info table (`u32` words), shared with the shaders:
-/// `[0, 16)` per-bucket base of the culled body list (written by the GPU),
-/// `[16, 32)` per-bucket vertex count of the indirect draws (max over input
-/// counts and styles), then `(start, count)` pairs indexed by
-/// `(style * KIND_CODES + code) * INPUT_SLOTS + inputs`.
+/// `[0, 17)` per-bucket base of the culled body list (written by the GPU),
+/// `[17, 34)` per-bucket vertex count of the indirect draws (max over input
+/// variants and styles), then `(start, count)` pairs indexed by
+/// `(style * KIND_CODES + code) * VARIANT_SLOTS + variant`.
 pub const INFO_BASE: usize = 0;
-pub const INFO_VCOUNT: usize = 16;
-pub const INFO_TABLE: usize = 32;
+pub const INFO_VCOUNT: usize = KIND_CODES as usize;
+pub const INFO_TABLE: usize = 2 * KIND_CODES as usize;
 
 /// Vertex index bits reserved for the vertex within a mesh; the bucket (kind
 /// code) of an indirect draw lives above them (`first_vertex = code << 16`).
@@ -79,16 +79,16 @@ impl Atlas {
                 vertices.extend(mesh);
             }
         }
-        let mut info = vec![0u32; INFO_TABLE + (2 * KIND_CODES * INPUT_SLOTS * 2) as usize];
+        let mut info = vec![0u32; INFO_TABLE + (2 * KIND_CODES * VARIANT_SLOTS * 2) as usize];
         for (&(kind, style), r) in &ranges {
             let Some(code) = kind.code() else { continue };
             let slots: Vec<u32> = match kind {
-                SymbolKind::Gate(_, n) => vec![u32::from(n)],
-                // Fixed pin count: fill every slot so any packing finds it.
-                _ => (0..INPUT_SLOTS).collect(),
+                SymbolKind::Gate(..) | SymbolKind::FlipFlop(..) | SymbolKind::Memory(..) => vec![kind.variant()],
+                // Single variant: fill every slot so any packing finds it.
+                _ => (0..VARIANT_SLOTS).collect(),
             };
-            for inputs in slots {
-                let idx = INFO_TABLE + 2 * ((style.index() * KIND_CODES + code) * INPUT_SLOTS + inputs) as usize;
+            for variant in slots {
+                let idx = INFO_TABLE + 2 * ((style.index() * KIND_CODES + code) * VARIANT_SLOTS + variant) as usize;
                 info[idx] = r.start;
                 info[idx + 1] = r.count;
                 let vc = &mut info[INFO_VCOUNT + code as usize];
@@ -159,7 +159,7 @@ mod tests {
         let a = atlas();
         let info = a.gpu_info();
         let lookup = |style: SymbolStyle, code: u32, inputs: u32| {
-            let idx = INFO_TABLE + 2 * ((style.index() * KIND_CODES + code) * INPUT_SLOTS + inputs) as usize;
+            let idx = INFO_TABLE + 2 * ((style.index() * KIND_CODES + code) * VARIANT_SLOTS + inputs) as usize;
             MeshRange { start: info[idx], count: info[idx + 1] }
         };
         for style in SymbolStyle::ALL {
@@ -171,14 +171,28 @@ mod tests {
                     assert!(info[INFO_VCOUNT + code as usize] >= a.range(k, style).unwrap().count);
                 }
             }
-            for k in [SymbolKind::Not, SymbolKind::Switch, SymbolKind::Clock, SymbolKind::Led] {
+            for k in [SymbolKind::Not, SymbolKind::Switch, SymbolKind::Clock, SymbolKind::Led, SymbolKind::TriState] {
                 let code = k.code().unwrap();
-                // NOT/LED are packed with 1 input, switch/clock with 0.
-                for inputs in [0, 1] {
-                    assert_eq!(Some(lookup(style, code, inputs)), a.range(k, style));
+                for variant in [0, 1] {
+                    assert_eq!(Some(lookup(style, code, variant)), a.range(k, style));
+                }
+            }
+            // Every flip-flop variant and memory size has its own mesh.
+            for k in SymbolKind::all() {
+                if let (SymbolKind::FlipFlop(..) | SymbolKind::Memory(..), Some(code)) = (k, k.code()) {
+                    assert_eq!(Some(lookup(style, code, k.variant())), a.range(k, style), "{k:?}");
+                    assert!(k.variant() < VARIANT_SLOTS);
                 }
             }
         }
+        // The variants of one kind code never collide.
+        let mut seen = HashMap::new();
+        for k in SymbolKind::all() {
+            if let Some(code) = k.code() {
+                assert!(seen.insert((code, k.variant()), k).is_none(), "{k:?} collides");
+            }
+        }
+        println!("atlas: {} vertices ({} KiB)", a.vertices().len(), a.vertices().len() * 24 / 1024);
         for code in 0..KIND_CODES {
             assert!(info[INFO_VCOUNT + code as usize] > 0);
         }

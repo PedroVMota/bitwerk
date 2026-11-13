@@ -2,14 +2,16 @@
 // pass groups the visible bodies by bucket; draw `b` has
 // first_vertex = b << 16, so `vertex_index` carries both the bucket (high
 // bits) and the vertex within the instance's mesh (low bits). Each instance
-// looks up its own mesh (kind × input count × style) in `sym_info`; vertices
+// looks up its own mesh (kind × variant × style) in `sym_info`; vertices
 // past the end of a shorter mesh are clipped. State (LED lit, switch lever,
-// pin colours) comes from the per-slot net bits, never from the mesh.
+// pin colours) comes from the per-slot four-state levels, never from the
+// mesh; an output pin stub reads the level of its own output (signal slot
+// `net + pin`).
 
-const SYM_BUCKETS: u32 = 10u;
-const SYM_INPUT_SLOTS: u32 = 9u;
-const SYM_INFO_VCOUNT: u32 = 16u;
-const SYM_INFO_TABLE: u32 = 32u;
+const SYM_BUCKETS: u32 = 17u;
+const SYM_VARIANTS: u32 = 256u;
+const SYM_INFO_VCOUNT: u32 = 17u;
+const SYM_INFO_TABLE: u32 = 34u;
 
 struct SymOut {
     @builtin(position) pos: vec4<f32>,
@@ -38,10 +40,12 @@ fn sym_color(role: u32, code: u32, lvl: u32) -> vec3<f32> {
             return vec3<f32>(0.16, 0.17, 0.20);
         }
         case 2u: {
-            if (lvl == 1u) {
+            if (lvl == LVL_HIGH) {
                 return accent;
-            } else if (lvl == 0u) {
+            } else if (lvl == LVL_LOW) {
                 return accent * 0.28;
+            } else if (lvl == LVL_X) {
+                return X_COLOR;
             }
             return vec3<f32>(0.32, 0.32, 0.32);
         }
@@ -76,16 +80,16 @@ fn vs_symbol(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -
     o.pos = CLIPPED;
     let bucket = min(vi >> 16u, SYM_BUCKETS - 1u);
     let local = vi & 0xffffu;
-    // Bucket bases are written by the culling pass into sym_info[0..16).
+    // Bucket bases are written by the culling pass into sym_info[0..17).
     let slot = vis_bodies[sym_info[bucket] + ii];
     let inst = bodies[slot];
     if (inst.kind == HIDDEN_KIND) {
         return o;
     }
     let code = min(inst.kind & 0xffu, SYM_BUCKETS - 1u);
-    let inputs = min((inst.kind >> 8u) & 0xffu, SYM_INPUT_SLOTS - 1u);
+    let variant = (inst.kind >> 8u) & 0xffu;
     let rot = (inst.kind >> 16u) & 3u;
-    let mi = SYM_INFO_TABLE + ((min(g.style, 1u) * SYM_BUCKETS + code) * SYM_INPUT_SLOTS + inputs) * 2u;
+    let mi = SYM_INFO_TABLE + ((min(g.style, 1u) * SYM_BUCKETS + code) * SYM_VARIANTS + variant) * 2u;
     let start = sym_info[mi];
     let count = sym_info[mi + 1u];
     if (local >= count) {
@@ -105,7 +109,13 @@ fn vs_symbol(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -
         world = sym_to_world(an, inst.min, inst.size, rot) + (p - an);
     }
     o.pos = g.view_proj * vec4<f32>(world, 0.0, 1.0);
-    o.color = sym_color(v.attr & 0xfu, code, lvl);
+    var role_lvl = lvl;
+    let role = v.attr & 0xfu;
+    let pin = (v.attr >> 8u) & 0xffu;
+    if (role == 3u && pin != 0u && inst.net != NO_NET) {
+        role_lvl = net_level(inst.net + pin);
+    }
+    o.color = sym_color(role, code, role_lvl);
     return o;
 }
 

@@ -4,15 +4,18 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use bw_core::{Circuit, ComponentId, ComponentKind, Edit};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use crate::SimError;
-use crate::netlist::{Netlist, SimState};
+use crate::netlist::{NetMap, Netlist, SimState};
 
 /// Minimum interval between two published snapshots (caps UI upload work).
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(8);
+/// Minimum interval between two published memory views (the contents of
+/// the one memory whose window is open; never part of the snapshots).
+const MEMORY_PUBLISH_INTERVAL: Duration = Duration::from_millis(100);
 /// Maximum ticks simulated per loop iteration before checking commands again,
 /// so a high tick rate can never make the thread unresponsive.
 const MAX_TICKS_PER_BATCH: u32 = 10_000;
@@ -54,6 +57,9 @@ pub enum Command {
         revision: u64,
     },
     SetSwitch(ComponentId, bool),
+    /// Publish the live contents of this memory (throttled, only when they
+    /// change) through [`SimHandle::memory_view`]; `None` stops it.
+    WatchMemory(Option<ComponentId>),
     Run,
     Stop,
     /// Toggles pause/resume.
@@ -73,11 +79,15 @@ pub struct Snapshot {
     pub revision: u64,
     pub state: RunState,
     pub tick: u64,
-    /// Level of every net (see [`crate::net_numbering`]).
-    pub values: Vec<u8>,
-    /// Component driving each net (same length as `values`). Shared by all
-    /// snapshots of one compilation, so cloning it is free.
-    pub net_components: Arc<[ComponentId]>,
+    /// Four-state level of every net, packed 2 bits per net (16 per word,
+    /// see [`crate::pack_levels`]).
+    pub values: Vec<u32>,
+    pub net_count: usize,
+    /// Output pins driving each net. Shared by all snapshots of one
+    /// compilation, so cloning it is free.
+    pub net_map: Arc<NetMap>,
+    /// Changes whenever the net numbering changes (each compilation).
+    pub compile_id: u64,
     pub error: Option<SimError>,
 }
 
@@ -89,16 +99,34 @@ impl Snapshot {
             state: RunState::Stopped,
             tick: 0,
             values: Vec::new(),
-            net_components: Arc::from(Vec::new()),
+            net_count: 0,
+            net_map: Arc::new(NetMap::default()),
+            compile_id: 0,
             error: None,
         }
     }
+
+    /// Level of net `i` (Z if out of range).
+    #[must_use]
+    pub fn level(&self, i: usize) -> u8 {
+        crate::packed_level(&self.values, i)
+    }
+}
+
+/// Live contents of the watched memory (see [`Command::WatchMemory`]).
+#[derive(Debug, Clone)]
+pub struct MemoryView {
+    pub id: ComponentId,
+    pub words: Arc<[u16]>,
+    /// Increments with every published change.
+    pub generation: u64,
 }
 
 /// Owner handle of the simulation thread. Dropping it shuts the thread down.
 pub struct SimHandle {
     tx: Sender<Command>,
     snapshot: Arc<ArcSwap<Snapshot>>,
+    memory: Arc<ArcSwapOption<MemoryView>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -111,11 +139,12 @@ impl SimHandle {
     pub fn spawn(on_publish: Box<dyn Fn() + Send>) -> std::io::Result<Self> {
         let (tx, rx) = crossbeam_channel::unbounded();
         let snapshot = Arc::new(ArcSwap::from_pointee(Snapshot::empty()));
-        let snap2 = Arc::clone(&snapshot);
+        let memory = Arc::new(ArcSwapOption::empty());
+        let (snap2, mem2) = (Arc::clone(&snapshot), Arc::clone(&memory));
         let thread = std::thread::Builder::new()
             .name("bw-sim".into())
-            .spawn(move || Worker::new(rx, snap2, on_publish).run())?;
-        Ok(Self { tx, snapshot, thread: Some(thread) })
+            .spawn(move || Worker::new(rx, snap2, mem2, on_publish).run())?;
+        Ok(Self { tx, snapshot, memory, thread: Some(thread) })
     }
 
     /// Non-blocking send. Errors (thread gone) are logged and ignored.
@@ -129,6 +158,12 @@ impl SimHandle {
     #[must_use]
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.snapshot.load_full()
+    }
+
+    /// Latest contents of the watched memory, if any. Wait-free.
+    #[must_use]
+    pub fn memory_view(&self) -> Option<Arc<MemoryView>> {
+        self.memory.load_full()
     }
 }
 
@@ -144,6 +179,7 @@ impl Drop for SimHandle {
 struct Worker {
     rx: Receiver<Command>,
     out: Arc<ArcSwap<Snapshot>>,
+    mem_out: Arc<ArcSwapOption<MemoryView>>,
     on_publish: Box<dyn Fn() + Send>,
     sim: Option<SimState>,
     /// The simulator's own copy of the circuit (kept in sync through
@@ -151,7 +187,17 @@ struct Worker {
     circuit: Circuit,
     /// The circuit changed since the last compilation.
     needs_compile: bool,
-    net_components: Arc<[ComponentId]>,
+    /// The next compilation starts from scratch (a new circuit was loaded)
+    /// instead of carrying flip-flop states and memory contents over.
+    fresh: bool,
+    net_map: Arc<NetMap>,
+    compile_id: u64,
+    /// Memory whose contents are published, and the (compilation, change
+    /// counter) last published.
+    watched: Option<ComponentId>,
+    watched_published: Option<(u64, u64)>,
+    mem_generation: u64,
+    last_mem_publish: Instant,
     revision: u64,
     state: RunState,
     error: Option<SimError>,
@@ -163,16 +209,28 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(rx: Receiver<Command>, out: Arc<ArcSwap<Snapshot>>, on_publish: Box<dyn Fn() + Send>) -> Self {
+    fn new(
+        rx: Receiver<Command>,
+        out: Arc<ArcSwap<Snapshot>>,
+        mem_out: Arc<ArcSwapOption<MemoryView>>,
+        on_publish: Box<dyn Fn() + Send>,
+    ) -> Self {
         let now = Instant::now();
         Self {
             rx,
             out,
+            mem_out,
             on_publish,
             sim: None,
             circuit: Circuit::new(),
             needs_compile: false,
-            net_components: Arc::from(Vec::new()),
+            fresh: true,
+            net_map: Arc::new(NetMap::default()),
+            compile_id: 0,
+            watched: None,
+            watched_published: None,
+            mem_generation: 0,
+            last_mem_publish: now,
             revision: 0,
             state: RunState::Stopped,
             error: None,
@@ -193,6 +251,10 @@ impl Worker {
             }
             if self.dirty {
                 let p = self.last_publish + PUBLISH_INTERVAL;
+                deadline = Some(deadline.map_or(p, |d| d.min(p)));
+            }
+            if self.memory_view_stale() {
+                let p = self.last_mem_publish + MEMORY_PUBLISH_INTERVAL;
                 deadline = Some(deadline.map_or(p, |d| d.min(p)));
             }
             let cmd = match deadline {
@@ -229,7 +291,27 @@ impl Worker {
             if self.dirty && self.last_publish.elapsed() >= PUBLISH_INTERVAL {
                 self.publish();
             }
+            if self.memory_view_stale() && self.last_mem_publish.elapsed() >= MEMORY_PUBLISH_INTERVAL {
+                self.publish_memory();
+            }
         }
+    }
+
+    /// The watched memory changed since it was last published.
+    fn memory_view_stale(&self) -> bool {
+        let Some(id) = self.watched else { return false };
+        let current = self.sim.as_ref().and_then(|s| s.memory(id)).map(|(_, g)| (self.compile_id, g));
+        current.is_some() && current != self.watched_published
+    }
+
+    fn publish_memory(&mut self) {
+        let Some(id) = self.watched else { return };
+        let Some((words, g)) = self.sim.as_ref().and_then(|s| s.memory(id)) else { return };
+        self.watched_published = Some((self.compile_id, g));
+        self.mem_generation += 1;
+        self.mem_out.store(Some(Arc::new(MemoryView { id, words: Arc::from(words), generation: self.mem_generation })));
+        self.last_mem_publish = Instant::now();
+        (self.on_publish)();
     }
 
     /// Compiles the simulator's circuit copy if edits are pending.
@@ -241,9 +323,18 @@ impl Worker {
         let tick = self.sim.as_ref().map_or(0, |s| s.tick);
         match Netlist::compile(&self.circuit) {
             Ok(net) => {
-                self.net_components = Arc::from(net.net_components());
+                self.net_map = Arc::new(net.net_map());
+                self.compile_id += 1;
                 let mut sim = SimState::new(net, &self.circuit);
-                let r = sim.reset();
+                // An edit keeps the flip-flop states and memory contents of
+                // the running circuit; a newly loaded circuit starts afresh.
+                let r = match (self.sim.take(), std::mem::take(&mut self.fresh)) {
+                    (Some(old), false) => {
+                        sim.transfer_from(&old);
+                        sim.reinit()
+                    }
+                    _ => sim.reset(),
+                };
                 sim.tick = tick;
                 self.sim = Some(sim);
                 self.apply(r);
@@ -268,6 +359,7 @@ impl Worker {
                 self.circuit = (*circuit).clone();
                 drop(circuit);
                 self.needs_compile = true;
+                self.fresh = true;
             }
             Command::Edit { edit, revision } => {
                 self.revision = revision;
@@ -275,8 +367,18 @@ impl Worker {
                     // Cannot happen while UI and simulator replay the same
                     // edits; logged so a divergence would be noticed.
                     tracing::error!("simulator could not apply {edit:?}: {e}");
+                } else if edit.affects_netlist() {
+                    self.needs_compile = true;
+                } else {
+                    self.apply_live_edit(&edit);
                 }
-                self.needs_compile = true;
+            }
+            Command::WatchMemory(id) => {
+                self.watched = id;
+                self.watched_published = None;
+                if id.is_none() {
+                    self.mem_out.store(None);
+                }
             }
             Command::SetSwitch(id, on) => {
                 // Keep the copy in sync so a later recompilation keeps the level.
@@ -323,6 +425,25 @@ impl Worker {
         }
         self.dirty = true;
         true
+    }
+
+    /// Applies a memory edit to the running state (no recompilation).
+    fn apply_live_edit(&mut self, edit: &Edit) {
+        if self.needs_compile {
+            return; // the next compilation picks the contents up from the circuit
+        }
+        let Some(sim) = self.sim.as_mut() else { return };
+        let r = match edit {
+            Edit::SetMemoryWord { id, addr, value } => {
+                sim.write_memory_word(*id, usize::try_from(*addr).unwrap_or(usize::MAX), *value)
+            }
+            Edit::SetMemory { id, .. } => match self.circuit.memory(*id) {
+                Some(image) => sim.load_memory(*id, &image),
+                None => Ok(()),
+            },
+            _ => Ok(()),
+        };
+        self.apply(r);
     }
 
     fn reset(&mut self) {
@@ -400,14 +521,17 @@ impl Worker {
 
     fn publish(&mut self) {
         self.generation += 1;
-        let (tick, values) = self.sim.as_ref().map_or((0, Vec::new()), |s| (s.tick, s.values.clone()));
+        let (tick, values, net_count) =
+            self.sim.as_ref().map_or((0, Vec::new(), 0), |s| (s.tick, s.packed(), s.values().len()));
         self.out.store(Arc::new(Snapshot {
             generation: self.generation,
             revision: self.revision,
             state: self.state,
             tick,
             values,
-            net_components: Arc::clone(&self.net_components),
+            net_count,
+            net_map: Arc::clone(&self.net_map),
+            compile_id: self.compile_id,
             error: self.error.clone(),
         }));
         self.dirty = false;

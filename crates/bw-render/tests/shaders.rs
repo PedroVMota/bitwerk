@@ -36,7 +36,7 @@ fn scene_build_and_query() {
     c.connect(PinRef { component: s, pin: 0 }, PinRef { component: g, pin: 0 }, vec![GridPos::new(50, 1)]).unwrap();
     let scene = bw_render::Scene::build(&c, 7);
     assert_eq!(scene.bodies().len(), 2);
-    assert_eq!(scene.wires().len(), 2);
+    assert_eq!(scene.wires().len(), 1, "collinear via point: one straight segment");
     assert_eq!(scene.pick_body(glam::Vec2::new(101.0, 1.0)), Some(g));
     let mut n = 0;
     scene.query(glam::Vec2::new(-1.0, -1.0), glam::Vec2::new(3.0, 3.0), |_| n += 1);

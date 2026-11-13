@@ -14,7 +14,8 @@ struct BodyOut {
 fn vs_body(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> BodyOut {
     let inst = bodies[body_slot(ii)];
     var o: BodyOut;
-    if (inst.kind == HIDDEN_KIND) {
+    // Junction dots exist only as symbols (they would be specks here).
+    if (inst.kind == HIDDEN_KIND || (inst.kind & 0xffu) == JUNCTION_CODE) {
         o.pos = CLIPPED;
         return o;
     }
@@ -24,16 +25,18 @@ fn vs_body(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     let code = inst.kind & 0xffu;
     let accent = kind_accent(code);
     var fill = vec3<f32>(0.20, 0.21, 0.24);
-    if (code >= 7u) {
+    if (code >= 7u && code <= 9u) {
         // Sources and LEDs show their level in the fill colour.
-        if (lvl == 1u) {
+        if (lvl == LVL_HIGH) {
             fill = accent;
-        } else if (lvl == 0u) {
+        } else if (lvl == LVL_LOW) {
             fill = accent * 0.25;
+        } else if (lvl == LVL_X) {
+            fill = X_COLOR;
         } else {
             fill = vec3<f32>(0.3, 0.3, 0.3);
         }
-    } else if (lvl == 1u) {
+    } else if (lvl == LVL_HIGH) {
         fill = vec3<f32>(0.22, 0.27, 0.22);
     }
     o.pos = g.view_proj * vec4<f32>(world, 0.0, 1.0);

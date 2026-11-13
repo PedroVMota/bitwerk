@@ -16,6 +16,7 @@ fuzz_target!(|data: &[u8]| {
         let text = bw_io::save_to_string(&project).expect("accepted project must serialize");
         let again = bw_io::load_from_bytes(text.as_bytes()).expect("serialized project must load");
         assert_eq!(again.circuit.component_count(), project.circuit.component_count());
-        assert_eq!(again.circuit.wire_count(), project.circuit.wire_count());
+        assert_eq!(again.circuit.segment_count(), project.circuit.segment_count());
+        assert_eq!(again.circuit.node_count(), project.circuit.node_count());
     }
 });

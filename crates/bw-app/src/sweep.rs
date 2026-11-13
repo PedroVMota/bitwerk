@@ -2,7 +2,9 @@
 //!
 //! Once the stress circuit is on screen, a scripted ~20 s camera path runs
 //! (idle at full view, zoom in close, pan across, zoom back out), followed by
-//! a burst of scripted edits (move / rotate / add+connect / delete). Every
+//! a burst of scripted edits (move / rotate / add a part / branch a wire off
+//! a segment (split + junction) / drag a segment / move a bend / delete a
+//! segment / delete a part). Every
 //! frame's interval and CPU work are recorded; on exit a summary table is
 //! printed (and optionally a per-frame CSV written with `--sweep-csv <path>`)
 //! and the app quits. Nothing here depends on a human touching the window.
@@ -11,7 +13,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use bw_core::{ComponentId, ComponentKind, GridPos, PinRef};
+use bw_core::{ComponentId, ComponentKind, Edit, GridPos, PinRef, SegmentId, WireEnd};
 use bw_render::Item;
 use glam::Vec2;
 
@@ -242,23 +244,53 @@ impl Sweep {
         }
         let i = self.edits.len();
         let n = self.targets.len();
-        let j = i / 4;
-        let target = self.targets[(j * 7 + i % 4) % n];
-        let ok = match i % 4 {
+        let j = i / 8;
+        let target = self.targets[(j * 7) % n];
+        // The NOT added by step 2 of the current cycle, and its input pin.
+        let not_in = self.added.last().map(|&id| PinRef { component: id, pin: 0 });
+        let branch_seg = |app: &BitwerkApp| {
+            let node = app.circuit.pin_node(not_in?)?;
+            app.circuit.node(node)?.segments().first().copied()
+        };
+        let ok = match i % 8 {
             0 => app.circuit.component(target).map(|c| c.pos.offset(0, 1)).is_some_and(|to| app.edit_move(target, to)),
             1 => app.edit_rotate(target),
             2 => {
                 let Some(c) = app.circuit.component(target).cloned() else { return };
-                let origin = GridPos::new(c.pos.x, c.pos.y + 6);
-                match app.edit_place(ComponentKind::Not, origin) {
+                match app.edit_place(ComponentKind::Not, GridPos::new(c.pos.x + 1, c.pos.y + 6)) {
                     Ok(not) => {
                         self.added.push(not);
-                        let from = PinRef { component: target, pin: c.kind.input_count() };
-                        app.edit_connect(from, PinRef { component: not, pin: 0 }).is_ok()
+                        true
                     }
                     Err(_) => false,
                 }
             }
+            3 => {
+                // Branch off the middle of a segment of the target's output
+                // net (splits it: a junction) into the NOT's input.
+                let out = PinRef {
+                    component: target,
+                    pin: app.circuit.component(target).map_or(0, |c| c.kind.input_count()),
+                };
+                let from = split_point(app, out).unwrap_or(WireEnd::Pin(out));
+                not_in.is_some_and(|to| {
+                    let via = vec![];
+                    app.edit_wire(from, WireEnd::Pin(to), via).is_ok()
+                })
+            }
+            4 => branch_seg(app).is_some_and(|s| app.apply_edit(Edit::DragSegment(s, 1)).is_ok()),
+            5 => {
+                // Move a bend of the branch (geometry only).
+                let bend = branch_seg(app).and_then(|s| {
+                    let sg = app.circuit.segment(s)?;
+                    [sg.a, sg.b].into_iter().find(|&n| app.circuit.node(n).is_some_and(bw_core::WireNode::is_free))
+                });
+                bend.is_some_and(|b| {
+                    let to = app.circuit.node(b).map_or(GridPos::default(), |w| w.pos.offset(1, 0));
+                    app.apply_edit(Edit::MoveNode(b, to)).is_ok()
+                })
+            }
+            6 => branch_seg(app).is_some_and(|s| app.apply_edit(Edit::RemoveSegment(s)).is_ok()),
             _ => self.added.pop().is_some_and(|id| app.edit_delete(id)),
         };
         if !ok {
@@ -469,4 +501,26 @@ pub fn bodies_in(scene: &bw_render::Scene, lo: Vec2, hi: Vec2, mut f: impl FnMut
             }
         }
     });
+}
+
+/// A point in the middle of a segment of the net of `out` (a wire end that
+/// splits it), if it has one long enough.
+fn split_point(app: &BitwerkApp, out: PinRef) -> Option<WireEnd> {
+    let start = app.circuit.pin_node(out)?;
+    let mut found: Option<(SegmentId, GridPos)> = None;
+    app.circuit.visit_net(
+        start,
+        |_, _| {},
+        |s| {
+            if found.is_some() {
+                return;
+            }
+            if let Some((a, b)) = app.circuit.segment_ends(s) {
+                if (a.x - b.x).abs() + (a.y - b.y).abs() >= 2 {
+                    found = Some((s, GridPos::new((a.x + b.x) / 2, (a.y + b.y) / 2)));
+                }
+            }
+        },
+    );
+    found.map(|(s, p)| WireEnd::OnSegment(s, p))
 }

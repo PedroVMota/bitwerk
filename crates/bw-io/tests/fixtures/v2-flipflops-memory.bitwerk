@@ -1,0 +1,1105 @@
+(
+    format: "bitwerk",
+    version: 2,
+    name: "flip-flops, tri-state bus and memory",
+    circuit: (
+        components: [
+            (
+                id: (0),
+                kind: Switch(
+                    on: true,
+                ),
+                pos: (
+                    x: 0,
+                    y: 0,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (1),
+                kind: Clock(
+                    half_period: 10,
+                ),
+                pos: (
+                    x: 0,
+                    y: 6,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (2),
+                kind: Switch(
+                    on: false,
+                ),
+                pos: (
+                    x: 0,
+                    y: 11,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (3),
+                kind: FlipFlop(
+                    ty: Jk,
+                    trigger: MasterSlave,
+                    preset_clear: true,
+                ),
+                pos: (
+                    x: 8,
+                    y: 0,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (4),
+                kind: Led,
+                pos: (
+                    x: 18,
+                    y: 8,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (5),
+                kind: FlipFlop(
+                    ty: Jk,
+                    trigger: MasterSlave,
+                    preset_clear: true,
+                ),
+                pos: (
+                    x: 22,
+                    y: 0,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (6),
+                kind: Led,
+                pos: (
+                    x: 32,
+                    y: 8,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (7),
+                kind: FlipFlop(
+                    ty: Jk,
+                    trigger: MasterSlave,
+                    preset_clear: true,
+                ),
+                pos: (
+                    x: 36,
+                    y: 0,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (8),
+                kind: Led,
+                pos: (
+                    x: 46,
+                    y: 8,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (9),
+                kind: FlipFlop(
+                    ty: Jk,
+                    trigger: MasterSlave,
+                    preset_clear: true,
+                ),
+                pos: (
+                    x: 50,
+                    y: 0,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (10),
+                kind: Led,
+                pos: (
+                    x: 60,
+                    y: 8,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (11),
+                kind: Switch(
+                    on: true,
+                ),
+                pos: (
+                    x: 0,
+                    y: 20,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (12),
+                kind: Switch(
+                    on: false,
+                ),
+                pos: (
+                    x: 0,
+                    y: 26,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (13),
+                kind: Switch(
+                    on: false,
+                ),
+                pos: (
+                    x: 0,
+                    y: 32,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (14),
+                kind: Not,
+                pos: (
+                    x: 6,
+                    y: 32,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (15),
+                kind: TriState,
+                pos: (
+                    x: 14,
+                    y: 19,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (16),
+                kind: TriState,
+                pos: (
+                    x: 14,
+                    y: 25,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (17),
+                kind: Led,
+                pos: (
+                    x: 24,
+                    y: 23,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (18),
+                kind: Memory(
+                    ty: Ram,
+                    addr_bits: 4,
+                    data_bits: 4,
+                ),
+                pos: (
+                    x: 76,
+                    y: 0,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (19),
+                kind: Switch(
+                    on: true,
+                ),
+                pos: (
+                    x: 68,
+                    y: 8,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (20),
+                kind: Led,
+                pos: (
+                    x: 88,
+                    y: 0,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (21),
+                kind: Switch(
+                    on: false,
+                ),
+                pos: (
+                    x: 68,
+                    y: 10,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (22),
+                kind: Led,
+                pos: (
+                    x: 88,
+                    y: 2,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (23),
+                kind: Switch(
+                    on: true,
+                ),
+                pos: (
+                    x: 68,
+                    y: 12,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (24),
+                kind: Led,
+                pos: (
+                    x: 88,
+                    y: 4,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (25),
+                kind: Switch(
+                    on: false,
+                ),
+                pos: (
+                    x: 68,
+                    y: 14,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (26),
+                kind: Led,
+                pos: (
+                    x: 88,
+                    y: 6,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (27),
+                kind: Switch(
+                    on: true,
+                ),
+                pos: (
+                    x: 68,
+                    y: 16,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (28),
+                kind: Switch(
+                    on: false,
+                ),
+                pos: (
+                    x: 68,
+                    y: 18,
+                ),
+                rotation: R0,
+            ),
+        ],
+        wires: [
+            (
+                id: (0),
+                from: (
+                    component: (0),
+                    pin: 0,
+                ),
+                to: (
+                    component: (3),
+                    pin: 0,
+                ),
+                via: [],
+            ),
+            (
+                id: (1),
+                from: (
+                    component: (0),
+                    pin: 0,
+                ),
+                to: (
+                    component: (3),
+                    pin: 2,
+                ),
+                via: [
+                    (
+                        x: 6,
+                        y: 1,
+                    ),
+                    (
+                        x: 6,
+                        y: 5,
+                    ),
+                ],
+            ),
+            (
+                id: (2),
+                from: (
+                    component: (1),
+                    pin: 0,
+                ),
+                to: (
+                    component: (3),
+                    pin: 1,
+                ),
+                via: [
+                    (
+                        x: 4,
+                        y: 7,
+                    ),
+                    (
+                        x: 4,
+                        y: 3,
+                    ),
+                ],
+            ),
+            (
+                id: (3),
+                from: (
+                    component: (2),
+                    pin: 0,
+                ),
+                to: (
+                    component: (3),
+                    pin: 4,
+                ),
+                via: [
+                    (
+                        x: 12,
+                        y: 12,
+                    ),
+                ],
+            ),
+            (
+                id: (4),
+                from: (
+                    component: (3),
+                    pin: 5,
+                ),
+                to: (
+                    component: (4),
+                    pin: 0,
+                ),
+                via: [
+                    (
+                        x: 17,
+                        y: 1,
+                    ),
+                    (
+                        x: 17,
+                        y: 9,
+                    ),
+                ],
+            ),
+            (
+                id: (5),
+                from: (
+                    component: (0),
+                    pin: 0,
+                ),
+                to: (
+                    component: (5),
+                    pin: 0,
+                ),
+                via: [
+                    (
+                        x: 2,
+                        y: -2,
+                    ),
+                    (
+                        x: 21,
+                        y: -2,
+                    ),
+                    (
+                        x: 21,
+                        y: 1,
+                    ),
+                ],
+            ),
+            (
+                id: (6),
+                from: (
+                    component: (0),
+                    pin: 0,
+                ),
+                to: (
+                    component: (5),
+                    pin: 2,
+                ),
+                via: [
+                    (
+                        x: 2,
+                        y: -2,
+                    ),
+                    (
+                        x: 21,
+                        y: -2,
+                    ),
+                    (
+                        x: 21,
+                        y: 5,
+                    ),
+                ],
+            ),
+            (
+                id: (7),
+                from: (
+                    component: (3),
+                    pin: 5,
+                ),
+                to: (
+                    component: (5),
+                    pin: 1,
+                ),
+                via: [
+                    (
+                        x: 19,
+                        y: 1,
+                    ),
+                    (
+                        x: 19,
+                        y: 3,
+                    ),
+                ],
+            ),
+            (
+                id: (8),
+                from: (
+                    component: (2),
+                    pin: 0,
+                ),
+                to: (
+                    component: (5),
+                    pin: 4,
+                ),
+                via: [
+                    (
+                        x: 26,
+                        y: 12,
+                    ),
+                ],
+            ),
+            (
+                id: (9),
+                from: (
+                    component: (5),
+                    pin: 5,
+                ),
+                to: (
+                    component: (6),
+                    pin: 0,
+                ),
+                via: [
+                    (
+                        x: 31,
+                        y: 1,
+                    ),
+                    (
+                        x: 31,
+                        y: 9,
+                    ),
+                ],
+            ),
+            (
+                id: (10),
+                from: (
+                    component: (0),
+                    pin: 0,
+                ),
+                to: (
+                    component: (7),
+                    pin: 0,
+                ),
+                via: [
+                    (
+                        x: 2,
+                        y: -2,
+                    ),
+                    (
+                        x: 35,
+                        y: -2,
+                    ),
+                    (
+                        x: 35,
+                        y: 1,
+                    ),
+                ],
+            ),
+            (
+                id: (11),
+                from: (
+                    component: (0),
+                    pin: 0,
+                ),
+                to: (
+                    component: (7),
+                    pin: 2,
+                ),
+                via: [
+                    (
+                        x: 2,
+                        y: -2,
+                    ),
+                    (
+                        x: 35,
+                        y: -2,
+                    ),
+                    (
+                        x: 35,
+                        y: 5,
+                    ),
+                ],
+            ),
+            (
+                id: (12),
+                from: (
+                    component: (5),
+                    pin: 5,
+                ),
+                to: (
+                    component: (7),
+                    pin: 1,
+                ),
+                via: [
+                    (
+                        x: 33,
+                        y: 1,
+                    ),
+                    (
+                        x: 33,
+                        y: 3,
+                    ),
+                ],
+            ),
+            (
+                id: (13),
+                from: (
+                    component: (2),
+                    pin: 0,
+                ),
+                to: (
+                    component: (7),
+                    pin: 4,
+                ),
+                via: [
+                    (
+                        x: 40,
+                        y: 12,
+                    ),
+                ],
+            ),
+            (
+                id: (14),
+                from: (
+                    component: (7),
+                    pin: 5,
+                ),
+                to: (
+                    component: (8),
+                    pin: 0,
+                ),
+                via: [
+                    (
+                        x: 45,
+                        y: 1,
+                    ),
+                    (
+                        x: 45,
+                        y: 9,
+                    ),
+                ],
+            ),
+            (
+                id: (15),
+                from: (
+                    component: (0),
+                    pin: 0,
+                ),
+                to: (
+                    component: (9),
+                    pin: 0,
+                ),
+                via: [
+                    (
+                        x: 2,
+                        y: -2,
+                    ),
+                    (
+                        x: 49,
+                        y: -2,
+                    ),
+                    (
+                        x: 49,
+                        y: 1,
+                    ),
+                ],
+            ),
+            (
+                id: (16),
+                from: (
+                    component: (0),
+                    pin: 0,
+                ),
+                to: (
+                    component: (9),
+                    pin: 2,
+                ),
+                via: [
+                    (
+                        x: 2,
+                        y: -2,
+                    ),
+                    (
+                        x: 49,
+                        y: -2,
+                    ),
+                    (
+                        x: 49,
+                        y: 5,
+                    ),
+                ],
+            ),
+            (
+                id: (17),
+                from: (
+                    component: (7),
+                    pin: 5,
+                ),
+                to: (
+                    component: (9),
+                    pin: 1,
+                ),
+                via: [
+                    (
+                        x: 47,
+                        y: 1,
+                    ),
+                    (
+                        x: 47,
+                        y: 3,
+                    ),
+                ],
+            ),
+            (
+                id: (18),
+                from: (
+                    component: (2),
+                    pin: 0,
+                ),
+                to: (
+                    component: (9),
+                    pin: 4,
+                ),
+                via: [
+                    (
+                        x: 54,
+                        y: 12,
+                    ),
+                ],
+            ),
+            (
+                id: (19),
+                from: (
+                    component: (9),
+                    pin: 5,
+                ),
+                to: (
+                    component: (10),
+                    pin: 0,
+                ),
+                via: [
+                    (
+                        x: 59,
+                        y: 1,
+                    ),
+                    (
+                        x: 59,
+                        y: 9,
+                    ),
+                ],
+            ),
+            (
+                id: (20),
+                from: (
+                    component: (11),
+                    pin: 0,
+                ),
+                to: (
+                    component: (15),
+                    pin: 0,
+                ),
+                via: [],
+            ),
+            (
+                id: (21),
+                from: (
+                    component: (12),
+                    pin: 0,
+                ),
+                to: (
+                    component: (16),
+                    pin: 0,
+                ),
+                via: [],
+            ),
+            (
+                id: (22),
+                from: (
+                    component: (13),
+                    pin: 0,
+                ),
+                to: (
+                    component: (14),
+                    pin: 0,
+                ),
+                via: [],
+            ),
+            (
+                id: (23),
+                from: (
+                    component: (13),
+                    pin: 0,
+                ),
+                to: (
+                    component: (15),
+                    pin: 1,
+                ),
+                via: [
+                    (
+                        x: 4,
+                        y: 33,
+                    ),
+                    (
+                        x: 4,
+                        y: 17,
+                    ),
+                    (
+                        x: 16,
+                        y: 17,
+                    ),
+                ],
+            ),
+            (
+                id: (24),
+                from: (
+                    component: (14),
+                    pin: 1,
+                ),
+                to: (
+                    component: (16),
+                    pin: 1,
+                ),
+                via: [
+                    (
+                        x: 12,
+                        y: 33,
+                    ),
+                    (
+                        x: 12,
+                        y: 23,
+                    ),
+                    (
+                        x: 16,
+                        y: 23,
+                    ),
+                ],
+            ),
+            (
+                id: (25),
+                from: (
+                    component: (15),
+                    pin: 2,
+                ),
+                to: (
+                    component: (17),
+                    pin: 0,
+                ),
+                via: [
+                    (
+                        x: 21,
+                        y: 21,
+                    ),
+                    (
+                        x: 21,
+                        y: 24,
+                    ),
+                ],
+            ),
+            (
+                id: (26),
+                from: (
+                    component: (16),
+                    pin: 2,
+                ),
+                to: (
+                    component: (17),
+                    pin: 0,
+                ),
+                via: [
+                    (
+                        x: 21,
+                        y: 27,
+                    ),
+                    (
+                        x: 21,
+                        y: 24,
+                    ),
+                ],
+            ),
+            (
+                id: (27),
+                from: (
+                    component: (3),
+                    pin: 5,
+                ),
+                to: (
+                    component: (18),
+                    pin: 0,
+                ),
+                via: [
+                    (
+                        x: 17,
+                        y: 1,
+                    ),
+                    (
+                        x: 17,
+                        y: -6,
+                    ),
+                    (
+                        x: 73,
+                        y: -6,
+                    ),
+                    (
+                        x: 73,
+                        y: 1,
+                    ),
+                ],
+            ),
+            (
+                id: (28),
+                from: (
+                    component: (5),
+                    pin: 5,
+                ),
+                to: (
+                    component: (18),
+                    pin: 1,
+                ),
+                via: [
+                    (
+                        x: 31,
+                        y: 1,
+                    ),
+                    (
+                        x: 31,
+                        y: -7,
+                    ),
+                    (
+                        x: 72,
+                        y: -7,
+                    ),
+                    (
+                        x: 72,
+                        y: 3,
+                    ),
+                ],
+            ),
+            (
+                id: (29),
+                from: (
+                    component: (7),
+                    pin: 5,
+                ),
+                to: (
+                    component: (18),
+                    pin: 2,
+                ),
+                via: [
+                    (
+                        x: 45,
+                        y: 1,
+                    ),
+                    (
+                        x: 45,
+                        y: -8,
+                    ),
+                    (
+                        x: 71,
+                        y: -8,
+                    ),
+                    (
+                        x: 71,
+                        y: 5,
+                    ),
+                ],
+            ),
+            (
+                id: (30),
+                from: (
+                    component: (9),
+                    pin: 5,
+                ),
+                to: (
+                    component: (18),
+                    pin: 3,
+                ),
+                via: [
+                    (
+                        x: 59,
+                        y: 1,
+                    ),
+                    (
+                        x: 59,
+                        y: -9,
+                    ),
+                    (
+                        x: 70,
+                        y: -9,
+                    ),
+                    (
+                        x: 70,
+                        y: 7,
+                    ),
+                ],
+            ),
+            (
+                id: (31),
+                from: (
+                    component: (19),
+                    pin: 0,
+                ),
+                to: (
+                    component: (18),
+                    pin: 4,
+                ),
+                via: [],
+            ),
+            (
+                id: (32),
+                from: (
+                    component: (18),
+                    pin: 10,
+                ),
+                to: (
+                    component: (20),
+                    pin: 0,
+                ),
+                via: [],
+            ),
+            (
+                id: (33),
+                from: (
+                    component: (21),
+                    pin: 0,
+                ),
+                to: (
+                    component: (18),
+                    pin: 5,
+                ),
+                via: [],
+            ),
+            (
+                id: (34),
+                from: (
+                    component: (18),
+                    pin: 11,
+                ),
+                to: (
+                    component: (22),
+                    pin: 0,
+                ),
+                via: [],
+            ),
+            (
+                id: (35),
+                from: (
+                    component: (23),
+                    pin: 0,
+                ),
+                to: (
+                    component: (18),
+                    pin: 6,
+                ),
+                via: [],
+            ),
+            (
+                id: (36),
+                from: (
+                    component: (18),
+                    pin: 12,
+                ),
+                to: (
+                    component: (24),
+                    pin: 0,
+                ),
+                via: [],
+            ),
+            (
+                id: (37),
+                from: (
+                    component: (25),
+                    pin: 0,
+                ),
+                to: (
+                    component: (18),
+                    pin: 7,
+                ),
+                via: [],
+            ),
+            (
+                id: (38),
+                from: (
+                    component: (18),
+                    pin: 13,
+                ),
+                to: (
+                    component: (26),
+                    pin: 0,
+                ),
+                via: [],
+            ),
+            (
+                id: (39),
+                from: (
+                    component: (27),
+                    pin: 0,
+                ),
+                to: (
+                    component: (18),
+                    pin: 8,
+                ),
+                via: [],
+            ),
+            (
+                id: (40),
+                from: (
+                    component: (28),
+                    pin: 0,
+                ),
+                to: (
+                    component: (18),
+                    pin: 9,
+                ),
+                via: [],
+            ),
+        ],
+        memories: [
+            (
+                id: (18),
+                words: "0 1 3 7 f e c 8 0 8 c e f 7 3 1",
+            ),
+        ],
+    ),
+)

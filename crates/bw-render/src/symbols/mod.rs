@@ -5,8 +5,10 @@
 //! * [`Symbol::build`] describes a symbol as outline paths plus fills in its
 //!   own unrotated local frame (grid units, origin at the body's top-left,
 //!   y down), together with its pin anchors. Pins follow `bw-core`'s pin
-//!   geometry exactly (inputs at `(0, 2i + 1)`, the output at `(w, h / 2)`),
-//!   so wires end precisely on the symbol's pin stubs.
+//!   geometry exactly ([`bw_core::ComponentKind::pin_offset`]: inputs at
+//!   `(0, 2i + 1)`, a single output at `(w, h / 2)`, enables / preset /
+//!   clear on the top or bottom edge), so wires end precisely on the
+//!   symbol's pin stubs.
 //! * [`tess`] turns the paths into triangles once (fills by ear clipping,
 //!   strokes as mitred strips with a unit *extrude* vector per vertex).
 //! * [`atlas()`] holds every kind × input count × style in one shared,
@@ -16,8 +18,9 @@
 //!
 //! State never changes a mesh: each vertex has a colour *role* and a *layer*
 //! (always / only when high / only when not high) that the shader resolves
-//! against the per-slot net level bits (LED lit, switch lever, clock trace,
-//! output pin colour).
+//! against the per-slot four-state levels (LED lit, switch lever, clock
+//! trace). Output pin stubs also carry their output index, so each stub of
+//! a multi-output part (Q / Q̄, memory data) shows its own net.
 
 #![allow(clippy::many_single_char_names, reason = "geometry code: points, radii, curve parameters")]
 
@@ -29,7 +32,10 @@ pub mod tess;
 
 use std::f32::consts::PI;
 
-use bw_core::{ComponentKind, GateOp, MAX_GATE_INPUTS, MIN_GATE_INPUTS, PinDir};
+use bw_core::{
+    ComponentKind, DATA_WIDTHS, FfTrigger, FlipFlopType, GateOp, MAX_ADDR_BITS, MIN_ADDR_BITS, MIN_GATE_INPUTS,
+    MemoryType, PinDir, data_width_index,
+};
 
 pub use atlas::{Atlas, MeshRange, atlas};
 use path::{P, arc, circle, cubic, quad, rect};
@@ -154,7 +160,7 @@ impl Layer {
         }
     }
 
-    /// Visible at `level` (0 low, 1 high, 2 unknown)?
+    /// Visible at `level` (0 low, 1 high, 2 floating, 3 unknown)?
     #[must_use]
     pub const fn shows(self, level: u8) -> bool {
         match self {
@@ -174,13 +180,12 @@ pub enum SymbolKind {
     Switch,
     Clock,
     Led,
-    // ---- not simulated yet (symbol only) ----
-    DFlipFlop,
-    RsFlipFlop,
-    JkFlipFlop,
     TriState,
-    Ram,
-    Rom,
+    /// Type, trigger, preset/clear pins.
+    FlipFlop(FlipFlopType, FfTrigger, bool),
+    /// Type, address lines, data bits.
+    Memory(MemoryType, u8, u8),
+    // ---- not simulated yet (symbol only) ----
     SevenSegment,
     NumericOutput,
     Vcc,
@@ -190,24 +195,31 @@ pub enum SymbolKind {
     /// Generic macro / IC (DIL-style box); [`Symbol::macro_ic`] builds named
     /// variants with any pin count.
     Macro,
-    Junction,
     Text,
+    /// Solder dot where three or more wires meet (drawn automatically, not
+    /// a component; its own GPU bucket).
+    Junction,
 }
 
-/// Number of GPU kind codes (see [`crate::kind_code`]).
-pub const KIND_CODES: u32 = 10;
-/// Input-count slots per kind in the GPU mesh table (`0..=MAX_GATE_INPUTS`).
-pub const INPUT_SLOTS: u32 = MAX_GATE_INPUTS as u32 + 1;
+/// Number of GPU kind codes (see [`crate::kind_code`]): the 16 component
+/// kinds plus the junction dot.
+pub const KIND_CODES: u32 = 17;
+/// Variant slots per kind in the GPU mesh table: the gate input count, the
+/// flip-flop trigger + preset/clear, or the memory size (see
+/// [`SymbolKind::variant`]); 8 bits of the packed instance kind.
+pub const VARIANT_SLOTS: u32 = 256;
+
+/// Variant index of a memory size: `(addr_bits - 4) * 5 + width index`.
+#[must_use]
+pub fn memory_variant(addr_bits: u8, data_bits: u8) -> u32 {
+    let w = data_width_index(data_bits).unwrap_or(0);
+    let widths = u32::try_from(DATA_WIDTHS.len()).unwrap_or(u32::MAX);
+    u32::from(addr_bits.saturating_sub(MIN_ADDR_BITS)) * widths + u32::from(w)
+}
 
 impl SymbolKind {
     /// Symbols of components that are not simulated yet.
-    pub const FUTURE: [Self; 15] = [
-        Self::DFlipFlop,
-        Self::RsFlipFlop,
-        Self::JkFlipFlop,
-        Self::TriState,
-        Self::Ram,
-        Self::Rom,
+    pub const FUTURE: [Self; 8] = [
         Self::SevenSegment,
         Self::NumericOutput,
         Self::Vcc,
@@ -215,34 +227,68 @@ impl SymbolKind {
         Self::SequenceGenerator,
         Self::InteractiveInput,
         Self::Macro,
-        Self::Junction,
         Self::Text,
     ];
 
     #[must_use]
     pub fn of(kind: &ComponentKind) -> Self {
         match *kind {
-            ComponentKind::Gate { op, inputs } => Self::Gate(op, inputs.clamp(MIN_GATE_INPUTS, MAX_GATE_INPUTS)),
+            ComponentKind::Gate { op, inputs } => {
+                Self::Gate(op, inputs.clamp(MIN_GATE_INPUTS, bw_core::MAX_GATE_INPUTS))
+            }
             ComponentKind::Not => Self::Not,
             ComponentKind::Switch { .. } => Self::Switch,
             ComponentKind::Clock { .. } => Self::Clock,
             ComponentKind::Led => Self::Led,
+            ComponentKind::TriState => Self::TriState,
+            ComponentKind::FlipFlop { ty, trigger, preset_clear } => Self::FlipFlop(ty, trigger, preset_clear),
+            ComponentKind::Memory { ty, addr_bits, data_bits } => Self::Memory(ty, addr_bits, data_bits),
         }
     }
 
     /// Every symbol variant: gates for each input count, the other current
-    /// components, then the future ones.
+    /// components (every flip-flop variant and memory size), then the
+    /// future ones.
     #[must_use]
     pub fn all() -> Vec<Self> {
         let mut v = Vec::new();
         for op in GateOp::ALL {
-            for n in MIN_GATE_INPUTS..=MAX_GATE_INPUTS {
+            for n in MIN_GATE_INPUTS..=bw_core::MAX_GATE_INPUTS {
                 v.push(Self::Gate(op, n));
             }
         }
-        v.extend([Self::Not, Self::Switch, Self::Clock, Self::Led]);
+        v.extend([Self::Not, Self::Switch, Self::Clock, Self::Led, Self::TriState]);
+        for ty in FlipFlopType::ALL {
+            for trigger in FfTrigger::ALL {
+                for pc in [false, true] {
+                    if (ComponentKind::FlipFlop { ty, trigger, preset_clear: pc }).is_valid() {
+                        v.push(Self::FlipFlop(ty, trigger, pc));
+                    }
+                }
+            }
+        }
+        for ty in [MemoryType::Ram, MemoryType::Rom] {
+            for a in MIN_ADDR_BITS..=MAX_ADDR_BITS {
+                for d in DATA_WIDTHS {
+                    v.push(Self::Memory(ty, a, d));
+                }
+            }
+        }
+        v.push(Self::Junction);
         v.extend(Self::FUTURE);
         v
+    }
+
+    /// Mesh variant within the kind code (see [`VARIANT_SLOTS`]); matches
+    /// [`crate::body_kind`].
+    #[must_use]
+    pub fn variant(self) -> u32 {
+        match self {
+            Self::Gate(_, n) => u32::from(n),
+            Self::FlipFlop(_, trigger, pc) => u32::from(trigger.index()) | (u32::from(pc) << 2),
+            Self::Memory(_, a, d) => memory_variant(a, d),
+            _ => 0,
+        }
     }
 
     #[must_use]
@@ -266,6 +312,13 @@ impl SymbolKind {
             Self::Switch => 7,
             Self::Clock => 8,
             Self::Led => 9,
+            Self::TriState => 10,
+            Self::FlipFlop(FlipFlopType::D, ..) => 11,
+            Self::FlipFlop(FlipFlopType::Rs, ..) => 12,
+            Self::FlipFlop(FlipFlopType::Jk, ..) => 13,
+            Self::Memory(MemoryType::Ram, ..) => 14,
+            Self::Memory(MemoryType::Rom, ..) => 15,
+            Self::Junction => 16,
             _ => return None,
         })
     }
@@ -284,12 +337,12 @@ impl SymbolKind {
             Self::Switch => "Switch",
             Self::Clock => "Clock",
             Self::Led => "LED",
-            Self::DFlipFlop => "D flip-flop",
-            Self::RsFlipFlop => "RS flip-flop",
-            Self::JkFlipFlop => "JK flip-flop",
+            Self::FlipFlop(FlipFlopType::D, ..) => "D flip-flop",
+            Self::FlipFlop(FlipFlopType::Rs, ..) => "RS flip-flop",
+            Self::FlipFlop(FlipFlopType::Jk, ..) => "JK flip-flop",
             Self::TriState => "Tri-state buffer",
-            Self::Ram => "RAM",
-            Self::Rom => "ROM",
+            Self::Memory(MemoryType::Ram, ..) => "RAM",
+            Self::Memory(MemoryType::Rom, ..) => "ROM",
             Self::SevenSegment => "7-segment display",
             Self::NumericOutput => "Numeric output",
             Self::Vcc => "Power (VCC)",
@@ -314,8 +367,8 @@ impl SymbolKind {
             Self::Switch | Self::InteractiveInput => [0.40, 0.85, 0.55],
             Self::Clock | Self::SequenceGenerator => [0.40, 0.85, 0.85],
             Self::Led | Self::SevenSegment | Self::NumericOutput => [0.95, 0.35, 0.35],
-            Self::DFlipFlop | Self::RsFlipFlop | Self::JkFlipFlop => [0.95, 0.55, 0.78],
-            Self::Ram | Self::Rom => [0.55, 0.78, 0.95],
+            Self::FlipFlop(..) => [0.95, 0.55, 0.78],
+            Self::Memory(..) => [0.55, 0.78, 0.95],
             Self::Vcc => [0.95, 0.45, 0.35],
             Self::Ground => [0.60, 0.66, 0.75],
             Self::Macro => [0.78, 0.78, 0.84],
@@ -325,13 +378,17 @@ impl SymbolKind {
     }
 }
 
-/// Wire / pin colour of a net level (0 low, 1 high, else unknown). Mirrors
-/// `level_color` in `common.wgsl`.
+/// Colour of the unknown (X) level, on wires and state indicators.
+pub const X_COLOR: [f32; 3] = [1.0, 0.55, 0.10];
+
+/// Wire / pin colour of a net level (0 low, 1 high, 2 floating, 3
+/// unknown). Mirrors `level_color` in `common.wgsl`.
 #[must_use]
 pub const fn level_color(level: u8) -> [f32; 3] {
     match level {
         1 => [0.30, 0.95, 0.40],
         0 => [0.12, 0.42, 0.18],
+        3 => X_COLOR,
         _ => [0.45, 0.50, 0.58],
     }
 }
@@ -354,6 +411,7 @@ pub fn shade(role: Role, accent: [f32; 3], level: u8) -> [f32; 3] {
         Role::State => match level {
             1 => accent,
             0 => accent.map(|c| c * 0.28),
+            3 => X_COLOR,
             _ => [0.32; 3],
         },
         Role::PinOut => level_color(level),
@@ -370,6 +428,8 @@ pub struct Shape {
     pub layer: Layer,
     /// Labels: drawn upright around this point whatever the rotation.
     pub anchor: Option<P>,
+    /// Output index whose net colours a [`Role::PinOut`] stroke.
+    pub pin: u8,
 }
 
 /// A pin anchor of a symbol (local, unrotated grid units).
@@ -412,7 +472,7 @@ impl B {
     }
 
     fn push(&mut self, points: Vec<P>, closed: bool, fill: Option<Role>, stroke: Option<(Role, Width)>) -> &mut Shape {
-        self.shapes.push(Shape { points, closed, fill, stroke, layer: Layer::Always, anchor: None });
+        self.shapes.push(Shape { points, closed, fill, stroke, layer: Layer::Always, anchor: None, pin: 0 });
         let n = self.shapes.len() - 1;
         &mut self.shapes[n]
     }
@@ -464,10 +524,19 @@ impl B {
         self.inputs.push(SymPin { at: [x, 0.0], dir: PinDir::Input });
     }
 
-    /// Output pin at the right edge, stub from `x_start`.
+    /// Input pin at the bottom edge (e.g. a clear), stub up to `y_end`.
+    fn input_bottom(&mut self, x: f32, y_end: f32) {
+        let h = self.size[1];
+        self.line(vec![[x, h], [x, y_end]], Role::PinIn, Width::Pin);
+        self.inputs.push(SymPin { at: [x, h], dir: PinDir::Input });
+    }
+
+    /// Output pin at the right edge, stub from `x_start`, coloured by its
+    /// own net.
     fn output(&mut self, y: f32, x_start: f32) {
         let w = self.size[0];
-        self.line(vec![[x_start, y], [w, y]], Role::PinOut, Width::Pin);
+        let pin = u8::try_from(self.outputs.len()).unwrap_or(u8::MAX);
+        self.line(vec![[x_start, y], [w, y]], Role::PinOut, Width::Pin).pin = pin;
         self.outputs.push(SymPin { at: [w, y], dir: PinDir::Output });
     }
 
@@ -520,7 +589,7 @@ fn gate_output(b: &mut B, front: f32, c: f32, invert: bool) {
 
 #[allow(clippy::cast_precision_loss)]
 fn gate(op: GateOp, n: u8, style: SymbolStyle) -> Symbol {
-    let n = n.clamp(MIN_GATE_INPUTS, MAX_GATE_INPUTS);
+    let n = n.clamp(MIN_GATE_INPUTS, bw_core::MAX_GATE_INPUTS);
     let h = 2.0 * f32::from(n);
     let c = f32::from(n);
     let (fam, invert) = family(op);
@@ -640,44 +709,75 @@ fn led() -> Symbol {
     b.finish()
 }
 
-/// Edge-triggered flip-flop box with the dynamic (clock) triangle.
-fn flip_flop(inputs: &[&str], clock_at: usize) -> Symbol {
+/// Flip-flop box (IEC-style qualifiers, same in both styles): data inputs
+/// and the clock on the left, Q / Q̄ on the right, optional preset (top)
+/// and clear (bottom). The clock input shows the trigger: a plain `C` for
+/// the level-sensitive latch, the dynamic triangle for edge triggering
+/// (with an inversion bubble for the falling edge), and for master-slave a
+/// plain `C` plus the postponed-output mark (⌐) at both outputs.
+fn flip_flop(ty: FlipFlopType, trigger: FfTrigger, preset_clear: bool) -> Symbol {
+    let kind = ComponentKind::FlipFlop { ty, trigger, preset_clear };
     #[allow(clippy::cast_precision_loss)]
-    let h = 2.0 * inputs.len() as f32;
-    let mut b = B::new(6.0, h.max(4.0));
-    let h = b.size[1];
-    let (x0, x1) = (0.6, 5.4);
-    for i in 0..inputs.len() {
-        #[allow(clippy::cast_precision_loss)]
-        b.input(2.0 * i as f32 + 1.0, x0);
-    }
-    b.body(rect(x0, 0.2, x1, h - 0.2));
-    for (i, l) in inputs.iter().enumerate() {
+    let (w, h) = (kind.size().0 as f32, kind.size().1 as f32);
+    let mut b = B::new(w, h);
+    let (x0, x1) = (0.6, w - 0.6);
+    let labels = ty.input_labels();
+    let clock = usize::from(FlipFlopType::CLOCK_INPUT);
+    let falling = trigger == FfTrigger::FallingEdge;
+    for i in 0..labels.len() {
         #[allow(clippy::cast_precision_loss)]
         let y = 2.0 * i as f32 + 1.0;
-        if i == clock_at {
-            b.line(vec![[x0, y - 0.4], [x0 + 0.5, y], [x0 + 0.0, y + 0.4]], Role::Outline, Width::Outline);
+        let end = if i == clock && falling { x0 - 2.0 * BUBBLE_R } else { x0 };
+        b.input(y, end);
+    }
+    if preset_clear {
+        b.input_top(w / 2.0, 0.2);
+        b.input_bottom(w / 2.0, h - 0.2);
+    }
+    b.body(rect(x0, 0.2, x1, h - 0.2));
+    for (i, l) in labels.iter().enumerate() {
+        #[allow(clippy::cast_precision_loss)]
+        let y = 2.0 * i as f32 + 1.0;
+        if i == clock && matches!(trigger, FfTrigger::RisingEdge | FfTrigger::FallingEdge) {
+            b.line(vec![[x0, y - 0.4], [x0 + 0.5, y], [x0, y + 0.4]], Role::Outline, Width::Outline);
             b.text(l, x0 + 1.1, y, 0.6);
+            if falling {
+                b.bubble(x0 - BUBBLE_R, y);
+            }
         } else {
             b.text(l, x0 + 0.65, y, 0.7);
         }
     }
-    b.text("Q", x1 - 0.6, 1.0, 0.7);
-    b.text_bar("Q", x1 - 0.6, h - 1.0, 0.7);
-    b.output(1.0, x1);
-    b.output(h - 1.0, x1);
+    if preset_clear {
+        b.text("PRE", w / 2.0, 0.85, 0.45);
+        b.text("CLR", w / 2.0, h - 0.85, 0.45);
+    }
+    let (qy, nqy) = (1.0, h - 1.0);
+    b.text("Q", x1 - 0.6, qy, 0.7);
+    b.text_bar("Q", x1 - 0.6, nqy, 0.7);
+    if trigger == FfTrigger::MasterSlave {
+        // Postponed output: ⌐ left of each output label.
+        for y in [qy, nqy] {
+            let x = x1 - 1.55;
+            b.line(vec![[x, y - 0.3], [x + 0.45, y - 0.3], [x + 0.45, y + 0.15]], Role::Text, Width::Thin);
+        }
+    }
+    b.output(qy, x1);
+    b.output(nqy, x1);
     b.finish()
 }
 
+/// Tri-state buffer: IN on the left (y = 2), EN on the top (x = 2), OUT on
+/// the right (y = 2), as `ComponentKind::pin_offset` places them.
 fn tri_state(style: SymbolStyle) -> Symbol {
     let mut b = B::new(4.0, 3.0);
     let y = 2.0;
+    let ex = 2.0;
     match style {
         SymbolStyle::Ansi => {
             b.input(y, 0.6);
             let (x0, x1, half) = (0.6, 2.9, 0.85);
             // Enable stub ends on the triangle's upper edge.
-            let ex = 1.8;
             let ey = (y - half) + (ex - x0) / (x1 - x0) * half;
             b.input_top(ex, ey);
             b.body(vec![[x0, y - half], [x1, y], [x0, y + half]]);
@@ -685,9 +785,9 @@ fn tri_state(style: SymbolStyle) -> Symbol {
         }
         SymbolStyle::Iec => {
             b.input(y, 0.6);
-            b.input_top(1.8, 1.1);
+            b.input_top(ex, 1.1);
             b.body(rect(0.6, 1.1, 2.9, 2.9));
-            b.text("EN", 1.8, 1.45, 0.3);
+            b.text("EN", 1.3, 1.45, 0.3);
             b.text("1", 1.25, 2.2, 0.65);
             // Three-state output qualifier (inverted triangle).
             b.loop_line(vec![[2.2, 2.0], [2.65, 2.0], [2.425, 2.4]], Role::Text, Width::Thin);
@@ -697,27 +797,48 @@ fn tri_state(style: SymbolStyle) -> Symbol {
     b.finish()
 }
 
-fn memory(title: &str, inputs: &[&str], outputs: &[&str]) -> Symbol {
+/// RAM / ROM: address lines A0.. then (RAM) data inputs D0.., R/W̄, then
+/// C̄S̄ on the left; data outputs on the right; the type and size in the
+/// middle. Pins are labelled with small text (and the active-low controls
+/// with an overline); the output stubs carry their own net colours.
+fn memory(ty: MemoryType, addr_bits: u8, data_bits: u8) -> Symbol {
+    let kind = ComponentKind::Memory { ty, addr_bits, data_bits };
     #[allow(clippy::cast_precision_loss)]
-    let h = 2.0 * inputs.len().max(outputs.len()).max(3) as f32;
-    let mut b = B::new(8.0, h);
-    let (x0, x1) = (0.6, 7.4);
-    #[allow(clippy::cast_precision_loss)]
-    let pin_y = |i: usize| 2.0 * i as f32 + 1.0;
-    for i in 0..inputs.len() {
+    let (w, h) = (kind.size().0 as f32, kind.size().1 as f32);
+    let mut b = B::new(w, h);
+    let (x0, x1) = (0.6, w - 0.6);
+    let pin_y = |i: u8| 2.0 * f32::from(i) + 1.0;
+    let ins = kind.input_count();
+    for i in 0..ins {
         b.input(pin_y(i), x0);
     }
     b.body(rect(x0, 0.2, x1, h - 0.2));
     // Title band.
     b.line(vec![[2.6, 0.2], [2.6, h - 0.2]], Role::Outline, Width::Thin);
     b.line(vec![[5.4, 0.2], [5.4, h - 0.2]], Role::Outline, Width::Thin);
-    b.text(title, 4.0, h / 2.0, 0.9);
-    for (i, l) in inputs.iter().enumerate() {
-        b.text(l, x0 + 0.9, pin_y(i), 0.55);
+    b.text(ty.name(), 4.0, h / 2.0 - 0.7, 0.9);
+    b.text(&format!("{}X{}", 1u32 << addr_bits, data_bits), 4.0, h / 2.0 + 0.7, 0.45);
+    let th = 0.5;
+    for i in 0..ins {
+        let (y, lx) = (pin_y(i), x0 + 0.95);
+        if i < addr_bits {
+            b.text(&format!("A{i}"), lx, y, th);
+        } else if ty == MemoryType::Ram && i < addr_bits + data_bits {
+            b.text(&format!("D{}", i - addr_bits), lx, y, th);
+        } else if ty == MemoryType::Ram && i == addr_bits + data_bits {
+            // R/W̄: overline on the W only.
+            b.text("R/W", lx, y, th);
+            let cw = font::text_width(1, th);
+            let gx = lx + font::text_width(3, th) / 2.0 - cw / 2.0;
+            let oy = y - th / 2.0 - th * 0.28;
+            b.line(vec![[gx - cw / 2.0, oy], [gx + cw / 2.0, oy]], Role::Text, Width::Thin).anchor = Some([lx, y]);
+        } else {
+            b.text_bar("CS", lx, y, th);
+        }
     }
-    for (i, l) in outputs.iter().enumerate() {
-        b.text(l, x1 - 0.9, pin_y(i), 0.55);
-        b.output(pin_y(i), x1);
+    for k in 0..data_bits {
+        b.text(&format!("Q{k}"), x1 - 0.95, pin_y(k), th);
+        b.output(pin_y(k), x1);
     }
     b.finish()
 }
@@ -821,10 +942,12 @@ fn interactive_input() -> Symbol {
     b.finish()
 }
 
+/// Solder dot: a filled disc in the net colour, centred in a small body
+/// (`crate::scene::DOT_HALF` on each side of the node).
 fn junction() -> Symbol {
-    let mut b = B::new(0.0, 0.0);
-    b.dot([0.0, 0.0], 0.22, Role::PinOut);
-    b.outputs.push(SymPin { at: [0.0, 0.0], dir: PinDir::Output });
+    let h = crate::scene::DOT_HALF;
+    let mut b = B::new(2.0 * h, 2.0 * h);
+    b.dot([h, h], 0.23, Role::PinOut);
     b.finish()
 }
 
@@ -858,12 +981,9 @@ impl Symbol {
             SymbolKind::Switch => switch(),
             SymbolKind::Clock => clock(),
             SymbolKind::Led => led(),
-            SymbolKind::DFlipFlop => flip_flop(&["D", "C"], 1),
-            SymbolKind::RsFlipFlop => flip_flop(&["S", "C", "R"], 1),
-            SymbolKind::JkFlipFlop => flip_flop(&["J", "C", "K"], 1),
+            SymbolKind::FlipFlop(ty, trigger, pc) => flip_flop(ty, trigger, pc),
             SymbolKind::TriState => tri_state(style),
-            SymbolKind::Ram => memory("RAM", &["A", "DI", "WE", "CS"], &["DO"]),
-            SymbolKind::Rom => memory("ROM", &["A", "CS"], &["D"]),
+            SymbolKind::Memory(ty, a, d) => memory(ty, a, d),
             SymbolKind::SevenSegment => seven_segment(),
             SymbolKind::NumericOutput => numeric_output(),
             SymbolKind::Vcc => vcc(),
@@ -908,13 +1028,14 @@ impl Symbol {
         let mut out = Vec::new();
         for s in &self.shapes {
             let from = out.len();
+            let pin = u32::from(s.pin) << 8;
             if let Some(role) = s.fill {
                 if s.closed {
-                    tess::fill(&s.points, tess::attr(role, Width::None, s.layer), &mut out);
+                    tess::fill(&s.points, tess::attr(role, Width::None, s.layer) | pin, &mut out);
                 }
             }
             if let Some((role, width)) = s.stroke {
-                tess::stroke(&s.points, s.closed, tess::attr(role, width, s.layer), &mut out);
+                tess::stroke(&s.points, s.closed, tess::attr(role, width, s.layer) | pin, &mut out);
             }
             if let Some(a) = s.anchor {
                 let packed = tess::pack_anchor(a);
@@ -936,7 +1057,9 @@ mod tests {
     fn components() -> Vec<ComponentKind> {
         let mut v: Vec<ComponentKind> = GateOp::ALL
             .iter()
-            .flat_map(|&op| (MIN_GATE_INPUTS..=MAX_GATE_INPUTS).map(move |inputs| ComponentKind::Gate { op, inputs }))
+            .flat_map(|&op| {
+                (MIN_GATE_INPUTS..=bw_core::MAX_GATE_INPUTS).map(move |inputs| ComponentKind::Gate { op, inputs })
+            })
             .collect();
         v.extend([
             ComponentKind::Not,
@@ -944,7 +1067,25 @@ mod tests {
             ComponentKind::Switch { on: true },
             ComponentKind::Clock { half_period: 3 },
             ComponentKind::Led,
+            ComponentKind::TriState,
         ]);
+        for ty in FlipFlopType::ALL {
+            for trigger in FfTrigger::ALL {
+                for preset_clear in [false, true] {
+                    let k = ComponentKind::FlipFlop { ty, trigger, preset_clear };
+                    if k.is_valid() {
+                        v.push(k);
+                    }
+                }
+            }
+        }
+        for ty in [MemoryType::Ram, MemoryType::Rom] {
+            for addr_bits in MIN_ADDR_BITS..=MAX_ADDR_BITS {
+                for data_bits in DATA_WIDTHS {
+                    v.push(ComponentKind::Memory { ty, addr_bits, data_bits });
+                }
+            }
+        }
         v
     }
 
@@ -972,6 +1113,16 @@ mod tests {
                     });
                     assert!(touches, "{kind:?} {style:?}: no pin stub at pin {i}");
                 }
+                // Each output stub is coloured by its own output's net.
+                let outs: Vec<u8> = sym
+                    .shapes
+                    .iter()
+                    .filter(|s| s.stroke.is_some_and(|(r, _)| r == Role::PinOut) && kind.output_count() > 0)
+                    .filter(|s| s.layer == Layer::Always)
+                    .map(|s| s.pin)
+                    .collect();
+                let expect: Vec<u8> = (0..kind.output_count()).collect();
+                assert_eq!(outs, expect, "{kind:?} output stub indices");
             }
         }
     }
@@ -989,7 +1140,7 @@ mod tests {
                     // Centre lines stay inside the body (strokes may overhang
                     // by their half-width only).
                     let tol = 0.5;
-                    if kind != SymbolKind::Junction {
+                    {
                         assert!(
                             v.pos[0] >= -1e-4
                                 && v.pos[1] >= -1e-4

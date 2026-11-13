@@ -9,7 +9,7 @@ struct Globals {
     pixels_per_point: f32,
     // bit 0: net levels valid; bit 1: draw through the GPU-culled index lists
     flags: u32,
-    // Number of valid bits in net_bits (= body slots).
+    // Number of signal slots in net_bits.
     net_count: u32,
     // Slots uploaded so far (drawn / culled range).
     body_count: u32,
@@ -29,7 +29,7 @@ struct Body {
     min: vec2<f32>,
     size: vec2<f32>,
     kind: u32,
-    // Body slot whose level colours this body, or NO_NET.
+    // First signal slot of the body's outputs (LED: its driver), or NO_NET.
     net: u32,
 };
 
@@ -42,7 +42,7 @@ struct Wire {
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
-// One bit per body slot, 32 per word.
+// Four-state level per signal slot: 2 bits, 16 per word.
 @group(0) @binding(1) var<storage, read> net_bits: array<u32>;
 
 const NO_NET: u32 = 0xffffffffu;
@@ -53,34 +53,49 @@ const FLAG_CULLED: u32 = 2u;
 // there, so it is clipped without rasterising anything.
 const CLIPPED: vec4<f32> = vec4<f32>(2.0, 2.0, 2.0, 1.0);
 
-// 0 = low, 1 = high, 2 = unknown (no snapshot / unconnected).
+const LVL_LOW: u32 = 0u;
+const LVL_HIGH: u32 = 1u;
+const LVL_Z: u32 = 2u;
+const LVL_X: u32 = 3u;
+// Colour of the unknown level (mirrors symbols::X_COLOR).
+const X_COLOR: vec3<f32> = vec3<f32>(1.0, 0.55, 0.10);
+
+// 0 = low, 1 = high, 2 = floating (also: no snapshot / unconnected),
+// 3 = unknown.
 fn net_level(net: u32) -> u32 {
     if ((g.flags & FLAG_NETS_VALID) == 0u || net == NO_NET || net >= g.net_count) {
-        return 2u;
+        return LVL_Z;
     }
-    return (net_bits[net >> 5u] >> (net & 31u)) & 1u;
+    return (net_bits[net >> 4u] >> ((net & 15u) * 2u)) & 3u;
 }
 
 // Wire / pin colour of a net level (mirrors symbols::level_color).
 fn level_color(lvl: u32) -> vec3<f32> {
-    if (lvl == 1u) {
+    if (lvl == LVL_HIGH) {
         return vec3<f32>(0.30, 0.95, 0.40);
-    } else if (lvl == 0u) {
+    } else if (lvl == LVL_LOW) {
         return vec3<f32>(0.12, 0.42, 0.18);
+    } else if (lvl == LVL_X) {
+        return X_COLOR;
     }
     return vec3<f32>(0.45, 0.50, 0.58);
 }
 
 // kind code: 0..5 gates (AND OR NAND NOR XOR XNOR), 6 NOT, 7 switch, 8 clock,
-// 9 LED (mirrors SymbolKind::accent).
+// 9 LED, 10 tri-state, 11..13 D / RS / JK flip-flops, 14 RAM, 15 ROM,
+// 16 junction dot (mirrors SymbolKind::accent).
+const JUNCTION_CODE: u32 = 16u;
 fn kind_accent(kind: u32) -> vec3<f32> {
     switch kind {
         case 0u, 2u: { return vec3<f32>(0.35, 0.62, 0.95); }
         case 1u, 3u: { return vec3<f32>(0.95, 0.62, 0.30); }
         case 4u, 5u: { return vec3<f32>(0.70, 0.45, 0.95); }
-        case 6u: { return vec3<f32>(0.85, 0.85, 0.40); }
+        case 6u, 10u: { return vec3<f32>(0.85, 0.85, 0.40); }
         case 7u: { return vec3<f32>(0.40, 0.85, 0.55); }
         case 8u: { return vec3<f32>(0.40, 0.85, 0.85); }
+        case 11u, 12u, 13u: { return vec3<f32>(0.95, 0.55, 0.78); }
+        case 14u, 15u: { return vec3<f32>(0.55, 0.78, 0.95); }
+        case 16u: { return vec3<f32>(0.45, 0.50, 0.58); }
         default: { return vec3<f32>(0.95, 0.35, 0.35); }
     }
 }

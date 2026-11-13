@@ -20,30 +20,34 @@ struct DrawArgs {
     first_instance: u32,
 };
 
-// Body buckets (kind codes) and columns (buckets + wires).
-const NB: u32 = 10u;
-const NCOL: u32 = 11u;
+// Body buckets (kind codes: 16 component kinds + junction dots) and columns
+// (buckets + wires).
+const NB: u32 = 17u;
+const NCOL: u32 = 18u;
 const NONE: u32 = 0xffffu;
-// sym_info layout (symbols/atlas.rs): [0, 16) bucket bases, [16, 32) vertex
+// sym_info layout (symbols/atlas.rs): [0, 17) bucket bases, [17, 34) vertex
 // counts of the per-bucket symbol draws.
-const INFO_VCOUNT: u32 = 16u;
+const INFO_VCOUNT: u32 = 17u;
+// The junction bucket is last; far-zoom quads leave it out (dots are only
+// drawn as symbols).
+const JUNCTION_BUCKET: u32 = 16u;
 
 @group(1) @binding(0) var<storage, read> c_bodies: array<Body>;
 @group(1) @binding(1) var<storage, read> c_wires: array<Wire>;
 @group(1) @binding(2) var<storage, read_write> c_vis_bodies: array<u32>;
 @group(1) @binding(3) var<storage, read_write> c_vis_wires: array<u32>;
 // [0] all bodies as quads, [1] wires, [2 + b] symbols of bucket b.
-@group(1) @binding(4) var<storage, read_write> c_args: array<DrawArgs, 12>;
+@group(1) @binding(4) var<storage, read_write> c_args: array<DrawArgs, 19>;
 // Column-major: [col * cull_groups + group] counts, replaced by offsets.
 @group(1) @binding(5) var<storage, read_write> c_groups: array<u32>;
 @group(1) @binding(6) var<storage, read_write> c_info: array<u32>;
 
 const WG: u32 = 256u;
 
-var<workgroup> sh_cnt: array<atomic<u32>, 16>;
+var<workgroup> sh_cnt: array<atomic<u32>, 32>;
 var<workgroup> sh_tag: array<u32, 256>;
 var<workgroup> sh_scan: array<u32, 256>;
-var<workgroup> sh_tot: array<u32, 16>;
+var<workgroup> sh_tot: array<u32, 32>;
 
 fn overlaps(lo: vec2<f32>, hi: vec2<f32>) -> bool {
     return all(hi >= g.cull_rect.xy) && all(lo <= g.cull_rect.zw);
@@ -81,7 +85,7 @@ fn cs_count(
 ) {
     let group = wid.x + wid.y * nwg.x;
     let i = group * WG + lid;
-    if (lid < 16u) {
+    if (lid < 32u) {
         atomicStore(&sh_cnt[lid], 0u);
     }
     workgroupBarrier();
@@ -139,12 +143,16 @@ fn cs_scan(@builtin(local_invocation_index) lid: u32) {
     }
     if (lid == 0u) {
         var total = 0u;
+        var quads = 0u;
         for (var b = 0u; b < NB; b++) {
             c_info[b] = total;
             c_args[2u + b] = DrawArgs(c_info[INFO_VCOUNT + b], sh_tot[b], b << 16u, 0u);
             total += sh_tot[b];
+            if (b != JUNCTION_BUCKET) {
+                quads += sh_tot[b];
+            }
         }
-        c_args[0] = DrawArgs(6u, total, 0u, 0u);
+        c_args[0] = DrawArgs(6u, quads, 0u, 0u);
         c_args[1] = DrawArgs(6u, sh_tot[NB], 0u, 0u);
     }
 }

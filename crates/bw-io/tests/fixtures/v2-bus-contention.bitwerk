@@ -1,0 +1,187 @@
+(
+    format: "bitwerk",
+    version: 2,
+    name: "bus contention",
+    circuit: (
+        components: [
+            (
+                id: (0),
+                kind: Switch(
+                    on: true,
+                ),
+                pos: (
+                    x: 0,
+                    y: 0,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (1),
+                kind: Switch(
+                    on: false,
+                ),
+                pos: (
+                    x: 0,
+                    y: 6,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (2),
+                kind: Switch(
+                    on: true,
+                ),
+                pos: (
+                    x: 0,
+                    y: 12,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (3),
+                kind: TriState,
+                pos: (
+                    x: 8,
+                    y: -1,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (4),
+                kind: TriState,
+                pos: (
+                    x: 8,
+                    y: 5,
+                ),
+                rotation: R0,
+            ),
+            (
+                id: (5),
+                kind: Led,
+                pos: (
+                    x: 18,
+                    y: 3,
+                ),
+                rotation: R0,
+            ),
+        ],
+        wires: [
+            (
+                id: (0),
+                from: (
+                    component: (0),
+                    pin: 0,
+                ),
+                to: (
+                    component: (3),
+                    pin: 0,
+                ),
+                via: [],
+            ),
+            (
+                id: (1),
+                from: (
+                    component: (1),
+                    pin: 0,
+                ),
+                to: (
+                    component: (4),
+                    pin: 0,
+                ),
+                via: [],
+            ),
+            (
+                id: (2),
+                from: (
+                    component: (2),
+                    pin: 0,
+                ),
+                to: (
+                    component: (3),
+                    pin: 1,
+                ),
+                via: [
+                    (
+                        x: 4,
+                        y: 13,
+                    ),
+                    (
+                        x: 4,
+                        y: -3,
+                    ),
+                    (
+                        x: 10,
+                        y: -3,
+                    ),
+                ],
+            ),
+            (
+                id: (3),
+                from: (
+                    component: (2),
+                    pin: 0,
+                ),
+                to: (
+                    component: (4),
+                    pin: 1,
+                ),
+                via: [
+                    (
+                        x: 4,
+                        y: 13,
+                    ),
+                    (
+                        x: 4,
+                        y: 3,
+                    ),
+                    (
+                        x: 10,
+                        y: 3,
+                    ),
+                ],
+            ),
+            (
+                id: (4),
+                from: (
+                    component: (3),
+                    pin: 2,
+                ),
+                to: (
+                    component: (5),
+                    pin: 0,
+                ),
+                via: [
+                    (
+                        x: 15,
+                        y: 1,
+                    ),
+                    (
+                        x: 15,
+                        y: 4,
+                    ),
+                ],
+            ),
+            (
+                id: (5),
+                from: (
+                    component: (4),
+                    pin: 2,
+                ),
+                to: (
+                    component: (5),
+                    pin: 0,
+                ),
+                via: [
+                    (
+                        x: 15,
+                        y: 7,
+                    ),
+                    (
+                        x: 15,
+                        y: 4,
+                    ),
+                ],
+            ),
+        ],
+    ),
+)

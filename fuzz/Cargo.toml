@@ -25,3 +25,10 @@ bench = false
 [profile.release]
 debug = 1
 overflow-checks = true
+
+[[bin]]
+name = "load_memory_map"
+path = "fuzz_targets/load_memory_map.rs"
+test = false
+doc = false
+bench = false

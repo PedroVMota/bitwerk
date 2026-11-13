@@ -16,3 +16,7 @@ crossbeam-channel.workspace = true
 arc-swap.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# Loads the bundled examples in tests (workspace crate, no new dependency).
+bw-io.workspace = true

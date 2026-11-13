@@ -12,6 +12,7 @@
 mod app;
 mod canvas;
 mod icons;
+mod memwin;
 mod menu;
 mod scene_worker;
 mod stress;
@@ -44,7 +45,8 @@ fn main() -> eframe::Result {
     }
     // The measurement sweep keeps its window above others: an occluded
     // window is neither painted nor presented, which would void the run.
-    if std::env::args().any(|a| a == "--sweep") {
+    // `--on-top` does the same for scripted screenshots.
+    if std::env::args().any(|a| a == "--sweep" || a == "--on-top") {
         viewport = viewport.with_always_on_top();
     }
     let mut wgpu_options = egui_wgpu::WgpuConfiguration::default();
