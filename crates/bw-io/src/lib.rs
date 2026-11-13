@@ -578,12 +578,20 @@ pub fn save_to_path(p: &Project, path: &Path) -> Result<(), IoError> {
 /// # Errors
 /// I/O failure.
 pub fn write_atomic(text: &str, path: &Path) -> Result<(), IoError> {
+    write_bytes_atomic(text.as_bytes(), path)
+}
+
+/// Writes bytes atomically (temp file in the same directory + rename).
+///
+/// # Errors
+/// I/O failure.
+pub fn write_bytes_atomic(bytes: &[u8], path: &Path) -> Result<(), IoError> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp);
     {
         let mut f = File::create(&tmp)?;
-        f.write_all(text.as_bytes())?;
+        f.write_all(bytes)?;
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;

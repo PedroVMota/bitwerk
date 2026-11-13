@@ -307,3 +307,32 @@ checked against every file of the package:
   and sequential (immediate) propagation; gate-level latches such as the
   master-slave JK sample only work under those semantics. bitwerk's
   "Sequential" evaluation mode reproduces them (see the README).
+
+## 12. Notes from the bitwerk exporter
+
+Findings used by the writer (`crates/bw-io/src/dwm/writer.rs`, `export.rs`):
+
+- **Writing is the reverse of reading with the same field programs.**
+  Objects are written depth first from the root, numbered before their
+  fields; integers in the smallest `vaInt8/16/32` form; strings `vaString`
+  (≤ 255 bytes, else `vaLString`). Re-serialising the parsed object table of
+  every file of the package (495 `.dwm`, 8 `.dwt`) reproduces it **byte for
+  byte**, which also confirms the field layouts of §4 and the header of §2.
+- **Header written** (as Digital Works 3.x does): version 34, properties
+  100 name, 101 datasheet, 102 `'0'` (string), 202 `0`, 200 `1`.
+- **Zero-length wires are normal**: 812 wires in the package have all their
+  points equal, and 745 join two solders at the same position. A junction
+  of *n* wires is a chain of *n* − 2 solders joined by such wires; a pin
+  with several wires has one zero-length wire to a solder chain.
+- **Pin outlines**: 8 × 8 squares listed `(x+4,y+4), (x+4,y−4), (x−4,y−4),
+  (x−4,y+4)`, brush 0xFFFFFF; a tag's connection pin has brush 0xEEFAFF and
+  kind 0; 7-segment pins are 4 × 4. The inner `TMacroPin` of a tag lies at
+  the origin (±4), kind 0.
+- **Devices without a stored drawing in the package**: flip-flops, LEDs,
+  7-segment displays, switches, clocks, sequence generators, power and
+  ground are never stored with `has_graphics`; the exporter keeps their
+  standard symbol (`x`, `y` only). Clocks and sequence generators normally
+  carry a name label (`has_label`); `False` is valid (LEDs use it).
+- **Numeric outputs** always store one digit text per input line (all 13 in
+  the package), least significant first, suppressed digits in
+  `unk_color_60` (0x808080); the display format is not stored there.

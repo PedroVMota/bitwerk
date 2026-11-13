@@ -271,6 +271,15 @@ pub fn save_path(map: &MemoryMap, path: &Path) -> Result<(), MapError> {
     std::fs::rename(&tmp, path).map_err(io)
 }
 
+/// Writes a Digital Works binary memory map atomically (temp file +
+/// rename).
+///
+/// # Errors
+/// I/O failure.
+pub fn save_dw_path(map: &MemoryMap, path: &Path) -> Result<(), MapError> {
+    crate::write_bytes_atomic(&to_dw_bytes(map), path).map_err(|e| MapError::Io(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +346,22 @@ mod tests {
         let map = MemoryMap { data_bits: 8, words: (0..=255).collect() };
         save_path(&map, &path).unwrap();
         assert_eq!(load_path(&path).unwrap(), map);
+        // Digital Works binary: same words (read back as 16-bit words).
+        let dw = dir.join("dw.map");
+        save_dw_path(&map, &dw).unwrap();
+        let bytes = std::fs::read(&dw).unwrap();
+        assert!(is_dw_map(&bytes));
+        assert_eq!(bytes.len(), 8 + 4 * 256);
+        assert_eq!(load_path(&dw).unwrap().words, map.words);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The official sample map is rewritten byte for byte.
+    #[test]
+    fn digital_works_sample_rewrites_identically() {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dwm/low1.map");
+        let bytes = std::fs::read(p).unwrap();
+        let map = parse_dw(&bytes).unwrap();
+        assert_eq!(to_dw_bytes(&map), bytes);
     }
 }
