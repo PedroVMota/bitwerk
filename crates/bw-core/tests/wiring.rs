@@ -41,7 +41,7 @@ fn seg_at(c: &Circuit, p: GridPos) -> SegmentId {
 /// Switch at (0, 0) → LED 1 at (10, 0); out pin (2, 1), LED input (10, 1).
 fn straight() -> (Circuit, ComponentId, ComponentId) {
     let mut c = Circuit::new();
-    let sw = add(&mut c, ComponentKind::Switch { on: true }, 0, 0);
+    let sw = add(&mut c, ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle }, 0, 0);
     let led = add(&mut c, ComponentKind::Led, 10, 0);
     c.connect(pin(sw, 0), pin(led, 0), vec![]).unwrap();
     assert_eq!(c.segment_count(), 1);
@@ -114,8 +114,8 @@ fn deleting_a_branch_trims_dangling_wire_and_merges_the_straight_line() {
 fn merging_nets_refuses_two_drivers_and_allows_tristate_buses() {
     // Two switches, each driving its own LED.
     let mut c = Circuit::new();
-    let s1 = add(&mut c, ComponentKind::Switch { on: true }, 0, 0);
-    let s2 = add(&mut c, ComponentKind::Switch { on: false }, 0, 10);
+    let s1 = add(&mut c, ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle }, 0, 0);
+    let s2 = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle }, 0, 10);
     let l1 = add(&mut c, ComponentKind::Led, 12, 0);
     let l2 = add(&mut c, ComponentKind::Led, 12, 10);
     c.connect(pin(s1, 0), pin(l1, 0), vec![]).unwrap();
@@ -161,7 +161,7 @@ fn merging_nets_refuses_two_drivers_and_allows_tristate_buses() {
     assert_eq!(c.drivers_of(pin(l2, 0)), vec![pin(t1, 2), pin(t2, 2)]);
     assert_eq!(c.junction_count(), 2);
     // A plain output still cannot join the bus.
-    let s = add(&mut c, ComponentKind::Switch { on: true }, 20, 20);
+    let s = add(&mut c, ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle }, 20, 20);
     let bus = seg_at(&c, GridPos::new(8, 6));
     let e = c.apply(&Edit::AddWire {
         from: WireEnd::Pin(pin(s, 0)),
@@ -175,7 +175,7 @@ fn merging_nets_refuses_two_drivers_and_allows_tristate_buses() {
 #[test]
 fn moving_and_rotating_components_rubber_band_their_wires() {
     let mut c = Circuit::new();
-    let sw = add(&mut c, ComponentKind::Switch { on: true }, 0, 0);
+    let sw = add(&mut c, ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle }, 0, 0);
     let g = add(&mut c, ComponentKind::Gate { op: bw_core::GateOp::And, inputs: 2 }, 12, 4);
     let led = add(&mut c, ComponentKind::Led, 24, 0);
     // An L from the switch to in0, a straight-ish wire to the LED.
@@ -285,7 +285,7 @@ fn random_edit(c: &Circuit, r: &mut Rng) -> Edit {
     match r.below(12) {
         0 | 1 if comps.len() < 14 => {
             let kinds = [
-                ComponentKind::Switch { on: true },
+                ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle },
                 ComponentKind::Led,
                 ComponentKind::TriState,
                 ComponentKind::Gate { op: bw_core::GateOp::Xor, inputs: 2 },

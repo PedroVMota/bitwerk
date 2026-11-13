@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use bw_core::{ComponentId, ComponentKind, GridPos, NodeId, PinDir, PinRef, SegmentId, WireEnd};
+use bw_core::{ComponentId, ComponentKind, GridPos, NodeId, PinDir, PinRef, SegmentId, SwitchMode, WireEnd};
 use bw_render::{CanvasRenderer, FrameView, Item, NetLevels, SymbolKind};
 use bw_sim::{Command, Snapshot};
 use egui::{Color32, Pos2, Rect, Sense, Stroke};
@@ -23,6 +23,18 @@ pub enum DragState {
     Node { id: NodeId, to: GridPos },
     /// A segment, sideways (perpendicular to itself).
     Segment { id: SegmentId, from: GridPos, offset: i32 },
+}
+
+/// A push button held down with the Interact tool (released when the
+/// primary button goes up, wherever the pointer is, or the tool changes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pressed {
+    pub id: ComponentId,
+    /// Level at rest (the switch's `on`).
+    pub rest: bool,
+    /// Macro depth it was pressed at (0 = root: a simulator-only level;
+    /// inside a macro the press edits the definition, like toggles do).
+    pub depth: usize,
 }
 
 /// A wire being drawn with the Wire tool.
@@ -180,6 +192,7 @@ pub fn canvas_ui(app: &mut BitwerkApp, ui: &mut egui::Ui, snap_shot: &Arc<Snapsh
 
     // ---- primary-button interaction ----------------------------------
     let shift = ui.input(|i| i.modifiers.shift);
+    interact_press(app, ui, &resp, hover.map(|p| world_at(&app.camera, p)), snap_shot);
     if resp.drag_started_by(egui::PointerButton::Primary) && app.tool == Tool::Select {
         if let Some(p) = resp.interact_pointer_pos().map(local) {
             let w = world_at(&app.camera, p);
@@ -206,7 +219,7 @@ pub fn canvas_ui(app: &mut BitwerkApp, ui: &mut egui::Ui, snap_shot: &Arc<Snapsh
             (None, Some(w)) => {
                 if let Some(b) = app.box_select.as_mut() {
                     b.1 = w;
-                } else {
+                } else if app.pressed.is_none() {
                     app.camera.pan_by(v(resp.drag_delta()));
                 }
             }
@@ -627,6 +640,17 @@ fn draw_overlays(app: &BitwerkApp, ui: &egui::Ui, rect: Rect, hover: Option<Vec2
                             to_screen(o + Vec2::new(p[0], p[1]))
                         });
                     }
+                } else if let ComponentKind::Text { .. } = kind {
+                    // A text annotation: its real box and the default text.
+                    let note = bw_core::Note::default();
+                    let h = (f32::from(note.height) / 10.0 * app.camera.zoom).max(4.0);
+                    painter.text(
+                        to_screen(o + Vec2::new(0.2 * f32::from(note.height) / 10.0, size.y * 0.5)),
+                        egui::Align2::LEFT_CENTER,
+                        &note.text,
+                        egui::FontId::proportional(h),
+                        Color32::from_white_alpha(140),
+                    );
                 } else {
                     crate::icons::paint_with(
                         &painter,
@@ -740,8 +764,11 @@ fn click(app: &mut BitwerkApp, w: Vec2) {
         }
         Tool::Interact => {
             if let Some(id) = pick_component(app, w) {
-                if let Some(ComponentKind::Switch { on }) = app.shown().component(id).map(|c| c.kind) {
-                    let kind = ComponentKind::Switch { on: !on };
+                // Push buttons and pulse inputs act on press (`interact_press`).
+                if let Some(ComponentKind::Switch { on, mode: mode @ SwitchMode::Toggle }) =
+                    app.shown().component(id).map(|c| c.kind)
+                {
+                    let kind = ComponentKind::Switch { on: !on, mode };
                     if !app.levels.is_empty() {
                         // Inside a macro a switch is part of the definition.
                         if let Err(e) = app.apply_edit(bw_core::Edit::SetKind(id, kind)) {
@@ -763,6 +790,74 @@ fn click(app: &mut BitwerkApp, w: Vec2) {
             }
         }
         Tool::Wire => wire_click(app, w),
+    }
+}
+
+/// Live level of a component's first output at the root (`None` if the
+/// snapshot does not map the root or the pin drives no net). Scans the
+/// driver map: only called on a click.
+fn live_level(snap: &Snapshot, id: ComponentId) -> Option<bool> {
+    if snap.view.as_ref().is_none_or(|v| !v.is_empty()) {
+        return None;
+    }
+    let map = &snap.net_map;
+    let k = map.pins.iter().position(|&(c, pin)| c == id && pin == 0)?;
+    let k = u32::try_from(k).ok()?;
+    // `start` is sorted: the net is the last start at or before k.
+    let net = map.start.partition_point(|&s| s <= k).checked_sub(1)?;
+    match bw_sim::packed_level(&snap.values, net) {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+/// Interact tool: a push button is held while the primary button is down
+/// (its level is inverted until release, even if the pointer leaves it);
+/// clicking a pulse input sets its current level (the opposite of the
+/// live one). At the root only the simulator changes; inside a macro the
+/// switch is part of the definition, so the definition is edited.
+fn interact_press(app: &mut BitwerkApp, ui: &egui::Ui, resp: &egui::Response, w: Option<Vec2>, snap: &Snapshot) {
+    if let Some(p) = app.pressed {
+        let down = ui.input(|i| i.pointer.primary_down());
+        if !down || app.tool != Tool::Interact || app.levels.len() != p.depth {
+            app.pressed = None;
+            if app.levels.len() == p.depth {
+                set_switch_level(app, p.id, p.rest, ComponentKind::Switch { on: p.rest, mode: SwitchMode::Momentary });
+            }
+        }
+        return;
+    }
+    if app.tool != Tool::Interact || !resp.hovered() || !ui.input(|i| i.pointer.primary_pressed()) {
+        return;
+    }
+    let Some(id) = w.and_then(|w| pick_component(app, w)) else { return };
+    match app.shown().component(id).map(|c| c.kind) {
+        Some(ComponentKind::Switch { on, mode: SwitchMode::Momentary }) => {
+            app.pressed = Some(Pressed { id, rest: on, depth: app.levels.len() });
+            set_switch_level(app, id, !on, ComponentKind::Switch { on: !on, mode: SwitchMode::Momentary });
+        }
+        Some(ComponentKind::Switch { on, mode: SwitchMode::Pulse }) => {
+            if app.levels.is_empty() {
+                let level = live_level(snap, id).unwrap_or(on);
+                app.sim.send(Command::SetSwitch(id, !level));
+            } else {
+                set_switch_level(app, id, !on, ComponentKind::Switch { on: !on, mode: SwitchMode::Pulse });
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Sets a switch's level: in the simulator at the root, as a definition
+/// edit (`kind`) inside a macro.
+fn set_switch_level(app: &mut BitwerkApp, id: ComponentId, level: bool, kind: ComponentKind) {
+    if app.levels.is_empty() {
+        app.sim.send(Command::SetSwitch(id, level));
+    } else if app.shown().component(id).is_some_and(|c| c.kind != kind) {
+        if let Err(e) = app.apply_edit(bw_core::Edit::SetKind(id, kind)) {
+            app.status = e.to_string();
+        }
     }
 }
 

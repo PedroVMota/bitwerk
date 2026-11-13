@@ -178,7 +178,13 @@ impl BitwerkApp {
         else {
             return;
         };
-        match bw_io::bwmacro::load_from_path(&path) {
+        self.import_macro_path(&path);
+    }
+
+    /// Imports a `.bwmacro` file into the project (its definitions are
+    /// added; identical ones are reused).
+    pub fn import_macro_path(&mut self, path: &std::path::Path) {
+        match bw_io::bwmacro::load_from_path(path) {
             Ok(f) => match self.circuit.macros().import_plan(&f.table, f.root) {
                 Ok((defs, root)) => {
                     for (id, def) in defs {
@@ -241,6 +247,14 @@ fn contents(app: &mut BitwerkApp, ui: &mut egui::Ui) {
             app.import_macro_file();
         }
     });
+    if ui
+        .small_button("Import Digital Works folder…")
+        .on_hover_text("Convert every Digital Works macro (.dwm) below a folder into My parts › Imported")
+        .clicked()
+    {
+        app.import_dw_folder_dialog();
+    }
+    crate::dwimport::parts_section(app, ui);
     let q = app.parts.search.to_lowercase();
     let mut rows: Vec<Row> = Vec::new();
     for (id, e) in app.circuit.macros().iter() {

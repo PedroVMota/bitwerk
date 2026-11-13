@@ -1,6 +1,6 @@
 (
     format: "bitwerk",
-    version: 4,
+    version: 5,
     name: "Macros demo",
     macros: [
         (

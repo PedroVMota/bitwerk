@@ -28,7 +28,7 @@ pub fn generate(target: usize) -> Result<Circuit, CircuitError> {
         let source = if row % 2 == 0 {
             ComponentKind::Clock { half_period: 2 + u32::try_from(row % 7).unwrap_or(0) }
         } else {
-            ComponentKind::Switch { on: row % 4 == 1 }
+            ComponentKind::Switch { on: row % 4 == 1, mode: crate::SwitchMode::Toggle }
         };
         let src = c.add_component(source, GridPos::new(0, y), Rotation::R0)?;
         // (component, segments of the wire feeding its first input, the

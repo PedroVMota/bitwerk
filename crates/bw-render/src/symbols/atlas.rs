@@ -13,6 +13,15 @@ use super::{KIND_CODES, SymVertex, Symbol, SymbolKind, SymbolStyle, VARIANT_SLOT
 pub const INFO_MACRO: usize = INFO_TABLE + (2 * KIND_CODES * VARIANT_SLOTS * 2) as usize;
 /// Macro mesh slots in the info buffer (one per possible definition id).
 pub const MACRO_SLOTS: usize = bw_core::MAX_MACRO_DEFS;
+/// Start (in `u32` words) of the per-annotation mesh table: `(start,
+/// count)` of note slot `s` at `INFO_NOTE + 2 * s` (written by the renderer
+/// as annotations appear or change). Slot 0 means "no note mesh" (the
+/// instance falls back to the static text symbol).
+pub const INFO_NOTE: usize = INFO_MACRO + 2 * MACRO_SLOTS;
+/// Note slots (14 bits of the packed instance kind; slot 0 unused).
+pub const NOTE_SLOTS: usize = 1 << 14;
+/// Words of the whole GPU info table.
+pub const INFO_WORDS: usize = INFO_NOTE + 2 * NOTE_SLOTS;
 
 /// Sub-range of the atlas vertex array.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,11 +31,12 @@ pub struct MeshRange {
 }
 
 /// Layout of the GPU info table (`u32` words), shared with the shaders:
-/// `[0, 19)` per-bucket base of the culled body list (written by the GPU),
-/// `[19, 38)` per-bucket vertex count of the indirect draws (max over input
-/// variants and styles), then `(start, count)` pairs indexed by
+/// `[0, KIND_CODES)` per-bucket base of the culled body list (written by
+/// the GPU), `[KIND_CODES, 2 * KIND_CODES)` per-bucket vertex count of the
+/// indirect draws (max over variants and styles, and over the dynamic macro
+/// and note meshes), then `(start, count)` pairs indexed by
 /// `(style * KIND_CODES + code) * VARIANT_SLOTS + variant`, then the macro
-/// table ([`INFO_MACRO`]).
+/// table ([`INFO_MACRO`]) and the note table ([`INFO_NOTE`]).
 pub const INFO_BASE: usize = 0;
 pub const INFO_VCOUNT: usize = KIND_CODES as usize;
 pub const INFO_TABLE: usize = 2 * KIND_CODES as usize;
@@ -89,13 +99,13 @@ impl Atlas {
         }
         let mut info = vec![0u32; INFO_TABLE + (2 * KIND_CODES * VARIANT_SLOTS * 2) as usize];
         for (&(kind, style), r) in &ranges {
-            let Some(code) = kind.code() else { continue };
-            let slots: Vec<u32> = match kind {
-                SymbolKind::Gate(..) | SymbolKind::FlipFlop(..) | SymbolKind::Memory(..) | SymbolKind::Tag(..) => {
-                    vec![kind.variant()]
-                }
-                // Single variant: fill every slot so any packing finds it.
-                _ => (0..VARIANT_SLOTS).collect(),
+            let code = kind.code();
+            let slots: Vec<u32> = if kind.per_variant_mesh() {
+                vec![kind.variant()]
+            } else {
+                // One mesh for every variant (parameters only the shader
+                // reads, or none): fill every slot so any packing finds it.
+                (0..VARIANT_SLOTS).collect()
             };
             for variant in slots {
                 let idx = INFO_TABLE + 2 * ((style.index() * KIND_CODES + code) * VARIANT_SLOTS + variant) as usize;
@@ -176,31 +186,39 @@ mod tests {
             for op in GateOp::ALL {
                 for n in MIN_GATE_INPUTS..=MAX_GATE_INPUTS {
                     let k = SymbolKind::Gate(op, n);
-                    let code = k.code().unwrap();
+                    let code = k.code();
                     assert_eq!(Some(lookup(style, code, u32::from(n))), a.range(k, style));
                     assert!(info[INFO_VCOUNT + code as usize] >= a.range(k, style).unwrap().count);
                 }
             }
-            for k in [SymbolKind::Not, SymbolKind::Switch, SymbolKind::Clock, SymbolKind::Led, SymbolKind::TriState] {
-                let code = k.code().unwrap();
-                for variant in [0, 1] {
-                    assert_eq!(Some(lookup(style, code, variant)), a.range(k, style));
+            for k in [
+                SymbolKind::Not,
+                SymbolKind::Clock,
+                SymbolKind::Led,
+                SymbolKind::TriState,
+                SymbolKind::SevenSegment,
+                SymbolKind::SequenceGenerator,
+                SymbolKind::Text,
+            ] {
+                assert!(!k.per_variant_mesh());
+                for variant in [0, 1, 37, 255] {
+                    assert_eq!(Some(lookup(style, k.code(), variant)), a.range(k, style), "{k:?}");
                 }
             }
-            // Every flip-flop variant and memory size has its own mesh.
+            // Every per-variant mesh (switch modes, VCC / ground, flip-flop
+            // variants, memory sizes, numeric layouts) has its own entry.
             for k in SymbolKind::all() {
-                if let (SymbolKind::FlipFlop(..) | SymbolKind::Memory(..), Some(code)) = (k, k.code()) {
-                    assert_eq!(Some(lookup(style, code, k.variant())), a.range(k, style), "{k:?}");
+                if k.per_variant_mesh() {
+                    assert_eq!(Some(lookup(style, k.code(), k.variant())), a.range(k, style), "{k:?}");
                     assert!(k.variant() < VARIANT_SLOTS);
+                    assert!(info[INFO_VCOUNT + k.code() as usize] >= a.range(k, style).unwrap().count);
                 }
             }
         }
         // The variants of one kind code never collide.
         let mut seen = HashMap::new();
         for k in SymbolKind::all() {
-            if let Some(code) = k.code() {
-                assert!(seen.insert((code, k.variant()), k).is_none(), "{k:?} collides");
-            }
+            assert!(seen.insert((k.code(), k.variant()), k).is_none(), "{k:?} collides");
         }
         println!("atlas: {} vertices ({} KiB)", a.vertices().len(), a.vertices().len() * 24 / 1024);
         for code in 0..KIND_CODES {

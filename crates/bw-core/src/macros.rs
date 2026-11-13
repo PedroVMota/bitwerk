@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::circuit::{Applied, Circuit, CircuitError, CircuitRaw, Edit, MemoryRecord};
 use crate::component::{
-    Component, ComponentId, ComponentKind, DIL_SIZES, MAX_DIL_PINS, MAX_MACRO_SIDE_PINS, MAX_MACRO_WIDTH, MacroId,
+    Component, ComponentId, ComponentKind, DIL_SIZES, MAX_DIL_PINS, MAX_MACRO_INPUTS, MAX_MACRO_WIDTH, MacroId,
     MacroShape, PinDir, PinRef, Rotation, TagDir,
 };
 use crate::geom::GridPos;
@@ -271,7 +271,7 @@ impl MacroDef {
         s.inputs = u8::try_from(ins).unwrap_or(u8::MAX);
         s.outputs = u8::try_from(outs).unwrap_or(u8::MAX);
         for (k, p) in iface[ins..].iter().enumerate() {
-            if p.tristate && k < 32 {
+            if p.tristate && k < 64 {
                 s.tristate |= 1 << k;
             }
         }
@@ -345,9 +345,12 @@ impl MacroDef {
         }
         let iface = self.interface();
         let ins = iface.iter().filter(|p| p.dir == TagDir::In).count();
-        let side = usize::from(MAX_MACRO_SIDE_PINS);
-        if ins > side || iface.len() - ins > side {
-            return bad(format!("at most {side} inputs and {side} outputs"));
+        let side = usize::from(MAX_MACRO_INPUTS);
+        if ins > side || iface.len() - ins > side || iface.len() > 255 {
+            return bad(format!("at most {side} inputs and {side} outputs (255 pins in all)"));
+        }
+        if iface[ins..].iter().skip(usize::from(crate::component::MAX_TRISTATE_OUTPUTS)).any(|p| p.tristate) {
+            return bad(format!("only the first {} outputs can be tri-state", crate::component::MAX_TRISTATE_OUTPUTS));
         }
         if let Package::Dil(n) = self.package {
             if !DIL_SIZES.contains(&n) {
@@ -533,6 +536,15 @@ impl MacroTable {
             c.id.hash(&mut h);
             c.pos.hash(&mut h);
             c.rotation.hash(&mut h);
+            // Only hashed when set, so the hashes of older content stay.
+            if let Some(color) = c.color {
+                0xfeu8.hash(&mut h);
+                color.hash(&mut h);
+            }
+            if let Some(note) = def.body.note(c.id) {
+                0xfdu8.hash(&mut h);
+                note.hash(&mut h);
+            }
             match c.kind {
                 ComponentKind::Macro(shape) => {
                     let child = self.entries.get(&shape.def).ok_or(CircuitError::NoSuchMacro(shape.def))?;
@@ -551,7 +563,7 @@ impl MacroTable {
                     0xffu8.hash(&mut h);
                     child.hash.hash(&mut h);
                 }
-                ComponentKind::Tag { .. } => c.kind.hash(&mut h),
+                ComponentKind::Tag { .. } | ComponentKind::Text { .. } => c.kind.hash(&mut h),
                 k => {
                     k.hash(&mut h);
                     flat = flat.saturating_add(1);
@@ -734,9 +746,18 @@ impl Circuit {
         let mut raw = CircuitRaw::default();
         for (&old, &nid) in &new_id {
             let c = &self.components[&old];
-            raw.components.push(Component { id: nid, kind: c.kind, pos: shift(c.pos), rotation: c.rotation });
+            raw.components.push(Component {
+                id: nid,
+                kind: c.kind,
+                pos: shift(c.pos),
+                rotation: c.rotation,
+                color: c.color,
+            });
             if let Some(m) = self.memories.get(&old) {
                 raw.memories.push(MemoryRecord { id: nid, words: memenc::encode(m) });
+            }
+            if let Some(n) = self.notes.get(&old) {
+                raw.notes.push(crate::circuit::NoteRecord { id: nid, note: n.clone() });
             }
         }
         // Classify the nets touching the selection.

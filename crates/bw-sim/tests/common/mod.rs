@@ -50,7 +50,11 @@ impl Bench {
         let mut switches = Vec::new();
         for k in 0..shape.inputs {
             let s = c
-                .add_component(ComponentKind::Switch { on: false }, GridPos::new(0, 4 * i32::from(k)), Rotation::R0)
+                .add_component(
+                    ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle },
+                    GridPos::new(0, 4 * i32::from(k)),
+                    Rotation::R0,
+                )
                 .unwrap();
             c.apply(&Edit::AddWire {
                 from: WireEnd::Pin(PinRef { component: s, pin: 0 }),

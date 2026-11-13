@@ -23,19 +23,24 @@ fn vs_body(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     let world = inst.min + c * inst.size;
     let lvl = net_level(inst.net);
     let code = inst.kind & 0xffu;
-    let accent = kind_accent(code);
+    var accent = kind_accent(code);
     var fill = vec3<f32>(0.20, 0.21, 0.24);
-    if ((code >= 7u && code <= 9u) || code == 16u) {
+    if ((code >= 7u && code <= 9u) || code == 16u || code == CONST_CODE || code == SEQ_CODE) {
         // Sources and LEDs show their level in the fill colour.
+        let ink = inst_ink(inst.kind, code);
         if (lvl == LVL_HIGH) {
-            fill = accent;
+            fill = ink;
         } else if (lvl == LVL_LOW) {
-            fill = accent * 0.25;
+            fill = ink * 0.25;
         } else if (lvl == LVL_X) {
             fill = X_COLOR;
         } else {
             fill = vec3<f32>(0.3, 0.3, 0.3);
         }
+    } else if (code == TEXT_CODE) {
+        // Annotations: a faint box in their text colour.
+        fill = vec3<f32>(0.15, 0.16, 0.18);
+        accent = inst_ink(inst.kind, code) * 0.6;
     } else if (lvl == LVL_HIGH) {
         fill = vec3<f32>(0.22, 0.27, 0.22);
     }

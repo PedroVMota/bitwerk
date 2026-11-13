@@ -34,27 +34,53 @@ use crate::camera::Camera;
 use crate::scene::{BodyInstance, Scene, WireInstance};
 use crate::symbols::{self, KIND_CODES, SymVertex, SymbolStyle};
 
-/// Atlas vertices reserved for macro definition meshes at start-up.
+/// Atlas vertices reserved for macro definition and note meshes at
+/// start-up.
 const MACRO_ATLAS_HEADROOM: usize = 1 << 16;
 
-/// The macro part of the symbol atlas: one mesh per definition, appended
-/// after the static symbols. Changing a definition appends its new mesh
-/// (the old range becomes garbage, compacted when it dominates); nothing
-/// else is rebuilt or re-uploaded.
+/// The dynamic part of the symbol atlas: one mesh per macro definition and
+/// per text annotation (note slot), appended after the static symbols, each
+/// with its `(start, count)` entry in the GPU info table. Changing a mesh
+/// appends the new one (the old range becomes garbage, compacted when it
+/// dominates); nothing else is rebuilt or re-uploaded.
 #[derive(Debug, Default)]
-struct MacroMeshes {
-    /// Table revision last synchronised.
-    revision: Option<u64>,
-    /// Definition → (content hash, shape, start, count) of its mesh.
-    meshes: std::collections::BTreeMap<u32, (u64, bw_core::MacroShape, u32, u32)>,
+struct DynMeshes {
+    /// Info-table word of each entry → (start, count) of its mesh.
+    entries: std::collections::BTreeMap<usize, (u32, u32)>,
     /// Vertices after the static ones (CPU copy, for compaction).
     tail: Vec<SymVertex>,
     static_vertices: usize,
     /// Atlas buffer capacity in vertices.
     cap: usize,
     garbage: usize,
+    /// Longest note mesh (vertex count of the text bucket; only grows
+    /// between compactions).
+    note_vmax: u32,
+}
+
+/// Macro definitions whose meshes are in [`DynMeshes`].
+#[derive(Debug, Default)]
+struct MacroMeshes {
+    /// Table revision last synchronised.
+    revision: Option<u64>,
+    /// Definition → (content hash, shape) of its mesh.
+    meshes: std::collections::BTreeMap<u32, (u64, bw_core::MacroShape)>,
     /// Meshes built in the last sync (tests / stats).
     built: usize,
+}
+
+/// Info-table word of a macro definition's mesh entry.
+fn macro_word(id: u32) -> usize {
+    symbols::atlas::INFO_MACRO + 2 * id as usize
+}
+
+/// Info-table word of a note slot's mesh entry.
+fn note_word(slot: u32) -> usize {
+    symbols::atlas::INFO_NOTE + 2 * slot as usize
+}
+
+fn is_note_word(w: usize) -> bool {
+    w >= symbols::atlas::INFO_NOTE
 }
 
 /// Below this many slots culling is not worth a compute pass: draw all.
@@ -248,8 +274,11 @@ pub struct CanvasRenderer {
     target_bodies: u32,
     target_wires: u32,
     warned_limit: bool,
-    /// Meshes of macro definitions appended to the atlas.
+    /// Meshes of macro definitions and annotations appended to the atlas.
+    dynamic: DynMeshes,
     macros: MacroMeshes,
+    /// Note meshes built by the last `prepare` that had note changes.
+    notes_built: usize,
     /// Uploaded counts the instance bind groups were created for.
     bound: Option<(u32, u32)>,
 
@@ -427,7 +456,7 @@ impl CanvasRenderer {
         let atlas_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
         let atlas_buf = init_buffer(device, "bw-symbol-atlas", &atlas_bytes, atlas_usage);
         let mut info = atlas.gpu_info().to_vec();
-        info.resize(symbols::atlas::INFO_MACRO + 2 * symbols::atlas::MACRO_SLOTS, 0);
+        info.resize(symbols::atlas::INFO_WORDS, 0);
         let info_buf = init_buffer(
             device,
             "bw-symbol-info",
@@ -505,7 +534,9 @@ impl CanvasRenderer {
             target_bodies: 0,
             target_wires: 0,
             warned_limit: false,
-            macros: MacroMeshes { static_vertices, cap: atlas_cap, ..MacroMeshes::default() },
+            dynamic: DynMeshes { static_vertices, cap: atlas_cap, ..DynMeshes::default() },
+            macros: MacroMeshes::default(),
+            notes_built: 0,
             bound: None,
             mode: DrawMode::All(0),
             cull_groups: 0,
@@ -517,9 +548,6 @@ impl CanvasRenderer {
         }
     }
 
-    /// Uploads whatever changed since the previous frame (dirty slots, the
-    /// next chunk of a streaming scene, net levels) and the camera uniform.
-    /// CPU cost is proportional to what changed, never to the scene size.
     /// Keeps the macro part of the symbol atlas in step with the project's
     /// definition table: new or changed definitions get their mesh appended
     /// (one small upload), removed ones free their table entry. Cheap when
@@ -530,16 +558,14 @@ impl CanvasRenderer {
         }
         self.macros.revision = Some(table.revision());
         self.macros.built = 0;
-        let mut changed: Vec<u32> = Vec::new();
         let live: std::collections::BTreeSet<u32> = table.iter().map(|(id, _)| id.0).collect();
         let gone: Vec<u32> = self.macros.meshes.keys().copied().filter(|id| !live.contains(id)).collect();
+        let mut removes = Vec::new();
         for id in gone {
-            if let Some((.., n)) = self.macros.meshes.remove(&id) {
-                self.macros.garbage += n as usize;
-            }
-            changed.push(id);
+            self.macros.meshes.remove(&id);
+            removes.push(macro_word(id));
         }
-        let mut new_meshes: Vec<(u32, u64, bw_core::MacroShape, Vec<SymVertex>)> = Vec::new();
+        let mut puts: Vec<(usize, Vec<SymVertex>)> = Vec::new();
         for (id, e) in table.iter() {
             if id.0 as usize >= symbols::atlas::MACRO_SLOTS {
                 continue;
@@ -552,68 +578,156 @@ impl CanvasRenderer {
             if mesh.len() > max {
                 mesh.truncate(max - max % 3);
             }
-            new_meshes.push((id.0, e.hash, e.shape, mesh));
+            self.macros.meshes.insert(id.0, (e.hash, e.shape));
+            puts.push((macro_word(id.0), mesh));
         }
-        let added: usize = new_meshes.iter().map(|m| m.3.len()).sum();
-        let live_len = self.macros.tail.len() - self.macros.garbage.min(self.macros.tail.len());
-        // Compact when garbage dominates: rebuild the (small) macro tail only.
-        if self.macros.garbage > 4096 && self.macros.garbage > live_len {
-            let old_tail = std::mem::take(&mut self.macros.tail);
-            let base = self.macros.static_vertices;
-            for (id, m) in &mut self.macros.meshes {
-                let s = m.2 as usize - base;
-                let start = base + self.macros.tail.len();
-                self.macros.tail.extend_from_slice(&old_tail[s..s + m.3 as usize]);
-                m.2 = u32::try_from(start).unwrap_or(u32::MAX);
-                changed.push(*id);
+        self.macros.built = puts.len();
+        self.apply_dynamic(device, queue, &removes, puts);
+        // The bucket's vertex count: the longest macro mesh.
+        let static_max = symbols::atlas().gpu_info()[symbols::atlas::INFO_VCOUNT + symbols::MACRO_CODE as usize];
+        let vmax = self
+            .dynamic
+            .entries
+            .iter()
+            .filter(|(w, _)| !is_note_word(**w))
+            .map(|(_, m)| m.1)
+            .max()
+            .unwrap_or(0)
+            .max(static_max);
+        self.write_vcount(queue, symbols::MACRO_CODE, vmax);
+    }
+
+    fn write_vcount(&self, queue: &wgpu::Queue, code: u32, count: u32) {
+        let w = symbols::atlas::INFO_VCOUNT + code as usize;
+        queue.write_buffer(&self.info_buf, (w * 4) as u64, bytemuck::cast_slice(&[count]));
+    }
+
+    /// Keeps the note meshes of text annotations in step with the scene:
+    /// all of them for a scene the renderer has not shown yet, else only
+    /// the note slots the scene reports as changed.
+    fn sync_notes(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, scene: &mut Scene, new_scene: bool) {
+        let dirty = scene.take_dirty_notes();
+        let mut removes: Vec<usize> = Vec::new();
+        let mut puts: Vec<(usize, Vec<SymVertex>)> = Vec::new();
+        if new_scene {
+            removes.extend(self.dynamic.entries.keys().copied().filter(|&w| is_note_word(w)));
+            for (slot, note) in scene.note_slots() {
+                puts.push((note_word(slot), symbols::note_mesh(note)));
             }
-            self.macros.garbage = 0;
-            let need = base + self.macros.tail.len() + added;
+        } else {
+            if dirty.is_empty() {
+                return;
+            }
+            let mut seen = std::collections::HashSet::new();
+            for &slot in dirty.iter().rev() {
+                if !seen.insert(slot) {
+                    continue;
+                }
+                match scene.note_at(slot) {
+                    Some(note) => puts.push((note_word(slot), symbols::note_mesh(note))),
+                    None => removes.push(note_word(slot)),
+                }
+            }
+        }
+        if puts.is_empty() && removes.is_empty() {
+            return;
+        }
+        self.notes_built = puts.len();
+        let grow = puts.iter().map(|p| u32::try_from(p.1.len()).unwrap_or(u32::MAX)).max().unwrap_or(0);
+        let before = self.dynamic.note_vmax;
+        if self.apply_dynamic(device, queue, &removes, puts) || new_scene {
+            // Exact again after a compaction or a new scene.
+            self.dynamic.note_vmax =
+                self.dynamic.entries.iter().filter(|(w, _)| is_note_word(**w)).map(|(_, m)| m.1).max().unwrap_or(0);
+        } else {
+            self.dynamic.note_vmax = self.dynamic.note_vmax.max(grow);
+        }
+        if self.dynamic.note_vmax != before || new_scene {
+            let static_max = symbols::atlas().gpu_info()[symbols::atlas::INFO_VCOUNT + symbols::TEXT_CODE as usize];
+            self.write_vcount(queue, symbols::TEXT_CODE, self.dynamic.note_vmax.max(static_max));
+        }
+    }
+
+    /// Removes and (re)places dynamic meshes: removed and replaced meshes
+    /// become garbage (the tail is compacted when garbage dominates), new
+    /// meshes are appended with one upload, and the changed table entries
+    /// are written in runs. Returns whether the tail was compacted.
+    fn apply_dynamic(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        removes: &[usize],
+        puts: Vec<(usize, Vec<SymVertex>)>,
+    ) -> bool {
+        let mut changed: Vec<usize> = Vec::new();
+        for &w in removes {
+            if let Some((_, n)) = self.dynamic.entries.remove(&w) {
+                self.dynamic.garbage += n as usize;
+            }
+            changed.push(w);
+        }
+        for (w, _) in &puts {
+            if let Some((_, n)) = self.dynamic.entries.remove(w) {
+                self.dynamic.garbage += n as usize;
+            }
+        }
+        let added: usize = puts.iter().map(|m| m.1.len()).sum();
+        let base = self.dynamic.static_vertices;
+        let live_len = self.dynamic.tail.len() - self.dynamic.garbage.min(self.dynamic.tail.len());
+        // Compact when garbage dominates: rebuild the (small) dynamic tail.
+        let compact = self.dynamic.garbage > 4096 && self.dynamic.garbage > live_len;
+        if compact {
+            let old_tail = std::mem::take(&mut self.dynamic.tail);
+            for (&w, m) in &mut self.dynamic.entries {
+                let s = m.0 as usize - base;
+                let start = base + self.dynamic.tail.len();
+                self.dynamic.tail.extend_from_slice(&old_tail[s..s + m.1 as usize]);
+                m.0 = u32::try_from(start).unwrap_or(u32::MAX);
+                changed.push(w);
+            }
+            self.dynamic.garbage = 0;
+            let need = base + self.dynamic.tail.len() + added;
             self.ensure_atlas(device, queue, need, false);
-            let bytes: &[u8] = bytemuck::cast_slice(&self.macros.tail);
+            let bytes: &[u8] = bytemuck::cast_slice(&self.dynamic.tail);
             queue.write_buffer(&self.atlas_buf, (base * std::mem::size_of::<SymVertex>()) as u64, bytes);
         }
-        let base = self.macros.static_vertices;
-        let need = base + self.macros.tail.len() + added;
+        let need = base + self.dynamic.tail.len() + added;
         self.ensure_atlas(device, queue, need, true);
-        for (id, hash, shape, mesh) in new_meshes {
-            let start = base + self.macros.tail.len();
-            if let Some(old) = self.macros.meshes.insert(
-                id,
-                (hash, shape, u32::try_from(start).unwrap_or(u32::MAX), u32::try_from(mesh.len()).unwrap_or(0)),
-            ) {
-                self.macros.garbage += old.3 as usize;
-            }
-            let bytes: &[u8] = bytemuck::cast_slice(&mesh);
-            queue.write_buffer(&self.atlas_buf, (start * std::mem::size_of::<SymVertex>()) as u64, bytes);
-            self.macros.tail.extend(mesh);
-            self.macros.built += 1;
-            changed.push(id);
+        let first = base + self.dynamic.tail.len();
+        for (w, mesh) in puts {
+            let start = base + self.dynamic.tail.len();
+            self.dynamic
+                .entries
+                .insert(w, (u32::try_from(start).unwrap_or(u32::MAX), u32::try_from(mesh.len()).unwrap_or(0)));
+            self.dynamic.tail.extend(mesh);
+            changed.push(w);
         }
-        // Table entries of changed definitions, and the bucket's vertex
-        // count (the longest macro mesh).
-        let info_at = |w: usize| (w * 4) as u64;
+        if added > 0 {
+            let bytes: &[u8] = bytemuck::cast_slice(&self.dynamic.tail[first - base..]);
+            queue.write_buffer(&self.atlas_buf, (first * std::mem::size_of::<SymVertex>()) as u64, bytes);
+        }
+        // Table entries of changed meshes, in runs of adjacent words.
         changed.sort_unstable();
         changed.dedup();
-        for id in changed {
-            let (start, count) = self.macros.meshes.get(&id).map_or((0, 0), |m| (m.2, m.3));
-            let w = symbols::atlas::INFO_MACRO + 2 * id as usize;
-            queue.write_buffer(&self.info_buf, info_at(w), bytemuck::cast_slice(&[start, count]));
+        let mut i = 0;
+        while i < changed.len() {
+            let w0 = changed[i];
+            let mut run: Vec<u32> = Vec::new();
+            while i < changed.len() && changed[i] == w0 + run.len() {
+                let (start, count) = self.dynamic.entries.get(&changed[i]).copied().unwrap_or((0, 0));
+                run.extend([start, count]);
+                i += 1;
+            }
+            queue.write_buffer(&self.info_buf, (w0 * 4) as u64, bytemuck::cast_slice(&run));
         }
-        let static_max = symbols::atlas().gpu_info()[symbols::atlas::INFO_VCOUNT + symbols::MACRO_CODE as usize];
-        let vmax = self.macros.meshes.values().map(|m| m.3).max().unwrap_or(0).max(static_max);
-        queue.write_buffer(
-            &self.info_buf,
-            info_at(symbols::atlas::INFO_VCOUNT + symbols::MACRO_CODE as usize),
-            bytemuck::cast_slice(&[vmax]),
-        );
         self.cull_dirty = true;
+        compact
     }
 
     /// Grows the atlas buffer to hold `need` vertices (GPU-side copy of
-    /// the static part and, with `keep_tail`, the macro meshes).
+    /// the static part and, with `keep_tail`, the dynamic meshes).
     fn ensure_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, need: usize, keep_tail: bool) {
-        if need <= self.macros.cap {
+        if need <= self.dynamic.cap {
             return;
         }
         let cap = need.next_power_of_two();
@@ -624,22 +738,33 @@ impl CanvasRenderer {
             usage: self.atlas_buf.usage(),
             mapped_at_creation: false,
         });
-        let keep = self.macros.static_vertices + if keep_tail { self.macros.tail.len() } else { 0 };
+        let keep = self.dynamic.static_vertices + if keep_tail { self.dynamic.tail.len() } else { 0 };
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bw-atlas-grow") });
         enc.copy_buffer_to_buffer(&self.atlas_buf, 0, &buf, 0, (keep * std::mem::size_of::<SymVertex>()) as u64);
         queue.submit([enc.finish()]);
         self.atlas_buf = buf;
-        self.macros.cap = cap;
+        self.dynamic.cap = cap;
         self.bound = None;
+    }
+
+    /// Note meshes built by the last `prepare` with note changes, and the
+    /// live note meshes.
+    #[must_use]
+    pub fn note_mesh_stats(&self) -> (usize, usize) {
+        (self.notes_built, self.dynamic.entries.keys().filter(|&&w| is_note_word(w)).count())
     }
 
     /// Macro meshes built by the last [`Self::sync_macros`] and the atlas
     /// vertices used by macro meshes (live + garbage).
     #[must_use]
     pub fn macro_mesh_stats(&self) -> (usize, usize) {
-        (self.macros.built, self.macros.tail.len())
+        (self.macros.built, self.dynamic.tail.len())
     }
 
+    /// Uploads whatever changed since the previous frame (dirty slots, the
+    /// next chunk of a streaming scene, changed note meshes, net levels)
+    /// and the camera uniform. CPU cost is proportional to what changed,
+    /// never to the scene size.
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -702,7 +827,9 @@ impl CanvasRenderer {
 
     fn sync_scene(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, scene: &mut Scene) {
         self.last_upload_bytes = 0;
-        if self.scene_id != Some(scene.id()) {
+        let new_scene = self.scene_id != Some(scene.id());
+        self.sync_notes(device, queue, scene, new_scene);
+        if new_scene {
             // A whole new scene: stream it in from slot 0.
             self.scene_id = Some(scene.id());
             self.uploaded_bodies = 0;

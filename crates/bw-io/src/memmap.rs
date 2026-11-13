@@ -18,6 +18,11 @@
 //! Parsing treats the file as hostile input: total size, line length,
 //! token sizes, word count and values are all bounded and checked; nothing
 //! is allocated beyond `words`.
+//!
+//! [`parse`] also reads the binary memory maps of Digital Works (detected by
+//! their magic number, see [`parse_dw`]): `u32` magic `0xABCD`, `u32` word
+//! count, then that many `u32` words (little endian; only the low 16 bits
+//! are meaningful).
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -68,13 +73,65 @@ fn hex(tok: &str, max_digits: usize) -> Option<u32> {
     u32::from_str_radix(tok, 16).ok()
 }
 
-/// Parses a memory map from untrusted bytes.
+/// Magic number of a Digital Works memory map.
+pub const DW_MAP_MAGIC: u32 = 0xABCD;
+
+/// Is this a Digital Works (binary) memory map?
+#[must_use]
+pub fn is_dw_map(bytes: &[u8]) -> bool {
+    bytes.get(..4).is_some_and(|m| u32::from_le_bytes([m[0], m[1], m[2], m[3]]) == DW_MAP_MAGIC)
+}
+
+/// Parses a Digital Works binary memory map: magic, count, `count` words.
+/// The file must be exactly that long. Words keep their low 16 bits (the
+/// map is 16 bits wide; the app masks it to the device's width and
+/// truncates or zero-fills it to the device's size, as Digital Works does).
+///
+/// # Errors
+/// Bad magic, too large, or a length that does not match the count.
+pub fn parse_dw(bytes: &[u8]) -> Result<MemoryMap, MapError> {
+    if bytes.len() > MAX_MAP_SIZE {
+        return Err(MapError::TooLarge);
+    }
+    if !is_dw_map(bytes) || bytes.len() < 8 {
+        return Err(MapError::NotAMap);
+    }
+    let count = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    let body = &bytes[8..];
+    if count.checked_mul(4) != Some(body.len()) {
+        return Err(MapError::Line { line: 1, msg: "word count does not match the file length" });
+    }
+    if count == 0 {
+        return Err(MapError::Missing("words"));
+    }
+    #[allow(clippy::cast_possible_truncation, reason = "only the low 16 bits are meaningful")]
+    let words = body.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u16).collect();
+    Ok(MemoryMap { data_bits: 16, words })
+}
+
+/// Writes a Digital Works binary memory map.
+#[must_use]
+pub fn to_dw_bytes(map: &MemoryMap) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + 4 * map.words.len());
+    out.extend_from_slice(&DW_MAP_MAGIC.to_le_bytes());
+    out.extend_from_slice(&u32::try_from(map.words.len()).unwrap_or(u32::MAX).to_le_bytes());
+    for &w in &map.words {
+        out.extend_from_slice(&u32::from(w).to_le_bytes());
+    }
+    out
+}
+
+/// Parses a memory map from untrusted bytes (bitwerk text or Digital Works
+/// binary, detected by the magic number).
 ///
 /// # Errors
 /// Any violation of the format or its limits.
 pub fn parse(bytes: &[u8]) -> Result<MemoryMap, MapError> {
     if bytes.len() > MAX_MAP_SIZE {
         return Err(MapError::TooLarge);
+    }
+    if is_dw_map(bytes) {
+        return parse_dw(bytes);
     }
     let text = std::str::from_utf8(bytes).map_err(|_| MapError::NotAMap)?;
     let mut magic = false;

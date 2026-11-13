@@ -4,13 +4,13 @@
 //! ```ron
 //! (
 //!     format: "bitwerk-macro",
-//!     version: 1,
+//!     version: 2,
 //!     root: (2),
 //!     macros: [ (id: (0), name: "Half adder", ...), ..., (id: (2), ...) ],
 //! )
 //! ```
 //!
-//! The records are those of the project format 4. Loading treats the file
+//! The records are those of the project format 5 (version 1 files: format 4). Loading treats the file
 //! as hostile input exactly like a project (size cap, RON depth limit,
 //! object limits, full validation, cycles / depth / flattened size refused).
 
@@ -23,8 +23,9 @@ use crate::{IoError, MAX_FILE_SIZE, MacroRecordIn, MacroRecordOut, build_table, 
 
 /// Magic string of a macro file.
 pub const MACRO_MAGIC: &str = "bitwerk-macro";
-/// Current macro file version.
-pub const MACRO_VERSION: u32 = 1;
+/// Current macro file version: 2 = the records of project format 5 (new
+/// kinds, colours, notes); version 1 files (format 4 records) still load.
+pub const MACRO_VERSION: u32 = 2;
 /// File extension.
 pub const MACRO_EXT: &str = "bwmacro";
 
@@ -88,10 +89,15 @@ pub fn load_from_bytes(bytes: &[u8]) -> Result<MacroFile, IoError> {
     if h.format != MACRO_MAGIC {
         return Err(IoError::NotABitwerkFile);
     }
-    if h.version != MACRO_VERSION {
+    if !(1..=MACRO_VERSION).contains(&h.version) {
         return Err(IoError::UnsupportedVersion { found: h.version });
     }
     let file: FileIn = opts.from_bytes(bytes).map_err(|e| IoError::Parse(e.to_string()))?;
+    if h.version < 2 {
+        if let Some(feature) = file.macros.iter().find_map(|m| crate::v5_feature(&m.body)) {
+            return Err(IoError::FeatureNotInVersion { version: 1, feature });
+        }
+    }
     let root = file.root;
     let table = build_table(file.macros)?;
     if table.get(root).is_none() {

@@ -1134,8 +1134,8 @@ fn demo_project() -> bw_io::Project {
     let put = |c: &mut Circuit, k, x, y| c.add_component(k, GridPos::new(x, y), Rotation::R0).unwrap();
     let mut nets: Vec<(PinRef, Vec<PinRef>)> = Vec::new();
     let clk = put(&mut c, ComponentKind::Clock { half_period: 10 }, 0, 2);
-    let en = put(&mut c, ComponentKind::Switch { on: true }, 0, 7);
-    let clr = put(&mut c, ComponentKind::Switch { on: false }, 0, 12);
+    let en = put(&mut c, ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle }, 0, 7);
+    let clr = put(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle }, 0, 12);
     let k = mac(&c, dec);
     let counter = put(&mut c, k, 12, 2);
     let k = mac(&c, seg);
@@ -1160,7 +1160,12 @@ fn demo_project() -> bw_io::Project {
     let dil = put(&mut c, k, 100, 30);
     let nled = put(&mut c, ComponentKind::Led, 120, 33);
     for i in 0..9u8 {
-        let s = put(&mut c, ComponentKind::Switch { on: i == 0 || i == 5 }, 0, 26 + 4 * i32::from(i));
+        let s = put(
+            &mut c,
+            ComponentKind::Switch { on: i == 0 || i == 5, mode: bw_core::SwitchMode::Toggle },
+            0,
+            26 + 4 * i32::from(i),
+        );
         let mut readers = vec![pin(adder, i)];
         if i == 0 || i == 4 {
             readers.push(pin(dil, u8::from(i != 0)));

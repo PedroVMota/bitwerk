@@ -27,7 +27,7 @@ pub use renderer::{
     CanvasRenderer, DrawMode, FrameView, NetLevels, STREAM_BYTES_PER_FRAME, cull_shader_source, shader_source,
 };
 pub use scene::{
-    BodyInstance, BodyOwner, DOT_HALF, Dirty, HIDDEN_KIND, Item, NO_NET, Scene, WireInstance, body_kind, junction_kind,
-    kind_code, unpack_code,
+    BodyInstance, BodyOwner, COLOR_FLAG, COLOR_SHIFT, DOT_HALF, Dirty, HIDDEN_KIND, Item, MAX_NOTE_SLOT, NO_NET,
+    NOTE_SHIFT, Scene, TEXT_COLOR_SHIFT, WireInstance, body_kind, junction_kind, kind_code, unpack_code,
 };
 pub use symbols::{SymbolKind, SymbolStyle};

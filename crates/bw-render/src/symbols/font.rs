@@ -1,8 +1,12 @@
-//! A tiny original stroke font for symbol labels (`&`, `≥1`, `Q`, `RAM`, …).
+//! A tiny original stroke font for symbol labels (`&`, `≥1`, `Q`, `RAM`, …)
+//! and text annotations.
 //!
 //! Glyphs live on a 4 × 6 design grid (x right, y down, cap height 6) and are
 //! lists of polylines. They are tessellated like any other stroke, so text
-//! stays sharp at every zoom level and costs nothing at run time.
+//! stays sharp at every zoom level and costs nothing at run time. Symbol
+//! labels use capitals only ([`glyph`]); annotations keep their case
+//! ([`glyph_cased`]): lowercase letters have an x-height of 4 (y = 2 … 6),
+//! ascenders reach y = 0 and descenders y = 7.6, below the baseline.
 
 use super::path::P;
 
@@ -21,7 +25,7 @@ const P_BOWL: &[P] = &[[0.0, 6.0], [0.0, 0.0], [3.0, 0.0], [4.0, 1.0], [4.0, 2.0
 #[must_use]
 #[allow(clippy::too_many_lines, reason = "one table entry per glyph")]
 pub fn glyph(c: char) -> &'static [&'static [P]] {
-    match c.to_ascii_uppercase() {
+    match fold_accent(c).to_ascii_uppercase() {
         '/' => &[&[[0.5, 6.0], [3.5, 0.0]]],
         ':' => &[&[[2.0, 1.6], [2.0, 2.2]], &[[2.0, 4.6], [2.0, 5.2]]],
         '.' => &[&[[2.0, 5.4], [2.0, 6.0]]],
@@ -172,8 +176,194 @@ pub fn glyph(c: char) -> &'static [&'static [P]] {
             &[[0.0, 2.0], [4.0, 2.0]],
             &[[0.0, 4.0], [4.0, 4.0]],
         ],
+        '\'' => &[&[[2.0, 0.0], [2.0, 1.6]]],
+        '"' => &[&[[1.2, 0.0], [1.2, 1.6]], &[[2.8, 0.0], [2.8, 1.6]]],
+        '`' => &[&[[1.4, 0.0], [2.4, 1.2]]],
+        '?' => &[
+            &[[0.0, 1.0], [1.0, 0.0], [3.0, 0.0], [4.0, 1.0], [4.0, 2.0], [2.0, 3.4], [2.0, 4.4]],
+            &[[2.0, 5.4], [2.0, 6.0]],
+        ],
+        '!' => &[&[[2.0, 0.0], [2.0, 4.2]], &[[2.0, 5.4], [2.0, 6.0]]],
+        '*' => &[&[[2.0, 1.2], [2.0, 4.8]], &[[0.4, 2.1], [3.6, 3.9]], &[[3.6, 2.1], [0.4, 3.9]]],
+        '[' => &[&[[3.0, 0.0], [1.6, 0.0], [1.6, 6.0], [3.0, 6.0]]],
+        ']' => &[&[[1.0, 0.0], [2.4, 0.0], [2.4, 6.0], [1.0, 6.0]]],
+        '{' => &[&[
+            [3.0, 0.0],
+            [2.2, 0.0],
+            [1.6, 0.6],
+            [1.6, 2.4],
+            [0.8, 3.0],
+            [1.6, 3.6],
+            [1.6, 5.4],
+            [2.2, 6.0],
+            [3.0, 6.0],
+        ]],
+        '}' => &[&[
+            [1.0, 0.0],
+            [1.8, 0.0],
+            [2.4, 0.6],
+            [2.4, 2.4],
+            [3.2, 3.0],
+            [2.4, 3.6],
+            [2.4, 5.4],
+            [1.8, 6.0],
+            [1.0, 6.0],
+        ]],
+        '%' => &[
+            &[[4.0, 0.0], [0.0, 6.0]],
+            &[[0.4, 0.2], [1.4, 0.2], [1.4, 1.4], [0.4, 1.4], [0.4, 0.2]],
+            &[[2.6, 4.6], [3.6, 4.6], [3.6, 5.8], [2.6, 5.8], [2.6, 4.6]],
+        ],
+        '$' => &[
+            &[
+                [3.8, 1.4],
+                [3.0, 0.8],
+                [1.0, 0.8],
+                [0.2, 1.6],
+                [0.2, 2.2],
+                [1.0, 3.0],
+                [3.0, 3.0],
+                [3.8, 3.8],
+                [3.8, 4.4],
+                [3.0, 5.2],
+                [1.0, 5.2],
+                [0.2, 4.6],
+            ],
+            &[[2.0, 0.0], [2.0, 6.0]],
+        ],
+        '@' => &[&[
+            [3.0, 4.0],
+            [3.0, 2.0],
+            [1.4, 2.0],
+            [1.4, 4.0],
+            [3.0, 4.0],
+            [4.0, 3.4],
+            [4.0, 1.0],
+            [3.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [0.0, 5.0],
+            [1.0, 6.0],
+            [3.6, 6.0],
+        ]],
+        ';' => &[&[[2.0, 1.6], [2.0, 2.2]], &[[2.2, 5.0], [1.6, 6.6]]],
+        '|' => &[&[[2.0, 0.0], [2.0, 7.6]]],
+        '\\' => &[&[[0.5, 0.0], [3.5, 6.0]]],
+        '~' => &[&[[0.0, 3.4], [1.0, 2.6], [3.0, 3.4], [4.0, 2.6]]],
+        '^' => &[&[[0.6, 2.4], [2.0, 0.0], [3.4, 2.4]]],
         ' ' => &[],
         _ => &[&[[0.0, 0.0], [4.0, 0.0], [4.0, 6.0], [0.0, 6.0], [0.0, 0.0]]],
+    }
+}
+
+/// Descender depth below the baseline (design units).
+pub const DESCENT: f32 = 1.6;
+
+/// A Latin letter with a diacritic drawn as its base letter (annotations in
+/// Portuguese, German, … stay readable without accent glyphs).
+fn fold_accent(c: char) -> char {
+    match c {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => 'a',
+        'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' => 'A',
+        'ç' => 'c',
+        'Ç' => 'C',
+        'è' | 'é' | 'ê' | 'ë' => 'e',
+        'È' | 'É' | 'Ê' | 'Ë' => 'E',
+        'ì' | 'í' | 'î' | 'ï' => 'i',
+        'Ì' | 'Í' | 'Î' | 'Ï' => 'I',
+        'ñ' => 'n',
+        'Ñ' => 'N',
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' => 'o',
+        'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' => 'O',
+        'ù' | 'ú' | 'û' | 'ü' => 'u',
+        'Ù' | 'Ú' | 'Û' | 'Ü' => 'U',
+        'ý' | 'ÿ' => 'y',
+        'Ý' => 'Y',
+        c => c,
+    }
+}
+
+const BOWL_R: &[P] = &[[0.0, 3.0], [1.0, 2.0], [3.0, 2.0], [4.0, 3.0], [4.0, 5.0], [3.0, 6.0], [1.0, 6.0], [0.0, 5.0]];
+const BOWL_L: &[P] = &[[4.0, 3.0], [3.0, 2.0], [1.0, 2.0], [0.0, 3.0], [0.0, 5.0], [1.0, 6.0], [3.0, 6.0], [4.0, 5.0]];
+const ARCH: &[P] = &[[0.0, 3.0], [1.0, 2.0], [3.0, 2.0], [4.0, 3.0], [4.0, 6.0]];
+
+/// Polylines of one glyph, keeping the case (annotations): lowercase
+/// letters have their own drawings; everything else is [`glyph`].
+#[must_use]
+#[allow(clippy::too_many_lines, reason = "one table entry per glyph")]
+pub fn glyph_cased(c: char) -> &'static [&'static [P]] {
+    match fold_accent(c) {
+        'a' => &[
+            &[[0.4, 2.4], [1.2, 2.0], [3.0, 2.0], [4.0, 2.8], [4.0, 6.0]],
+            &[[4.0, 3.8], [1.0, 3.8], [0.0, 4.6], [0.0, 5.3], [0.8, 6.0], [3.0, 6.0], [4.0, 5.0]],
+        ],
+        'b' => &[&[[0.0, 0.0], [0.0, 6.0]], BOWL_R],
+        'c' => &[&[[4.0, 2.6], [3.2, 2.0], [1.0, 2.0], [0.0, 3.0], [0.0, 5.0], [1.0, 6.0], [3.2, 6.0], [4.0, 5.4]]],
+        'd' => &[&[[4.0, 0.0], [4.0, 6.0]], BOWL_L],
+        'e' => &[&[
+            [0.0, 4.0],
+            [4.0, 4.0],
+            [4.0, 3.0],
+            [3.0, 2.0],
+            [1.0, 2.0],
+            [0.0, 3.0],
+            [0.0, 5.0],
+            [1.0, 6.0],
+            [3.4, 6.0],
+            [4.0, 5.5],
+        ]],
+        'f' => &[&[[3.6, 0.4], [3.0, 0.0], [2.2, 0.0], [1.4, 0.8], [1.4, 6.0]], &[[0.2, 2.2], [3.2, 2.2]]],
+        'g' => &[
+            &[[4.0, 3.0], [3.0, 2.0], [1.0, 2.0], [0.0, 3.0], [0.0, 4.6], [1.0, 5.6], [3.0, 5.6], [4.0, 4.6]],
+            &[[4.0, 2.0], [4.0, 6.8], [3.2, 7.6], [0.8, 7.6], [0.1, 7.0]],
+        ],
+        'h' => &[&[[0.0, 0.0], [0.0, 6.0]], ARCH],
+        'i' => &[&[[1.0, 2.0], [2.0, 2.0], [2.0, 6.0]], &[[1.0, 6.0], [3.0, 6.0]], &[[2.0, 0.3], [2.0, 0.9]]],
+        'j' => &[&[[1.6, 2.0], [2.6, 2.0], [2.6, 6.8], [1.8, 7.6], [0.6, 7.6], [0.0, 7.0]], &[[2.6, 0.3], [2.6, 0.9]]],
+        'k' => &[&[[0.0, 0.0], [0.0, 6.0]], &[[3.6, 2.0], [0.0, 4.4]], &[[1.3, 3.6], [3.8, 6.0]]],
+        'l' => &[&[[1.0, 0.0], [2.0, 0.0], [2.0, 5.2], [2.8, 6.0], [3.4, 6.0]]],
+        'm' => &[
+            &[[0.0, 6.0], [0.0, 2.0]],
+            &[[0.0, 2.8], [0.6, 2.0], [1.4, 2.0], [2.0, 2.8], [2.0, 6.0]],
+            &[[2.0, 2.8], [2.6, 2.0], [3.4, 2.0], [4.0, 2.8], [4.0, 6.0]],
+        ],
+        'n' => &[&[[0.0, 2.0], [0.0, 6.0]], ARCH],
+        'o' => &[&[
+            [1.0, 2.0],
+            [3.0, 2.0],
+            [4.0, 3.0],
+            [4.0, 5.0],
+            [3.0, 6.0],
+            [1.0, 6.0],
+            [0.0, 5.0],
+            [0.0, 3.0],
+            [1.0, 2.0],
+        ]],
+        'p' => &[&[[0.0, 2.0], [0.0, 7.6]], BOWL_R],
+        'q' => &[&[[4.0, 2.0], [4.0, 7.6]], BOWL_L],
+        'r' => &[&[[0.0, 2.0], [0.0, 6.0]], &[[0.0, 3.4], [1.4, 2.0], [3.0, 2.0], [4.0, 2.8]]],
+        's' => &[&[
+            [4.0, 2.6],
+            [3.2, 2.0],
+            [0.9, 2.0],
+            [0.0, 2.7],
+            [0.0, 3.4],
+            [0.9, 4.0],
+            [3.1, 4.0],
+            [4.0, 4.6],
+            [4.0, 5.3],
+            [3.1, 6.0],
+            [0.8, 6.0],
+            [0.0, 5.4],
+        ]],
+        't' => &[&[[1.6, 0.4], [1.6, 5.2], [2.4, 6.0], [3.6, 6.0]], &[[0.2, 2.0], [3.4, 2.0]]],
+        'u' => &[&[[0.0, 2.0], [0.0, 5.0], [1.0, 6.0], [3.0, 6.0], [4.0, 5.0]], &[[4.0, 2.0], [4.0, 6.0]]],
+        'v' => &[&[[0.0, 2.0], [2.0, 6.0], [4.0, 2.0]]],
+        'w' => &[&[[0.0, 2.0], [1.0, 6.0], [2.0, 3.2], [3.0, 6.0], [4.0, 2.0]]],
+        'x' => &[&[[0.0, 2.0], [4.0, 6.0]], &[[4.0, 2.0], [0.0, 6.0]]],
+        'y' => &[&[[0.0, 2.0], [2.0, 6.0]], &[[4.0, 2.0], [1.4, 7.6]]],
+        'z' => &[&[[0.0, 2.0], [4.0, 2.0], [0.0, 6.0], [4.0, 6.0]]],
+        c => glyph(c),
     }
 }
 
@@ -188,9 +378,20 @@ pub fn text_width(n: usize, h: f32) -> f32 {
     (n as f32 * GW + (n as f32 - 1.0) * GAP) * s
 }
 
-/// Polylines of `text` centred on `(cx, cy)` with cap height `h`.
+/// Polylines of `text` centred on `(cx, cy)` with cap height `h`, in
+/// capitals (symbol labels).
 #[must_use]
 pub fn layout(text: &str, cx: f32, cy: f32, h: f32) -> Vec<Vec<P>> {
+    layout_with(text, cx, cy, h, glyph)
+}
+
+/// Like [`layout`], keeping the case.
+#[must_use]
+pub fn layout_centered_cased(text: &str, cx: f32, cy: f32, h: f32) -> Vec<Vec<P>> {
+    layout_with(text, cx, cy, h, glyph_cased)
+}
+
+fn layout_with(text: &str, cx: f32, cy: f32, h: f32, glyph: fn(char) -> &'static [&'static [P]]) -> Vec<Vec<P>> {
     let n = text.chars().count();
     let s = h / GH;
     let x0 = cx - text_width(n, h) / 2.0;
@@ -204,4 +405,70 @@ pub fn layout(text: &str, cx: f32, cy: f32, h: f32) -> Vec<Vec<P>> {
         x += (GW + GAP) * s;
     }
     out
+}
+
+/// Horizontal advance per glyph as a fraction of the cap height (matches
+/// `bw_core::note::NOTE_ADVANCE`).
+pub const ADVANCE: f32 = (GW + GAP) / GH;
+
+/// Italic slant: horizontal shift per unit of height above the baseline.
+pub const ITALIC_SLANT: f32 = 0.2;
+
+/// Polylines of one annotation line, left-aligned at `x0` with its cap top
+/// at `top` and cap height `h`, keeping the case; `italic` shears the
+/// glyphs about the baseline.
+#[must_use]
+pub fn layout_cased(text: &str, x0: f32, top: f32, h: f32, italic: bool) -> Vec<Vec<P>> {
+    let s = h / GH;
+    let base = top + h;
+    let slant = if italic { ITALIC_SLANT } else { 0.0 };
+    let mut out = Vec::new();
+    let mut x = x0;
+    for c in text.chars() {
+        for line in glyph_cased(c) {
+            out.push(
+                line.iter()
+                    .map(|p| {
+                        let y = top + p[1] * s;
+                        [x + p[0] * s + (base - y) * slant, y]
+                    })
+                    .collect(),
+            );
+        }
+        x += (GW + GAP) * s;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advance_matches_the_core_note_metrics() {
+        assert!((ADVANCE - bw_core::note::NOTE_ADVANCE).abs() < 1e-6);
+        // Descenders stay inside the line pitch below the cap top.
+        const { assert!((GH + DESCENT) / GH < bw_core::note::NOTE_LINE) };
+    }
+
+    #[test]
+    fn lowercase_and_punctuation_have_their_own_glyphs() {
+        let boxed = glyph('\u{2603}');
+        for c in "abcdefghijklmnopqrstuvwxyz".chars() {
+            assert_ne!(glyph_cased(c), glyph(c), "{c}");
+        }
+        for c in "-+='\"?!#&*<>[]%$@;:.,()/_{}|~^`\\".chars() {
+            assert_ne!(glyph_cased(c), boxed, "{c:?} has no glyph");
+        }
+        // Accents fold to the base letter; labels stay uppercase.
+        assert_eq!(glyph_cased('ç'), glyph_cased('c'));
+        assert_eq!(glyph('ã'), glyph('A'));
+        for c in (' '..='~').chain("çãé".chars()) {
+            for l in glyph_cased(c) {
+                for p in *l {
+                    assert!(p[0] >= 0.0 && p[0] <= GW + 0.5 && p[1] >= 0.0 && p[1] <= GH + DESCENT, "{c:?} {p:?}");
+                }
+            }
+        }
+    }
 }

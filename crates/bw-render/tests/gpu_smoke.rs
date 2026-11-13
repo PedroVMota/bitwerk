@@ -215,7 +215,13 @@ fn renders_switch_body_and_grid() {
     };
     let t = Target::new(&g, 200, 200, 1);
     let mut circuit = Circuit::new();
-    let sw = circuit.add_component(ComponentKind::Switch { on: true }, GridPos::new(0, 0), Rotation::R0).unwrap();
+    let sw = circuit
+        .add_component(
+            ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle },
+            GridPos::new(0, 0),
+            Rotation::R0,
+        )
+        .unwrap();
     let mut scene = Scene::build(&circuit, 1);
     let mut r = CanvasRenderer::new(&g.device, FORMAT, 1);
     let nets = Levels::new(&[(1, &[(sw, 0)])]);
@@ -254,9 +260,10 @@ fn renders_symbols_with_strokes_where_expected() {
     let _nand = add(&mut c, ComponentKind::Gate { op: GateOp::Nand, inputs: 3 }, 6, 0, Rotation::R0);
     let or = add(&mut c, ComponentKind::Gate { op: GateOp::Or, inputs: 2 }, 12, 0, Rotation::R90);
     let _xor = add(&mut c, ComponentKind::Gate { op: GateOp::Xor, inputs: 4 }, 18, 0, Rotation::R0);
-    let sw = add(&mut c, ComponentKind::Switch { on: true }, 0, 8, Rotation::R0);
+    let sw = add(&mut c, ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle }, 0, 8, Rotation::R0);
     let led = add(&mut c, ComponentKind::Led, 6, 8, Rotation::R0);
-    let sw_off = add(&mut c, ComponentKind::Switch { on: false }, 0, 12, Rotation::R0);
+    let sw_off =
+        add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle }, 0, 12, Rotation::R0);
     let _clk = add(&mut c, ComponentKind::Clock { half_period: 2 }, 6, 12, Rotation::R0);
     let _not = add(&mut c, ComponentKind::Not, 12, 8, Rotation::R0);
     c.connect(PinRef { component: sw, pin: 0 }, PinRef { component: led, pin: 0 }, vec![]).unwrap();
@@ -337,9 +344,9 @@ fn four_state_levels_colour_wires_leds_and_output_pins() {
     };
     let mut c = Circuit::new();
     let add = |c: &mut Circuit, kind, x, y| c.add_component(kind, GridPos::new(x, y), Rotation::R0).unwrap();
-    let sw_z = add(&mut c, ComponentKind::Switch { on: false }, 0, 0);
+    let sw_z = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle }, 0, 0);
     let led_z = add(&mut c, ComponentKind::Led, 6, 0);
-    let sw_x = add(&mut c, ComponentKind::Switch { on: false }, 0, 3);
+    let sw_x = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle }, 0, 3);
     let led_x = add(&mut c, ComponentKind::Led, 6, 3);
     let ff = add(
         &mut c,
@@ -382,7 +389,13 @@ fn junction_dots_render() {
         return;
     };
     let mut c = Circuit::new();
-    let sw = c.add_component(ComponentKind::Switch { on: true }, GridPos::new(0, 0), Rotation::R0).unwrap();
+    let sw = c
+        .add_component(
+            ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle },
+            GridPos::new(0, 0),
+            Rotation::R0,
+        )
+        .unwrap();
     let l1 = c.add_component(ComponentKind::Led, GridPos::new(12, 0), Rotation::R0).unwrap();
     let l2 = c.add_component(ComponentKind::Led, GridPos::new(12, 6), Rotation::R0).unwrap();
     c.connect(PinRef { component: sw, pin: 0 }, PinRef { component: l1, pin: 0 }, vec![]).unwrap();
@@ -884,4 +897,224 @@ fn renders_macro_bodies_and_dil_templates() {
     let s_out = c.component(a).unwrap().pin_pos(2).unwrap();
     let lit = at(&px2, s_out.x as f32 - 0.2, s_out.y as f32);
     assert!(lit[1] > 200, "half adder mesh survives the atlas growth {lit:?}");
+}
+
+/// Centre of the display segment `seg` (of digit `digit` for numeric
+/// outputs) of a symbol, in local units.
+fn segment_centre(kind: bw_render::SymbolKind, digit: Option<u8>, seg: u8) -> Vec2 {
+    use bw_render::symbols::{Role, Symbol};
+    let sym = Symbol::build(kind, bw_render::SymbolStyle::Ansi);
+    let s = sym
+        .shapes
+        .iter()
+        .find(|s| {
+            s.pin == seg
+                && match digit {
+                    Some(d) => s.fill == Some(Role::Digit) && s.extra == d,
+                    None => s.fill == Some(Role::Segment),
+                }
+        })
+        .unwrap();
+    s.points.iter().fold(Vec2::ZERO, |a, p| a + Vec2::new(p[0], p[1])) / s.points.len() as f32
+}
+
+/// The display components and sources: 7-segment segments light from
+/// their display signals with either polarity (floating / unknown segments
+/// have their own colours), numeric outputs compute their digits on the GPU
+/// (hex, signed decimal with a minus sign, binary with a floating bit as a
+/// grey dash), LEDs use their palette colour, VCC / ground / sequence
+/// generator / push button / pulse input draw, and a text annotation draws
+/// its note in its colour; editing the note rebuilds only its mesh.
+#[test]
+fn renders_displays_sources_colours_and_notes() {
+    use bw_core::{Color, Note, NumFormat, PinRef, SwitchMode};
+    use bw_render::SymbolKind;
+    use bw_render::symbols::{X_COLOR, ghost, palette_rgb};
+    let Some(g) = gpu() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let mut c = Circuit::new();
+    let add = |c: &mut Circuit, kind, x, y| c.add_component(kind, GridPos::new(x, y), Rotation::R0).unwrap();
+    let seg_k = add(&mut c, ComponentKind::SevenSeg { common_anode: false }, 0, 0);
+    let seg_a = add(&mut c, ComponentKind::SevenSeg { common_anode: true }, 10, 0);
+    let hex = add(&mut c, ComponentKind::Numeric { bits: 8, format: NumFormat::Hex, signed: false }, 20, 0);
+    let sdec = add(&mut c, ComponentKind::Numeric { bits: 8, format: NumFormat::Dec, signed: true }, 28, 0);
+    let bin = add(&mut c, ComponentKind::Numeric { bits: 4, format: NumFormat::Bin, signed: false }, 38, 0);
+    let vcc = add(&mut c, ComponentKind::Const { high: true }, 4, 18);
+    let led = add(&mut c, ComponentKind::Led, 8, 18);
+    let gnd = add(&mut c, ComponentKind::Const { high: false }, 12, 18);
+    let seq = add(&mut c, ComponentKind::SeqGen { pattern: 0b0110, len: 4, half_period: 2 }, 16, 18);
+    let push = add(&mut c, ComponentKind::Switch { on: false, mode: SwitchMode::Momentary }, 22, 18);
+    let pulse = add(&mut c, ComponentKind::Switch { on: true, mode: SwitchMode::Pulse }, 26, 18);
+    let text = add(&mut c, Note::default().kind(), 30, 18);
+    c.connect(PinRef { component: vcc, pin: 0 }, PinRef { component: led, pin: 0 }, vec![]).unwrap();
+    c.apply(&Edit::SetColor(led, Some(Color::Blue))).unwrap();
+    c.apply(&Edit::SetNote { id: text, note: Note { text: "Hi!".into(), height: 30, ..Note::default() } }).unwrap();
+    c.apply(&Edit::SetColor(text, Some(Color::Yellow))).unwrap();
+    let mut scene = Scene::build(&c, 1);
+
+    // Levels: one net per display signal / output.
+    let two = 0x5bu32; // segments of "2"
+    let mut nets: Vec<(u8, Vec<(ComponentId, u8)>)> = Vec::new();
+    for k in 0..7u8 {
+        nets.push((((two >> k) & 1) as u8, vec![(seg_k, k)]));
+        nets.push((0, vec![(seg_a, k)]));
+    }
+    for k in 0..8u8 {
+        nets.push((((0xa5u32 >> k) & 1) as u8, vec![(hex, k)]));
+        nets.push((((0xfbu32 >> k) & 1) as u8, vec![(sdec, k)]));
+    }
+    for (k, l) in [1u8, 2, 0, 1].into_iter().enumerate() {
+        nets.push((l, vec![(bin, k as u8)]));
+    }
+    for (id, l) in [(vcc, 1), (gnd, 0), (seq, 1), (push, 1), (pulse, 1)] {
+        nets.push((l, vec![(id, 0)]));
+    }
+    let refs: Vec<(u8, &[(ComponentId, u8)])> = nets.iter().map(|(l, p)| (*l, p.as_slice())).collect();
+    let levels = Levels::new(&refs);
+
+    let (w, h) = (1100u32, 500u32);
+    let t = Target::new(&g, w, h, 1);
+    let v = view(Vec2::new(23.0, 11.5), 20.0, w, h);
+    let mut r = CanvasRenderer::new(&g.device, FORMAT, 1);
+    let _ = t.frame(&g, &mut r, &mut scene, &v, Some(&levels), true);
+    assert!(r.draws_symbols());
+    assert_eq!(r.note_mesh_stats(), (1, 1));
+    let px = t.read(&g);
+    if let Ok(dir) = std::env::var("BW_SYMBOL_PNG") {
+        let raw: Vec<u8> = px.iter().flatten().copied().collect();
+        image::RgbaImage::from_raw(w, h, raw).unwrap().save(std::path::Path::new(&dir).join("displays.png")).unwrap();
+    }
+    let at = |px: &[[u8; 4]], p: Vec2| {
+        let s = v.camera.world_to_screen(p, v.viewport_points);
+        px[(s.y as u32 * w + s.x as u32) as usize]
+    };
+    let red = SymbolKind::SevenSegment.ink();
+    // "2" on the common-cathode display: a, b, g lit; c, f dark.
+    let seg = |id: ComponentId, k: u8| {
+        let o = c.component(id).unwrap().pos;
+        Vec2::new(o.x as f32, o.y as f32) + segment_centre(SymbolKind::SevenSegment, None, k)
+    };
+    for k in [0u8, 1, 3, 4, 6] {
+        assert!(near(at(&px, seg(seg_k, k)), red, 10), "lit segment {k}: {:?}", at(&px, seg(seg_k, k)));
+    }
+    for k in [2u8, 5] {
+        assert!(near(at(&px, seg(seg_k, k)), ghost(red), 10), "dark segment {k}: {:?}", at(&px, seg(seg_k, k)));
+    }
+    // Common anode: every input low → every segment lit.
+    for k in 0..7u8 {
+        assert!(near(at(&px, seg(seg_a, k)), red, 10), "anode segment {k}");
+    }
+    // Numeric digits computed from the display signals.
+    let ink = SymbolKind::Text.ink();
+    let digit = |id: ComponentId, d: u8, k: u8| {
+        let comp = c.component(id).unwrap();
+        let o = comp.pos;
+        Vec2::new(o.x as f32, o.y as f32) + segment_centre(SymbolKind::of(&comp.kind), Some(d), k)
+    };
+    let lit = |id, d, k| near(at(&px, digit(id, d, k)), ink, 10);
+    let dark = |id, d, k| near(at(&px, digit(id, d, k)), ghost(ink), 10);
+    // 0xA5: digit 0 is "5" (a c d f g), digit 1 "A" (all but d).
+    for k in [0, 2, 3, 5, 6] {
+        assert!(lit(hex, 0, k), "hex 5 segment {k}: {:?}", at(&px, digit(hex, 0, k)));
+    }
+    assert!(dark(hex, 0, 1) && dark(hex, 0, 4), "hex 5 b/e dark");
+    assert!(lit(hex, 1, 0) && lit(hex, 1, 4) && dark(hex, 1, 3), "hex A");
+    // 0xFB signed = -5: "5", then the minus sign, then blank columns.
+    assert!(lit(sdec, 0, 0) && dark(sdec, 0, 1), "units digit 5");
+    assert!(lit(sdec, 1, 6) && dark(sdec, 1, 0) && dark(sdec, 1, 3), "minus sign");
+    assert!(dark(sdec, 2, 6) && dark(sdec, 3, 0), "leading blanks");
+    // Binary 1 Z 0 1 (bit 0 first): "1" "-" "0" "1", the dash grey.
+    assert!(lit(bin, 0, 1) && lit(bin, 0, 2) && dark(bin, 0, 0), "bit 0 = 1");
+    assert!(near(at(&px, digit(bin, 1, 6)), [0.55, 0.57, 0.62], 10), "floating bit dash");
+    assert!(dark(bin, 1, 0), "dash only");
+    assert!(lit(bin, 2, 0) && dark(bin, 2, 6), "bit 2 = 0");
+    // Coloured LED, lit through VCC.
+    let lamp = at(&px, Vec2::new(9.12, 19.3));
+    assert!(near(lamp, palette_rgb(Color::Blue), 10), "blue LED {lamp:?}");
+    // Sources and switches draw something inside their bodies.
+    for id in [vcc, gnd, seq, push, pulse] {
+        let b = c.component(id).unwrap().bounds();
+        let mut hit = false;
+        for dy in 1..8 {
+            for dx in 1..8 {
+                let p = Vec2::new(
+                    b.min.x as f32 + (b.max.x - b.min.x) as f32 * dx as f32 / 8.0,
+                    b.min.y as f32 + (b.max.y - b.min.y) as f32 * dy as f32 / 8.0,
+                );
+                hit |= !is_grid(at(&px, p));
+            }
+        }
+        assert!(hit, "{:?} drawn", c.component(id).unwrap().kind);
+    }
+    // The note: the stem of "H" in yellow.
+    let stem = Vec2::new(30.0 + 0.2 * 3.0, 18.0 + 0.3 * 3.0 + 1.5);
+    assert!(near(at(&px, stem), palette_rgb(Color::Yellow), 12), "note text {:?}", at(&px, stem));
+    // An unknown segment shows the X colour.
+    let mut nets_x = nets.clone();
+    nets_x[0].0 = 3;
+    let refs: Vec<(u8, &[(ComponentId, u8)])> = nets_x.iter().map(|(l, p)| (*l, p.as_slice())).collect();
+    let mut levels_x = Levels::new(&refs);
+    levels_x.key = 2;
+    let _ = t.frame(&g, &mut r, &mut scene, &v, Some(&levels_x), true);
+    let px = t.read(&g);
+    assert!(near(at(&px, seg(seg_k, 0)), X_COLOR, 10), "unknown segment {:?}", at(&px, seg(seg_k, 0)));
+
+    // Editing the note rebuilds that mesh only; the old glyphs are gone.
+    let a =
+        c.apply(&Edit::SetNote { id: text, note: Note { text: "x".into(), height: 30, ..Note::default() } }).unwrap();
+    scene.apply(&c, &a, 2);
+    let _ = t.frame(&g, &mut r, &mut scene, &v, Some(&levels_x), true);
+    assert_eq!(r.note_mesh_stats(), (1, 1));
+    let px = t.read(&g);
+    assert!(is_grid(at(&px, stem)), "old text gone {:?}", at(&px, stem));
+    // Deleting the annotation drops its mesh.
+    let a = c.apply(&Edit::RemoveComponent(text)).unwrap();
+    scene.apply(&c, &a, 3);
+    let _ = t.frame(&g, &mut r, &mut scene, &v, Some(&levels_x), true);
+    assert_eq!(r.note_mesh_stats().1, 0);
+}
+
+/// Many annotations: every note gets its own mesh, a single edit rebuilds
+/// one, and a new scene (another hierarchy level) rebuilds them all.
+#[test]
+fn many_notes_rebuild_only_what_changed() {
+    use bw_core::Note;
+    let Some(g) = gpu() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let mut c = Circuit::new();
+    let mut ids = Vec::new();
+    for i in 0..2000 {
+        let id =
+            c.add_component(Note::default().kind(), GridPos::new((i % 50) * 12, (i / 50) * 4), Rotation::R0).unwrap();
+        c.apply(&Edit::SetNote { id, note: Note::new(&format!("note {i}")) }).unwrap();
+        ids.push(id);
+    }
+    let mut scene = Scene::build(&c, 1);
+    let (w, h) = (400u32, 300u32);
+    let t = Target::new(&g, w, h, 1);
+    let v = view(Vec2::new(10.0, 5.0), 20.0, w, h);
+    let mut r = CanvasRenderer::new(&g.device, FORMAT, 1);
+    let start = Instant::now();
+    let _ = t.frame(&g, &mut r, &mut scene, &v, None, true);
+    eprintln!("2000 notes: first frame {:.1} ms", start.elapsed().as_secs_f64() * 1e3);
+    assert_eq!(r.note_mesh_stats(), (2000, 2000));
+    let px = t.read(&g);
+    let s = v.camera.world_to_screen(Vec2::new(0.24, 0.36 + 0.6), v.viewport_points);
+    assert!(!is_grid(px[(s.y as u32 * w + s.x as u32) as usize]), "first note's 'n' stem");
+    for (n, &id) in ids.iter().enumerate().take(40) {
+        let a = c.apply(&Edit::SetNote { id, note: Note::new(&format!("edited {n}")) }).unwrap();
+        scene.apply(&c, &a, 2 + n as u64);
+        let prep = t.frame(&g, &mut r, &mut scene, &v, None, false);
+        assert_eq!(r.note_mesh_stats(), (1, 2000));
+        assert!(prep < 50.0, "note edit prepare {prep} ms");
+    }
+    // Plenty of garbage was compacted along the way: the tail stays small.
+    assert!(r.macro_mesh_stats().1 < 2000 * 600, "{}", r.macro_mesh_stats().1);
+    let mut other = Scene::build(&c, 99);
+    let _ = t.frame(&g, &mut r, &mut other, &v, None, true);
+    assert_eq!(r.note_mesh_stats(), (2000, 2000));
 }

@@ -377,8 +377,16 @@ pub fn stress_macros(cells: usize) -> Result<bw_core::Circuit, bw_core::CircuitE
         let y = i32::try_from(row).unwrap_or(0) * (ch + 6);
         let half = 2 + u32::try_from(row % 5).unwrap_or(0);
         let ck = c.add_component(ComponentKind::Clock { half_period: half }, GridPos::new(0, y), Rotation::R0)?;
-        let on = c.add_component(ComponentKind::Switch { on: true }, GridPos::new(0, y + 3), Rotation::R0)?;
-        let off = c.add_component(ComponentKind::Switch { on: false }, GridPos::new(0, y + 6), Rotation::R0)?;
+        let on = c.add_component(
+            ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle },
+            GridPos::new(0, y + 3),
+            Rotation::R0,
+        )?;
+        let off = c.add_component(
+            ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle },
+            GridPos::new(0, y + 6),
+            Rotation::R0,
+        )?;
         let mut prev: Option<bw_core::ComponentId> = None;
         for col in 0..per_row.min(cells - row * per_row) {
             let x = 10 + i32::try_from(col).unwrap_or(0) * (cw + 10);

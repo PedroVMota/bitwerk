@@ -104,7 +104,11 @@ fn inlined(d: &MacroDef) -> (Circuit, Vec<ComponentId>, Vec<ComponentId>) {
     let mut ins = Vec::new();
     let mut outs = Vec::new();
     for p in iface {
-        let kind = if p.dir == TagDir::In { ComponentKind::Switch { on: false } } else { ComponentKind::Led };
+        let kind = if p.dir == TagDir::In {
+            ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle }
+        } else {
+            ComponentKind::Led
+        };
         c.set_kind(p.tag, kind).unwrap();
         if p.dir == TagDir::In { ins.push(p.tag) } else { outs.push(p.tag) }
     }
@@ -168,7 +172,11 @@ fn flattened_macro_matches_inlined_circuit() {
         let mut switches = Vec::new();
         for k in 0..ins {
             let s = c
-                .add_component(ComponentKind::Switch { on: false }, GridPos::new(0, 4 * k as i32), Rotation::R0)
+                .add_component(
+                    ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle },
+                    GridPos::new(0, 4 * k as i32),
+                    Rotation::R0,
+                )
                 .unwrap();
             wire(&mut c, pin(s, 0), pin(inst, u8::try_from(k).unwrap()));
             switches.push(s);
@@ -253,7 +261,13 @@ fn nesting_depth_limit() {
     ));
     // 16 levels of inverters: an instance inverts its input 1 time.
     let inst = place(&mut c, id, GridPos::new(20, 0));
-    let s = c.add_component(ComponentKind::Switch { on: false }, GridPos::new(0, 0), Rotation::R0).unwrap();
+    let s = c
+        .add_component(
+            ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle },
+            GridPos::new(0, 0),
+            Rotation::R0,
+        )
+        .unwrap();
     wire(&mut c, pin(s, 0), pin(inst, 0));
     let mut sim = SimState::new(Netlist::compile(&c).unwrap(), &c);
     sim.reset().unwrap();
@@ -336,7 +350,13 @@ fn definition_edit_updates_all_instances() {
     let mut sws = Vec::new();
     for i in 0..3 {
         let inst = place(&mut c, id, GridPos::new(20, 8 * i));
-        let s = c.add_component(ComponentKind::Switch { on: false }, GridPos::new(0, 8 * i), Rotation::R0).unwrap();
+        let s = c
+            .add_component(
+                ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle },
+                GridPos::new(0, 8 * i),
+                Rotation::R0,
+            )
+            .unwrap();
         wire(&mut c, pin(s, 0), pin(inst, 0));
         let led = c.add_component(ComponentKind::Led, GridPos::new(50, 8 * i), Rotation::R0).unwrap();
         wire(&mut c, pin(inst, 1), pin(led, 0));
@@ -452,8 +472,20 @@ fn errors_name_the_hierarchy() {
     };
     let outer = define(&mut c, board);
     let inst = place(&mut c, outer, GridPos::new(30, 0));
-    let sa = c.add_component(ComponentKind::Switch { on: false }, GridPos::new(0, 0), Rotation::R0).unwrap();
-    let se = c.add_component(ComponentKind::Switch { on: false }, GridPos::new(0, 6), Rotation::R0).unwrap();
+    let sa = c
+        .add_component(
+            ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle },
+            GridPos::new(0, 0),
+            Rotation::R0,
+        )
+        .unwrap();
+    let se = c
+        .add_component(
+            ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle },
+            GridPos::new(0, 6),
+            Rotation::R0,
+        )
+        .unwrap();
     wire(&mut c, pin(sa, 0), pin(inst, 0));
     wire(&mut c, pin(se, 0), pin(inst, 1));
     let mut sim = SimState::new(Netlist::compile(&c).unwrap(), &c);
@@ -495,7 +527,13 @@ fn errors_name_the_hierarchy() {
     d.sync_pins();
     let id = define(&mut c, d);
     let inst = place(&mut c, id, GridPos::new(10, 0));
-    let s = c.add_component(ComponentKind::Switch { on: false }, GridPos::new(0, 0), Rotation::R0).unwrap();
+    let s = c
+        .add_component(
+            ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle },
+            GridPos::new(0, 0),
+            Rotation::R0,
+        )
+        .unwrap();
     wire(&mut c, pin(s, 0), pin(inst, 0));
     let mut sim = SimState::new(Netlist::compile(&c).unwrap(), &c);
     sim.reset().unwrap();
@@ -517,7 +555,13 @@ fn inside_view_shows_one_instance() {
     let i2 = place(&mut c, id, GridPos::new(30, 20));
     let mut sw = Vec::new();
     for (k, inst) in [(0, i1), (1, i1), (2, i2), (3, i2)] {
-        let s = c.add_component(ComponentKind::Switch { on: false }, GridPos::new(0, 6 * k), Rotation::R0).unwrap();
+        let s = c
+            .add_component(
+                ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle },
+                GridPos::new(0, 6 * k),
+                Rotation::R0,
+            )
+            .unwrap();
         wire(&mut c, pin(s, 0), pin(inst, u8::try_from(k % 2).unwrap()));
         sw.push(s);
     }

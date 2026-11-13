@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use bw_render::symbols::{self, SymbolKind, SymbolStyle, Width};
+use bw_render::symbols::{self, Role, SymbolKind, SymbolStyle, Width};
 use egui::{Color32, Pos2, Rect, Sense, Stroke};
 
 /// 0..1 → 0..255.
@@ -43,7 +43,9 @@ fn build_mesh(
     to_screen: impl Fn([f32; 2]) -> Pos2,
 ) -> egui::Mesh {
     let mesh = symbols::atlas().mesh(kind, style);
-    let accent = kind.accent();
+    let (accent, ink) = (kind.accent(), kind.ink());
+    // Displays: the level lights the segments / digits, not the body.
+    let display = matches!(kind, SymbolKind::SevenSegment | SymbolKind::Numeric(..));
     let hw = |w: Width| w.half_width(scale);
     let mut out = egui::Mesh::default();
     out.vertices.reserve(mesh.len());
@@ -51,7 +53,9 @@ fn build_mesh(
         if !tri[0].layer().shows(level) {
             continue;
         }
-        let [r, g, b] = symbols::shade(tri[0].role(), accent, level).map(byte);
+        let role = tri[0].role();
+        let lvl = if display && role == Role::Fill { 2 } else { level };
+        let [r, g, b] = symbols::shade_ink(role, accent, ink, lvl).map(byte);
         let color = Color32::from_rgba_unmultiplied(r, g, b, byte(opacity));
         for v in tri {
             let idx = u32::try_from(out.vertices.len()).unwrap_or(u32::MAX);
@@ -101,18 +105,24 @@ fn fit_mesh(rect: Rect, kind: SymbolKind, style: SymbolStyle, level: u8, opacity
     build_mesh(kind, style, level, opacity, scale, |p| c + (egui::vec2(p[0], p[1]) - mid) * scale)
 }
 
-/// State shown by a palette icon: lit LED and clock, open switch, neutral
-/// pins elsewhere.
+/// State shown by a palette icon: lit LED, clock, sequence, displays and
+/// VCC (high output), ground low, open switches, neutral pins elsewhere.
 pub fn palette_level(kind: SymbolKind) -> u8 {
     match kind {
-        SymbolKind::Led | SymbolKind::Clock | SymbolKind::SevenSegment | SymbolKind::SequenceGenerator => 1,
+        SymbolKind::Led
+        | SymbolKind::Clock
+        | SymbolKind::SevenSegment
+        | SymbolKind::Numeric(..)
+        | SymbolKind::SequenceGenerator
+        | SymbolKind::Vcc => 1,
+        SymbolKind::Ground => 0,
         _ => 2,
     }
 }
 
 /// A palette button: the symbol with a short caption, a hover tooltip and a
-/// selection highlight. Disabled buttons (not yet simulated components) are
-/// dimmed and only show their tooltip.
+/// selection highlight. Disabled buttons are dimmed and only show their
+/// tooltip.
 pub fn button(
     ui: &mut egui::Ui,
     kind: SymbolKind,

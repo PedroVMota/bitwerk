@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bw_core::{
-    Applied, Circuit, CircuitError, ComponentId, ComponentKind, DATA_WIDTHS, Edit, FfTrigger, FlipFlopType, GateOp,
-    GridPos, MemoryType, SegmentId, WireEnd,
+    Applied, Circuit, CircuitError, ComponentId, ComponentKind, DATA_WIDTHS, Edit, EvalMode, FfTrigger, FlipFlopType,
+    GateOp, GridPos, MemoryType, NumFormat, SegmentId, SwitchMode, WireEnd,
 };
 use bw_render::{Camera, CanvasRenderer, DrawMode, FrameView, Scene, SymbolKind, SymbolStyle};
 use bw_sim::{Command, RunState, SimError, SimHandle, StepMode};
@@ -34,10 +34,15 @@ pub enum Tool {
     Place(ComponentKind),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// An action waiting for the unsaved-changes question.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Pending {
     New,
     Open,
+    /// Import a Digital Works file (`None`: ask for it).
+    ImportDw(Option<PathBuf>),
+    /// Open this project file (dropped on the window).
+    OpenPath(PathBuf),
 }
 
 /// Debug-only switches.
@@ -115,6 +120,14 @@ pub struct BitwerkApp {
     enter_path: Vec<ComponentId>,
     /// Fit the view to the scene once the canvas size is known.
     pub fit_pending: bool,
+    /// For worker threads that need to wake the UI.
+    pub(crate) egui_ctx: egui::Context,
+    /// Digital Works import (report window, workers).
+    pub dw: crate::dwimport::DwState,
+    /// Drafts of free-text properties (notes, sequence patterns).
+    pub prop_drafts: crate::kind_props::Drafts,
+    /// Push button / pulse input held down with the Interact tool.
+    pub pressed: Option<crate::canvas::Pressed>,
 
     // Stats
     frame_times: VecDeque<f32>,
@@ -191,6 +204,10 @@ impl BitwerkApp {
             ctx_target: None,
             enter_path: Vec::new(),
             fit_pending: false,
+            egui_ctx: cc.egui_ctx.clone(),
+            dw: crate::dwimport::DwState::default(),
+            prop_drafts: crate::kind_props::Drafts::default(),
+            pressed: None,
             frame_times: VecDeque::with_capacity(120),
             frames_since_log: 0,
             canvas_state: (DrawMode::All(0), None),
@@ -231,11 +248,21 @@ impl BitwerkApp {
         if let Some(v) = args.iter().position(|a| a == "--style").and_then(|i| args.get(i + 1)) {
             app.set_style(if v.eq_ignore_ascii_case("iec") { SymbolStyle::Iec } else { SymbolStyle::Ansi });
         }
-        // `bitwerk <file.bitwerk>` opens a project at start-up.
+        // `--no-report`: Digital Works imports do not open the report
+        // window (`--report`, the default, shows it).
+        app.dw.suppress_report = args.iter().any(|a| a == "--no-report") && !args.iter().any(|a| a == "--report");
+        // `bitwerk <file.bitwerk>` opens a project at start-up; `bitwerk
+        // <file.dwm>` imports a Digital Works circuit (synchronously, so the
+        // options below apply to it) and shows the import report.
         if let Some(path) = args.iter().find(|a| {
             std::path::Path::new(a).extension().is_some_and(|e| e == PROJECT_EXT || e.eq_ignore_ascii_case("dwm"))
         }) {
             app.open_path(PathBuf::from(path));
+        }
+        // `--import-dw-folder DIR`: converts the Digital Works macros below
+        // DIR into the user library (Parts Centre, with progress).
+        if let Some(dir) = args.iter().position(|a| a == "--import-dw-folder").and_then(|i| args.get(i + 1)) {
+            app.start_folder_import(PathBuf::from(dir));
         }
         // `--select ID`: select a component (screenshots).
         if let Some(id) = args.iter().position(|a| a == "--select").and_then(|i| args.get(i + 1)) {
@@ -378,8 +405,12 @@ impl BitwerkApp {
         self.dirty = true;
     }
 
-    fn replace_circuit(&mut self, circuit: Circuit, name: String, path: Option<PathBuf>) {
+    pub(crate) fn replace_circuit(&mut self, circuit: Circuit, name: String, path: Option<PathBuf>) {
         self.drop_levels();
+        self.pressed = None;
+        if let Some(m) = &self.menu {
+            m.sync_eval_mode(circuit.eval_mode());
+        }
         self.multi.clear();
         self.macro_draft = None;
         self.circuit = Arc::new(circuit);
@@ -424,6 +455,9 @@ impl BitwerkApp {
             MenuAction::PartsCentre => self.parts.open = !self.parts.open,
             MenuAction::ImportMacro => self.import_macro_file(),
             MenuAction::StressMacros => self.spawn_stress_macros(ctx),
+            MenuAction::ImportDw => self.guarded(Pending::ImportDw(None)),
+            MenuAction::ImportDwFolder => self.import_dw_folder_dialog(),
+            MenuAction::EvalMode(mode) => self.set_eval_mode(mode),
         }
     }
 
@@ -435,6 +469,30 @@ impl BitwerkApp {
         }
         let n = self.circuit.macros().free_id().map_or(0, |m| m.0 + 1);
         self.macro_name_prompt = Some(format!("Macro {n}"));
+    }
+
+    /// Imports a Digital Works file (after the unsaved-changes question).
+    pub fn request_import_dw(&mut self, path: PathBuf) {
+        self.guarded(Pending::ImportDw(Some(path)));
+    }
+
+    /// Opens a project file (after the unsaved-changes question).
+    pub fn request_open_path(&mut self, path: PathBuf) {
+        self.guarded(Pending::OpenPath(path));
+    }
+
+    /// Chooses the simulator's propagation semantics (a root edit, also
+    /// while a macro is open).
+    pub fn set_eval_mode(&mut self, mode: EvalMode) {
+        if self.circuit.eval_mode() != mode {
+            match self.apply_root_edit(Edit::SetEvalMode(mode)) {
+                Ok(_) => self.status = format!("Simulation mode: {}", mode.name()),
+                Err(e) => self.status = e.to_string(),
+            }
+        }
+        if let Some(m) = &self.menu {
+            m.sync_eval_mode(self.circuit.eval_mode());
+        }
     }
 
     fn guarded(&mut self, p: Pending) {
@@ -453,6 +511,9 @@ impl BitwerkApp {
                 self.fit_on_next_scene = false;
             }
             Pending::Open => self.open(),
+            Pending::ImportDw(None) => self.import_dw_dialog(),
+            Pending::ImportDw(Some(path)) => self.import_dw_path(&path),
+            Pending::OpenPath(path) => self.open_path(path),
         }
     }
 
@@ -465,10 +526,19 @@ impl BitwerkApp {
         else {
             return;
         };
-        self.open_path(path);
+        if is_dwm_path(&path) {
+            self.import_dw_path(&path);
+        } else {
+            self.open_path(path);
+        }
     }
 
+    /// Opens a project file now (a `.dwm` file is imported, synchronously).
     fn open_path(&mut self, path: PathBuf) {
+        if is_dwm_path(&path) {
+            self.import_dw_now(&path);
+            return;
+        }
         match bw_io::load_from_path(&path) {
             Ok(p) => {
                 let name = if p.name.is_empty() { file_stem(&path) } else { p.name };
@@ -635,6 +705,27 @@ impl BitwerkApp {
                 self.sim.send(Command::SetTickRate(self.tick_rate));
             }
             ui.separator();
+            let mode = self.circuit.eval_mode();
+            let mut chosen = mode;
+            egui::ComboBox::from_id_salt("eval_mode")
+                .selected_text(match mode {
+                    EvalMode::UnitDelay => "Unit delay",
+                    EvalMode::Sequential => "Sequential (DW)",
+                })
+                .show_ui(ui, |ui| {
+                    for m in EvalMode::ALL {
+                        ui.selectable_value(&mut chosen, m, m.name());
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Simulation mode. Unit delay: every gate takes one step. Sequential: changes propagate \
+                     immediately, as in Digital Works (imported circuits use it).",
+                );
+            if chosen != mode {
+                self.set_eval_mode(chosen);
+            }
+            ui.separator();
             let (txt, color) = match snap.state {
                 RunState::Stopped => ("Stopped", ui.visuals().weak_text_color()),
                 RunState::Running => ("Running", egui::Color32::LIGHT_GREEN),
@@ -646,6 +737,11 @@ impl BitwerkApp {
             if let Some(e) = &snap.error {
                 ui.colored_label(egui::Color32::LIGHT_RED, self.describe_error(e));
             }
+            if self.dw.busy() {
+                ui.separator();
+                ui.spinner();
+                ui.label("Importing…");
+            }
             if self.menu.is_none() {
                 ui.separator();
                 if ui.button("Open…").clicked() {
@@ -653,6 +749,9 @@ impl BitwerkApp {
                 }
                 if ui.button("Save").clicked() {
                     self.save(false);
+                }
+                if ui.button("Import Digital Works…").clicked() {
+                    self.guarded(Pending::ImportDw(None));
                 }
                 if ui.button("Stress 100k").clicked() {
                     self.spawn_stress(ui.ctx());
@@ -676,7 +775,7 @@ impl BitwerkApp {
     fn palette(&mut self, ui: &mut egui::Ui) {
         ui.heading("Tools");
         ui.selectable_value(&mut self.tool, Tool::Select, "Select / move");
-        ui.selectable_value(&mut self.tool, Tool::Interact, "Interact (toggle switches)");
+        ui.selectable_value(&mut self.tool, Tool::Interact, "Interact (switches, buttons)");
         ui.selectable_value(&mut self.tool, Tool::Wire, "Wire");
         ui.separator();
         ui.horizontal(|ui| {
@@ -699,53 +798,47 @@ impl BitwerkApp {
                 self.tool = Tool::Place(ComponentKind::Gate { op, inputs: self.gate_inputs });
             }
         }
-        let mut kinds: Vec<ComponentKind> =
-            GateOp::ALL.iter().map(|&op| ComponentKind::Gate { op, inputs: self.gate_inputs }).collect();
-        kinds.extend([
-            ComponentKind::Not,
-            ComponentKind::Switch { on: false },
-            ComponentKind::Clock { half_period: 10 },
-            ComponentKind::Led,
-            ComponentKind::TriState,
-            ComponentKind::flip_flop(FlipFlopType::D),
-            ComponentKind::flip_flop(FlipFlopType::Rs),
-            ComponentKind::flip_flop(FlipFlopType::Jk),
-            ComponentKind::memory(MemoryType::Ram),
-            ComponentKind::memory(MemoryType::Rom),
-        ]);
+        let gates: Vec<ComponentKind> = GateOp::ALL
+            .iter()
+            .map(|&op| ComponentKind::Gate { op, inputs: self.gate_inputs })
+            .chain([ComponentKind::Not, ComponentKind::TriState])
+            .collect();
+        self.palette_group(ui, "Gates", &gates);
+        self.palette_group(
+            ui,
+            "Inputs",
+            &[
+                ComponentKind::Switch { on: false, mode: SwitchMode::Toggle },
+                ComponentKind::Switch { on: false, mode: SwitchMode::Momentary },
+                ComponentKind::Switch { on: false, mode: SwitchMode::Pulse },
+                ComponentKind::Clock { half_period: 10 },
+                ComponentKind::SeqGen { pattern: 0b0110, len: 4, half_period: 10 },
+                ComponentKind::Const { high: true },
+                ComponentKind::Const { high: false },
+            ],
+        );
+        self.palette_group(
+            ui,
+            "Outputs",
+            &[
+                ComponentKind::Led,
+                ComponentKind::SevenSeg { common_anode: false },
+                ComponentKind::Numeric { bits: 4, format: NumFormat::Hex, signed: false },
+            ],
+        );
+        self.palette_group(
+            ui,
+            "Flip-flops & memory",
+            &[
+                ComponentKind::flip_flop(FlipFlopType::D),
+                ComponentKind::flip_flop(FlipFlopType::Rs),
+                ComponentKind::flip_flop(FlipFlopType::Jk),
+                ComponentKind::memory(MemoryType::Ram),
+                ComponentKind::memory(MemoryType::Rom),
+            ],
+        );
+        self.palette_group(ui, "Notes", &[bw_core::Note::default().kind()]);
         let style = self.style;
-        egui::Grid::new("palette-components").spacing([4.0, 4.0]).show(ui, |ui| {
-            for (i, kind) in kinds.into_iter().enumerate() {
-                let selected = matches!(self.tool, Tool::Place(k) if same_palette_entry(k, kind));
-                // Icons show the 2-input variant; the placed gate uses the
-                // input count above.
-                // Memories show a small variant (the 256 × 8 default is
-                // very tall for an icon).
-                let sym = match kind {
-                    ComponentKind::Gate { op, .. } => SymbolKind::Gate(op, 2),
-                    ComponentKind::Memory { ty, .. } => SymbolKind::Memory(ty, 4, 1),
-                    k => SymbolKind::of(&k),
-                };
-                let tip = match kind {
-                    ComponentKind::Gate { op, inputs } => format!("{} gate ({inputs} inputs)", op.name()),
-                    ComponentKind::FlipFlop { trigger, .. } => {
-                        format!("{} ({}; change it in Properties)", SymbolKind::of(&kind).name(), trigger.name())
-                    }
-                    ComponentKind::Memory { addr_bits, data_bits, .. } => format!(
-                        "{} ({} words × {data_bits} bits; change it in Properties)",
-                        SymbolKind::of(&kind).name(),
-                        1u32 << addr_bits
-                    ),
-                    k => SymbolKind::of(&k).name().to_string(),
-                };
-                if crate::icons::button(ui, sym, style, kind.label(), &tip, selected, true).clicked() {
-                    self.tool = Tool::Place(kind);
-                }
-                if i % 3 == 2 {
-                    ui.end_row();
-                }
-            }
-        });
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("Macros");
@@ -781,22 +874,39 @@ impl BitwerkApp {
         if ui.button("Create Macro from Selection…").on_hover_text("Shift+Cmd+M").clicked() {
             self.prompt_macro_name();
         }
-        egui::CollapsingHeader::new("Coming later").default_open(true).show(ui, |ui| {
-            egui::Grid::new("palette-future").spacing([4.0, 4.0]).show(ui, |ui| {
-                for (i, kind) in SymbolKind::FUTURE.into_iter().enumerate() {
-                    let tip = format!("{} (symbol only, not simulated yet)", kind.name());
-                    let _ = crate::icons::button(ui, kind, style, short_name(kind), &tip, false, false);
+        ui.separator();
+        ui.small(
+            "Scroll wheel / pinch: zoom\nTrackpad scroll or drag empty space: pan\nR: rotate · Del: delete · Esc: cancel\n\
+             Wire: click a pin or a wire, click to bend, finish on a pin or a wire · / or Space: flip the L",
+        );
+    }
+
+    /// One palette section: a titled grid of symbol buttons, three per row.
+    fn palette_group(&mut self, ui: &mut egui::Ui, title: &str, kinds: &[ComponentKind]) {
+        let style = self.style;
+        egui::CollapsingHeader::new(title).default_open(true).show(ui, |ui| {
+            egui::Grid::new(("palette", title)).spacing([4.0, 4.0]).show(ui, |ui| {
+                for (i, &kind) in kinds.iter().enumerate() {
+                    let selected = matches!(self.tool, Tool::Place(k) if same_palette_entry(k, kind));
+                    if crate::icons::button(
+                        ui,
+                        palette_symbol(kind),
+                        style,
+                        palette_caption(kind),
+                        &palette_tip(kind),
+                        selected,
+                        true,
+                    )
+                    .clicked()
+                    {
+                        self.tool = Tool::Place(kind);
+                    }
                     if i % 3 == 2 {
                         ui.end_row();
                     }
                 }
             });
         });
-        ui.separator();
-        ui.small(
-            "Scroll wheel / pinch: zoom\nTrackpad scroll or drag empty space: pan\nR: rotate · Del: delete · Esc: cancel\n\
-             Wire: click a pin or a wire, click to bend, finish on a pin or a wire · / or Space: flip the L",
-        );
     }
 
     #[allow(clippy::too_many_lines, reason = "one editor per component kind")]
@@ -867,9 +977,6 @@ impl BitwerkApp {
                         .range(1..=bw_core::MAX_CLOCK_HALF_PERIOD)
                         .prefix("half period (ticks) "),
                 );
-            }
-            ComponentKind::Switch { on } => {
-                ui.checkbox(on, "on");
             }
             ComponentKind::FlipFlop { ty, trigger, preset_clear } => {
                 egui::ComboBox::from_label("type").selected_text(ty.name()).show_ui(ui, |ui| {
@@ -942,9 +1049,12 @@ impl BitwerkApp {
                 crate::macro_props::editor(self, ui, def);
             }
             ComponentKind::Not | ComponentKind::Led | ComponentKind::TriState => {}
+            k => crate::kind_props::kind_editor(self, ui, id, k),
         }
         if kind != comp.kind {
-            let res = if let (ComponentKind::Switch { on }, true) = (kind, self.levels.is_empty()) {
+            let same_mode = matches!((kind, comp.kind),
+                (ComponentKind::Switch { mode: a, .. }, ComponentKind::Switch { mode: b, .. }) if a == b);
+            let res = if let (ComponentKind::Switch { on, .. }, true) = (kind, self.levels.is_empty() && same_mode) {
                 // Toggling a switch changes no geometry: the simulator updates
                 // its copy and the level arrives with the next snapshot.
                 let r = self.circuit_mut().set_kind(id, kind);
@@ -960,6 +1070,7 @@ impl BitwerkApp {
                 self.status = "Disconnect the wires before changing the pins of this component".into();
             }
         }
+        crate::kind_props::extra_editor(self, ui, id, &comp.kind, comp.color);
         ui.separator();
         if ui.button("Rotate (R)").clicked() {
             self.rotate_selected();
@@ -1307,7 +1418,7 @@ impl BitwerkApp {
     }
 
     fn confirm_dialog(&mut self, ctx: &egui::Context) {
-        let Some(p) = self.confirm else { return };
+        let Some(p) = self.confirm.clone() else { return };
         let mut close = false;
         egui::Window::new("Unsaved changes")
             .collapsible(false)
@@ -1319,7 +1430,7 @@ impl BitwerkApp {
                     if ui.button("Discard").clicked() {
                         close = true;
                         self.dirty = false;
-                        self.run_pending(p);
+                        self.run_pending(p.clone());
                     }
                     if ui.button("Cancel").clicked() {
                         close = true;
@@ -1333,28 +1444,72 @@ impl BitwerkApp {
 }
 
 /// Same palette entry (gates by operation, flip-flops and memories by
-/// type, others by kind)?
+/// type, switches by mode, power by level, others by kind)?
 fn same_palette_entry(a: ComponentKind, b: ComponentKind) -> bool {
     match (a, b) {
         (ComponentKind::Gate { op: x, .. }, ComponentKind::Gate { op: y, .. }) => x == y,
         (ComponentKind::FlipFlop { ty: x, .. }, ComponentKind::FlipFlop { ty: y, .. }) => x == y,
         (ComponentKind::Memory { ty: x, .. }, ComponentKind::Memory { ty: y, .. }) => x == y,
+        (ComponentKind::Switch { mode: x, .. }, ComponentKind::Switch { mode: y, .. }) => x == y,
+        (ComponentKind::Const { high: x }, ComponentKind::Const { high: y }) => x == y,
         _ => std::mem::discriminant(&a) == std::mem::discriminant(&b),
     }
 }
 
-/// Caption under a palette icon.
-fn short_name(kind: SymbolKind) -> &'static str {
+/// Icon of a palette entry: gates show the 2-input variant (the placed
+/// gate uses the input count setting), memories a small variant (the
+/// 256 × 8 default is very tall for an icon).
+fn palette_symbol(kind: ComponentKind) -> SymbolKind {
     match kind {
-        SymbolKind::SevenSegment => "7-seg",
-        SymbolKind::NumericOutput => "Number",
-        SymbolKind::Vcc => "VCC",
-        SymbolKind::SequenceGenerator => "Sequence",
-        SymbolKind::InteractiveInput => "Input",
-        SymbolKind::Macro => "Macro",
-        SymbolKind::Junction => "Junction",
-        k => k.name(),
+        ComponentKind::Gate { op, .. } => SymbolKind::Gate(op, 2),
+        ComponentKind::Memory { ty, .. } => SymbolKind::Memory(ty, 4, 1),
+        k => SymbolKind::of(&k),
     }
+}
+
+/// Caption under a palette icon.
+fn palette_caption(kind: ComponentKind) -> &'static str {
+    match kind {
+        ComponentKind::Switch { mode: SwitchMode::Toggle, .. } => "Switch",
+        ComponentKind::Switch { mode: SwitchMode::Momentary, .. } => "Push",
+        ComponentKind::Switch { mode: SwitchMode::Pulse, .. } => "Pulse",
+        ComponentKind::Const { high: false } => "GND",
+        ComponentKind::SevenSeg { .. } => "7-seg",
+        ComponentKind::Numeric { .. } => "Number",
+        k => k.label(),
+    }
+}
+
+/// Tooltip of a palette entry.
+fn palette_tip(kind: ComponentKind) -> String {
+    let name = SymbolKind::of(&kind).name();
+    match kind {
+        ComponentKind::Gate { op, inputs } => format!("{} gate ({inputs} inputs)", op.name()),
+        ComponentKind::FlipFlop { trigger, .. } => format!("{name} ({}; change it in Properties)", trigger.name()),
+        ComponentKind::Memory { addr_bits, data_bits, .. } => {
+            format!("{name} ({} words × {data_bits} bits; change it in Properties)", 1u32 << addr_bits)
+        }
+        ComponentKind::Switch { mode: SwitchMode::Toggle, .. } => {
+            "Toggle switch (click it with the Interact tool)".into()
+        }
+        ComponentKind::Switch { mode: SwitchMode::Momentary, .. } => {
+            "Push button: on while held down with the Interact tool".into()
+        }
+        ComponentKind::Switch { mode: SwitchMode::Pulse, .. } => {
+            format!("Pulse input: square wave, {} ticks per half period", bw_core::PULSE_HALF_PERIOD)
+        }
+        ComponentKind::SeqGen { .. } => "Sequence generator: a repeating pattern of up to 64 steps".into(),
+        ComponentKind::Const { high: true } => "Power supply (VCC, logic 1)".into(),
+        ComponentKind::Const { high: false } => "Ground (logic 0)".into(),
+        ComponentKind::Numeric { .. } => "Numeric output (binary, hex or decimal; set the bits in Properties)".into(),
+        ComponentKind::Text { .. } => "Text annotation (edit it in Properties)".into(),
+        _ => name.to_string(),
+    }
+}
+
+/// A Digital Works circuit file (by extension)?
+fn is_dwm_path(p: &std::path::Path) -> bool {
+    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dwm"))
 }
 
 fn file_stem(p: &std::path::Path) -> String {
@@ -1389,6 +1544,7 @@ impl eframe::App for BitwerkApp {
             self.action(a, ctx);
         }
         self.poll_workers();
+        self.poll_dw();
         // Repaint on demand: input, simulator snapshots and finished workers
         // request repaints themselves; only keep going while the scene is
         // still streaming to the GPU (or when measuring).
@@ -1418,7 +1574,9 @@ impl eframe::App for BitwerkApp {
                 ui.label(&self.status);
             });
         });
-        egui::Panel::left("palette").resizable(false).default_size(170.0).show(ui, |ui| self.palette(ui));
+        egui::Panel::left("palette").resizable(false).default_size(170.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| self.palette(ui));
+        });
         egui::Panel::right("properties").resizable(true).default_size(250.0).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.properties(ui));
         });
@@ -1433,6 +1591,9 @@ impl eframe::App for BitwerkApp {
             self.stats_overlay(ui, rect);
         });
         crate::memwin::show(self, &ctx);
+        crate::dwimport::show_report(self, &ctx);
+        self.handle_dropped_files(&ctx);
+        crate::dwimport::drop_hint(&ctx);
         self.confirm_dialog(&ctx);
         self.macro_name_dialog(&ctx);
         if let Some(mut sweep) = self.sweep.take() {

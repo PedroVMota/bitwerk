@@ -59,7 +59,7 @@ fn seg_at(c: &Circuit, p: GridPos) -> SegmentId {
 fn add_move_delete_keep_rtree_consistent_and_reuse_slots() {
     let mut c = Circuit::new();
     let mut s = Scene::build(&c, 0);
-    let sw = add(&mut c, &mut s, ComponentKind::Switch { on: true }, 0, 0);
+    let sw = add(&mut c, &mut s, ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle }, 0, 0);
     let g = add(&mut c, &mut s, and2(), 10, 0);
     let led = add(&mut c, &mut s, ComponentKind::Led, 20, 0);
     let w1 = connect(&mut c, &mut s, sw, g, 0);
@@ -171,7 +171,7 @@ fn signal_slots_of_multi_output_parts_and_buses() {
 fn junctions_dots_and_net_colours_follow_wiring_edits() {
     let mut c = Circuit::new();
     let mut s = Scene::build(&c, 0);
-    let sw = add(&mut c, &mut s, ComponentKind::Switch { on: false }, 0, 0);
+    let sw = add(&mut c, &mut s, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle }, 0, 0);
     let l1 = add(&mut c, &mut s, ComponentKind::Led, 12, 0);
     let l2 = add(&mut c, &mut s, ComponentKind::Led, 12, 6);
     edit(
@@ -242,7 +242,7 @@ fn junctions_dots_and_net_colours_follow_wiring_edits() {
 fn deleting_the_only_segment_updates_led_and_frees_it() {
     let mut c = Circuit::new();
     let mut s = Scene::build(&c, 0);
-    let sw = add(&mut c, &mut s, ComponentKind::Switch { on: false }, 0, 0);
+    let sw = add(&mut c, &mut s, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle }, 0, 0);
     let led = add(&mut c, &mut s, ComponentKind::Led, 10, 0);
     let w = connect(&mut c, &mut s, sw, led, 0);
     assert_ne!(s.bodies()[s.body_slot(led).unwrap() as usize].net, NO_NET);
@@ -366,7 +366,7 @@ fn macro_instances_and_definition_edits_match_full_build() {
     for i in 0..6 {
         insts.push(add(&mut c, &mut s, shape, 20, 12 * i));
     }
-    let sw = add(&mut c, &mut s, ComponentKind::Switch { on: true }, 0, 0);
+    let sw = add(&mut c, &mut s, ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle }, 0, 0);
     for &m in &insts {
         connect(&mut c, &mut s, sw, m, 1);
     }
@@ -403,4 +403,107 @@ fn macro_instances_and_definition_edits_match_full_build() {
     edit(&mut c, &mut s, &Edit::RemoveMacro(id), 4);
     assert!(c.macros().is_empty());
     s.validate(&c).unwrap();
+}
+
+/// Displays get signal ranges of `signal_count` (outputs + display
+/// signals) that do not change when they are wired (unlike an LED, which
+/// shows its input's net); `SetKind` resizes the range; colours and notes
+/// are patched into the body instance; annotations own note slots that are
+/// reported dirty, freed and reused.
+#[test]
+#[allow(clippy::float_cmp, reason = "integer sizes converted to f32 on both sides")]
+fn displays_colours_and_notes_patch_the_scene() {
+    use bw_core::{Color, Note, NumFormat};
+    use bw_render::{COLOR_FLAG, COLOR_SHIFT, NOTE_SHIFT, TEXT_COLOR_SHIFT};
+    let mut c = Circuit::new();
+    let mut s = Scene::build(&c, 0);
+    let sw = add(&mut c, &mut s, ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Pulse }, 0, 0);
+    let seg = add(&mut c, &mut s, ComponentKind::SevenSeg { common_anode: false }, 10, 0);
+    let num = add(&mut c, &mut s, ComponentKind::Numeric { bits: 4, format: NumFormat::Hex, signed: false }, 30, 0);
+    let vcc = add(&mut c, &mut s, ComponentKind::Const { high: true }, 0, 20);
+    let led = add(&mut c, &mut s, ComponentKind::Led, 10, 20);
+    s.validate(&c).unwrap();
+    for k in 0..7 {
+        assert!(s.signal_slot(seg, k).is_some(), "segment signal {k}");
+    }
+    assert_eq!(s.signal_slot(seg, 7), None);
+    assert!(s.signal_slot(num, 3).is_some() && s.signal_slot(num, 4).is_none());
+    let body = |s: &Scene, id| s.bodies()[s.body_slot(id).unwrap() as usize];
+    assert_eq!(body(&s, seg).net, s.signal_slot(seg, 0).unwrap());
+    // More bits: a longer signal range.
+    let layout = s.layout_version();
+    edit(
+        &mut c,
+        &mut s,
+        &Edit::SetKind(num, ComponentKind::Numeric { bits: 12, format: NumFormat::Dec, signed: true }),
+        1,
+    );
+    s.validate(&c).unwrap();
+    assert!(s.signal_slot(num, 11).is_some() && s.signal_slot(num, 12).is_none());
+    assert_ne!(s.layout_version(), layout);
+    assert_eq!(body(&s, num).kind & 0xff, bw_render::symbols::NUMERIC_CODE);
+    assert_eq!(
+        (body(&s, num).kind >> 8) & 0xff,
+        bw_render::symbols::numeric_variant(12, NumFormat::Dec, true),
+        "numeric layout in the variant"
+    );
+    // Wiring a display keeps its own signals (the LED takes its driver's).
+    connect(&mut c, &mut s, sw, seg, 2);
+    connect(&mut c, &mut s, vcc, num, 0);
+    connect(&mut c, &mut s, vcc, led, 0);
+    s.validate(&c).unwrap();
+    assert_eq!(body(&s, seg).net, s.signal_slot(seg, 0).unwrap());
+    assert_eq!(body(&s, num).net, s.signal_slot(num, 0).unwrap());
+    assert_eq!(body(&s, led).net, s.signal_slot(vcc, 0).unwrap());
+    edit(&mut c, &mut s, &Edit::SetKind(seg, ComponentKind::SevenSeg { common_anode: true }), 2);
+    assert_eq!((body(&s, seg).kind >> 8) & 1, 1, "common anode flag");
+
+    // Colour: only the LED's slot is patched, with the colour field set.
+    let _ = s.take_dirty();
+    let a = edit(&mut c, &mut s, &Edit::SetColor(led, Some(Color::Blue)), 3);
+    assert_eq!(a.components, vec![led]);
+    s.validate(&c).unwrap();
+    assert_eq!(s.take_dirty().bodies, vec![s.body_slot(led).unwrap()]);
+    assert_eq!((body(&s, led).kind >> COLOR_SHIFT) & 0x1f, COLOR_FLAG | u32::from(Color::Blue.index()));
+    edit(&mut c, &mut s, &Edit::SetColor(led, None), 4);
+    assert_eq!(body(&s, led).kind >> COLOR_SHIFT, 0, "default colour");
+    // Kinds without a display colour ignore it.
+    edit(&mut c, &mut s, &Edit::SetColor(vcc, Some(Color::Red)), 5);
+    assert_eq!(body(&s, vcc).kind >> COLOR_SHIFT, 0);
+
+    // Text annotations: a note slot, dirty when added / changed / removed.
+    let _ = s.take_dirty_notes();
+    let t1 = add(&mut c, &mut s, Note::default().kind(), 0, 40);
+    let slot = s.note_slot(t1).unwrap();
+    assert!(slot >= 1);
+    assert_eq!(s.take_dirty_notes(), vec![slot]);
+    assert_eq!((body(&s, t1).kind >> NOTE_SHIFT) & bw_render::MAX_NOTE_SLOT, slot);
+    let note = Note { text: "Clock\nenable".into(), bold: true, italic: true, overbar: true, height: 20 };
+    let a = edit(&mut c, &mut s, &Edit::SetNote { id: t1, note: note.clone() }, 6);
+    assert_eq!(a.components, vec![t1]);
+    s.validate(&c).unwrap();
+    assert_eq!(s.take_dirty_notes(), vec![slot]);
+    assert_eq!(s.note_at(slot), Some(&note));
+    let (w, h) = note.box_size();
+    assert_eq!(body(&s, t1).size, [f32::from(w), f32::from(h)], "the box follows the note");
+    // A move does not rebuild the note mesh.
+    edit(&mut c, &mut s, &Edit::MoveComponent(t1, GridPos::new(5, 45)), 7);
+    assert!(s.take_dirty_notes().is_empty());
+    edit(&mut c, &mut s, &Edit::SetColor(t1, Some(Color::Yellow)), 8);
+    assert!(s.take_dirty_notes().is_empty(), "a colour change keeps the mesh");
+    assert_eq!((body(&s, t1).kind >> TEXT_COLOR_SHIFT) & 0x1f, COLOR_FLAG | u32::from(Color::Yellow.index()));
+    assert_eq!((body(&s, t1).kind >> NOTE_SHIFT) & bw_render::MAX_NOTE_SLOT, slot, "slot kept");
+    s.validate(&c).unwrap();
+    // Remove: slot freed (dirty, empty); the next annotation reuses it.
+    edit(&mut c, &mut s, &Edit::RemoveComponent(t1), 9);
+    assert_eq!(s.take_dirty_notes(), vec![slot]);
+    assert_eq!(s.note_at(slot), None);
+    s.validate(&c).unwrap();
+    let t2 = add(&mut c, &mut s, Note::default().kind(), 0, 60);
+    assert_eq!(s.note_slot(t2), Some(slot));
+    s.validate(&c).unwrap();
+    // A fresh build lists every note; its dirty list starts empty.
+    let mut fresh = Scene::build(&c, 10);
+    assert!(fresh.take_dirty_notes().is_empty());
+    assert_eq!(fresh.note_slots().count(), 1);
 }

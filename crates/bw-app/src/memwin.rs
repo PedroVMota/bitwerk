@@ -10,7 +10,8 @@
 //!   together. Enter moves to the next word, Escape or clicking elsewhere
 //!   cancels.
 //! * Clear (with confirmation), Load and Save of `.map` files
-//!   ([`bw_io::memmap`]). A larger map is truncated, a smaller one
+//!   ([`bw_io::memmap`]; Load also reads Digital Works binary maps, detected
+//!   by their magic number, and says which format it loaded). A larger map is truncated, a smaller one
 //!   zero-filled, wider words are masked to the data width.
 
 use std::sync::Arc;
@@ -282,16 +283,22 @@ pub fn show(app: &mut BitwerkApp, ctx: &egui::Context) {
 /// Asks for a `.map` file and adapts it to `kind`. `Ok(None)`: cancelled.
 fn load_map(kind: ComponentKind) -> Result<Option<(Vec<u16>, String)>, String> {
     let ComponentKind::Memory { data_bits, .. } = kind else { return Ok(None) };
-    let Some(path) =
-        rfd::FileDialog::new().set_title("Load memory map").add_filter("Memory map", &[MAP_EXT]).pick_file()
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("Load memory map")
+        .add_filter("Memory map (bitwerk or Digital Works)", &[MAP_EXT, "MAP"])
+        .pick_file()
     else {
         return Ok(None);
     };
-    let map = memmap::load_path(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let bytes = read_map_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let map = memmap::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    let format = if memmap::is_dw_map(&bytes) { "Digital Works map" } else { "bitwerk map" };
     let n = kind.memory_words();
     let mut notes = Vec::new();
     if map.words.len() > n {
         notes.push(format!("truncated from {} to {n} words", map.words.len()));
+    } else if map.words.len() < n {
+        notes.push(format!("{} words, zero-filled to {n}", map.words.len()));
     }
     if map.data_bits > data_bits {
         notes.push(format!("{}-bit words masked to {data_bits} bits", map.data_bits));
@@ -300,8 +307,30 @@ fn load_map(kind: ComponentKind) -> Result<Option<(Vec<u16>, String)>, String> {
     let mut words: Vec<u16> = map.words.iter().take(n).map(|&w| w & mask).collect();
     words.resize(n, 0);
     let file = path.file_name().map_or_else(String::new, |f| f.to_string_lossy().into_owned());
-    let note = if notes.is_empty() { format!("Loaded {file}") } else { format!("Loaded {file}: {}", notes.join(", ")) };
+    let note = if notes.is_empty() {
+        format!("Loaded {file} ({format})")
+    } else {
+        format!("Loaded {file} ({format}): {}", notes.join(", "))
+    };
     Ok(Some((words, note)))
+}
+
+/// Reads a map file, refusing anything larger than a map can be (checked
+/// before and while reading).
+fn read_map_file(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("not a file".into());
+    }
+    let cap = memmap::MAX_MAP_SIZE as u64;
+    if meta.len() > cap {
+        return Err("file too large for a memory map".into());
+    }
+    let mut buf = Vec::new();
+    file.take(cap + 1).read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    Ok(buf)
 }
 
 fn save_map(words: &[u16], data_bits: u8, label: &str) -> String {

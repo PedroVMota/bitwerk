@@ -39,3 +39,10 @@ path = "fuzz_targets/load_macro.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "load_dwm"
+path = "fuzz_targets/load_dwm.rs"
+test = false
+doc = false
+bench = false

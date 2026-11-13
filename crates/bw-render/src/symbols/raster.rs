@@ -189,7 +189,7 @@ pub fn app_icon(size: u32) -> Vec<u8> {
                 // Input stubs continue their wires (upper input high).
                 Role::PinIn => rgba(level_color(u8::from(v.pos[1] < 2.0))),
                 Role::Outline | Role::Text => outline,
-                Role::PinOut | Role::State => rgba(level_color(1)),
+                Role::PinOut | Role::State | Role::Segment | Role::Digit | Role::Ink => rgba(level_color(1)),
             })
         },
     );
@@ -209,6 +209,7 @@ mod tests {
         let kinds: Vec<SymbolKind> = SymbolKind::all()
             .into_iter()
             .filter(|k| !matches!(k, SymbolKind::Gate(_, n) if ![2, 3, 8].contains(n)))
+            .filter(|k| !matches!(k, SymbolKind::Numeric(n, _, _) if ![4, 8].contains(n)))
             .collect();
         let (cell, scale, cols) = (190.0f32, 22.0f32, 10usize);
         let rows = kinds.len().div_ceil(cols) * 2;

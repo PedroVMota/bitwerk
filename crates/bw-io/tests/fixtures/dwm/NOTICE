@@ -1,0 +1,53 @@
+The files in this directory (*.dwm circuits and macros, *.dwt templates and
+the *.map memory map) are unmodified sample files from the official Digital
+Works 3.0.5 package (digital-works.zip, Mecanique), used as test fixtures for
+bitwerk's Digital Works importer. File names were shortened; the original
+paths are listed below.
+
+The package is distributed under the following licence, reproduced verbatim
+from its help file (Digital.chm, topic "License Agreement",
+IntroductionAgreement.htm):
+
+    End User Agreement
+    Copyright (c) 2014 by David John Barker
+    www.mecanique.co.uk
+
+    Permission to use, copy, modify, and/or distribute this software for any
+    purpose with or without fee is hereby granted, provided that the above
+    copyright notice and this permission notice appear in all copies.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY AND
+    FITNESS FOR A PARTICULAR PURPOSE. IN NO EVENT SHALL MECANIQUE OR MICROCHIP BE
+    LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY
+    DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+    ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+    CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE OR FIRMWARE.
+
+Original paths inside the package (DigitalWorks/…) or its nested archives:
+
+    xor-nand.dwm          Sample Circuits/Simple/XOR Using NAND Gates.dwm
+    equality-xor.dwm      Sample Circuits/Simple/Equality Using XOR.dwm
+    ms-jk.dwm             Sample Circuits/Simple/Master Slave JK Flip Flop.dwm
+    counter.dwm           Sample Circuits/Counter.dwm
+    traffic-lights.dwm    Sample Circuits/traffic-lights.dwm
+    numbers.dwm           Sample Circuits/Numbers.dwm
+    memory.dwm            Sample Circuits/Memory.dwm
+    bus-contention.dwm    Sample Circuits/Bus Contention.dwm
+    rtx.dwm               Sample Circuits/RTX.dwm
+    logic-history.dwm     Sample Circuits/Logic History.dwm
+    comparator.dwm        Sample Circuits/Comparator Circuit.dwm
+    clocked-d-latch.dwm   Parts Centre/Tanenbaum/Clocked D Latch.dwm
+    2-din-xnor.dwm        Parts Centre/Macros/DIN Symbols/2_Din_xnor.dwm
+    4-din-nor.dwm         Parts Centre/Macros/DIN Symbols/4_Din_nor.dwm
+    74hc00.dwm            74Series.zip: 74hc00.dwm
+    74hc74.dwm            74Series.zip: 74hc74.dwm
+    74hc75.dwm            74Series.zip: 74hc75.dwm
+    74hc76.dwm            74Series.zip: 74hc76.dwm
+    74hc125.dwm           74Series.zip: 74hc125.dwm
+    14-pin-dil.dwt        Templates/14 Pin DIL.dwt
+    relay.dwt             Templates/Relay.dwt
+    low1.map              Parts Centre/Tanenbaum/low1.map
+
+They are test data only: bitwerk never executes anything from them, and
+they are not part of the application.

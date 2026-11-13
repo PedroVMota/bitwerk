@@ -47,8 +47,8 @@ fn set(s: &mut SimState, sw: ComponentId, v: u8) {
 /// Two switches → gate → LED; returns (circuit, a, b, gate).
 fn two_input(op: GateOp) -> (Circuit, ComponentId, ComponentId, ComponentId) {
     let mut c = Circuit::new();
-    let a = add(&mut c, ComponentKind::Switch { on: false });
-    let b = add(&mut c, ComponentKind::Switch { on: false });
+    let a = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle });
+    let b = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle });
     let g = add(&mut c, ComponentKind::Gate { op, inputs: 2 });
     let led = add(&mut c, ComponentKind::Led);
     wire(&mut c, a, 0, g, 0);
@@ -77,7 +77,7 @@ fn gate_truth_tables_through_netlist() {
 #[test]
 fn floating_inputs_read_as_unknown() {
     let mut c = Circuit::new();
-    let a = add(&mut c, ComponentKind::Switch { on: false });
+    let a = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle });
     let g = add(&mut c, ComponentKind::Gate { op: GateOp::And, inputs: 2 });
     let o = add(&mut c, ComponentKind::Gate { op: GateOp::Or, inputs: 2 });
     let n = add(&mut c, ComponentKind::Not);
@@ -95,7 +95,7 @@ fn floating_inputs_read_as_unknown() {
 #[test]
 fn not_gate_and_three_input() {
     let mut c = Circuit::new();
-    let a = add(&mut c, ComponentKind::Switch { on: true });
+    let a = add(&mut c, ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle });
     let n = add(&mut c, ComponentKind::Not);
     let g = add(&mut c, ComponentKind::Gate { op: GateOp::And, inputs: 3 });
     wire(&mut c, a, 0, n, 0);
@@ -110,14 +110,14 @@ fn not_gate_and_three_input() {
 #[test]
 fn self_feeding_not_is_a_race_condition() {
     let mut c = Circuit::new();
-    let a = add(&mut c, ComponentKind::Switch { on: false });
+    let a = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle });
     let g = add(&mut c, ComponentKind::Gate { op: GateOp::Nor, inputs: 2 });
     wire(&mut c, a, 0, g, 0);
     wire(&mut c, g, 0, g, 1);
     // NOR(0, own output) settles at X from floating; a fresh NOT loop with
     // a known start oscillates instead.
     let mut c2 = Circuit::new();
-    let sw = add(&mut c2, ComponentKind::Switch { on: true });
+    let sw = add(&mut c2, ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle });
     let nand = add(&mut c2, ComponentKind::Gate { op: GateOp::Nand, inputs: 2 });
     wire(&mut c2, sw, 0, nand, 0);
     wire(&mut c2, nand, 0, nand, 1);
@@ -136,7 +136,7 @@ fn nand_with_feedback_oscillates() {
     // NAND(switch, own output): stable at 1 while the switch is off, then
     // oscillates once it is on.
     let mut c = Circuit::new();
-    let sw = add(&mut c, ComponentKind::Switch { on: false });
+    let sw = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle });
     let g = add(&mut c, ComponentKind::Gate { op: GateOp::Nand, inputs: 2 });
     wire(&mut c, sw, 0, g, 0);
     wire(&mut c, g, 0, g, 1);
@@ -150,8 +150,8 @@ fn nand_with_feedback_oscillates() {
 fn sr_latch_of_gates_settles() {
     // Cross-coupled NOR latch must not be reported as a race.
     let mut c = Circuit::new();
-    let set_ = add(&mut c, ComponentKind::Switch { on: false });
-    let rst = add(&mut c, ComponentKind::Switch { on: true });
+    let set_ = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle });
+    let rst = add(&mut c, ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle });
     let q = add(&mut c, ComponentKind::Gate { op: GateOp::Nor, inputs: 2 });
     let nq = add(&mut c, ComponentKind::Gate { op: GateOp::Nor, inputs: 2 });
     wire(&mut c, rst, 0, q, 0);
@@ -195,10 +195,10 @@ struct Bus {
 
 fn bus() -> Bus {
     let mut c = Circuit::new();
-    let a = add(&mut c, ComponentKind::Switch { on: true });
-    let b = add(&mut c, ComponentKind::Switch { on: false });
-    let ea = add(&mut c, ComponentKind::Switch { on: false });
-    let eb = add(&mut c, ComponentKind::Switch { on: false });
+    let a = add(&mut c, ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle });
+    let b = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle });
+    let ea = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle });
+    let eb = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle });
     let t1 = add(&mut c, ComponentKind::TriState);
     let t2 = add(&mut c, ComponentKind::TriState);
     let buf = add(&mut c, ComponentKind::Gate { op: GateOp::And, inputs: 2 });
@@ -255,9 +255,9 @@ fn bus_contention_halts_naming_net_and_drivers() {
 #[test]
 fn complementary_enables_do_not_report_transient_contention() {
     let mut c = Circuit::new();
-    let sel = add(&mut c, ComponentKind::Switch { on: false });
+    let sel = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle });
     let not = add(&mut c, ComponentKind::Not);
-    let a = add(&mut c, ComponentKind::Switch { on: true });
+    let a = add(&mut c, ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle });
     let t1 = add(&mut c, ComponentKind::TriState);
     let t2 = add(&mut c, ComponentKind::TriState);
     let led = add(&mut c, ComponentKind::Led);
@@ -293,9 +293,9 @@ struct Ff {
 impl Ff {
     fn new(ty: FlipFlopType, trigger: FfTrigger, preset_clear: bool, wire_async: bool) -> Self {
         let mut c = Circuit::new();
-        let a = add(&mut c, ComponentKind::Switch { on: false });
-        let b = add(&mut c, ComponentKind::Switch { on: false });
-        let clk = add(&mut c, ComponentKind::Switch { on: false });
+        let a = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle });
+        let b = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle });
+        let clk = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle });
         let ff = add(&mut c, ComponentKind::FlipFlop { ty, trigger, preset_clear });
         wire(&mut c, a, 0, ff, 0);
         wire(&mut c, clk, 0, ff, 1);
@@ -305,8 +305,8 @@ impl Ff {
         let (mut pre, mut clr) = (None, None);
         if preset_clear && wire_async {
             let sync = ty.sync_inputs();
-            let p = add(&mut c, ComponentKind::Switch { on: false });
-            let r = add(&mut c, ComponentKind::Switch { on: false });
+            let p = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle });
+            let r = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle });
             wire(&mut c, p, 0, ff, sync);
             wire(&mut c, r, 0, ff, sync + 1);
             (pre, clr) = (Some(p), Some(r));
@@ -536,8 +536,8 @@ fn toggle_flip_flop_divides_the_clock() {
 #[test]
 fn jk_ripple_counter_counts() {
     let mut c = Circuit::new();
-    let one = add(&mut c, ComponentKind::Switch { on: true });
-    let clk = add(&mut c, ComponentKind::Switch { on: false });
+    let one = add(&mut c, ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle });
+    let clk = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle });
     let mut ffs = vec![];
     for i in 0..4 {
         let ff = add(&mut c, ComponentKind::flip_flop(FlipFlopType::Jk));
@@ -615,7 +615,7 @@ impl Mem {
         }
         let mut addr = vec![];
         for i in 0..addr_bits {
-            let sw = add(&mut c, ComponentKind::Switch { on: false });
+            let sw = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle });
             wire(&mut c, sw, 0, m, i);
             addr.push(sw);
         }
@@ -624,16 +624,16 @@ impl Mem {
         let mut next = addr_bits;
         if ty == MemoryType::Ram {
             for i in 0..data_bits {
-                let sw = add(&mut c, ComponentKind::Switch { on: false });
+                let sw = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle });
                 wire(&mut c, sw, 0, m, addr_bits + i);
                 data.push(sw);
             }
-            let r = add(&mut c, ComponentKind::Switch { on: true });
+            let r = add(&mut c, ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle });
             wire(&mut c, r, 0, m, addr_bits + data_bits);
             rw = Some(r);
             next += data_bits + 1;
         }
-        let cs = add(&mut c, ComponentKind::Switch { on: false });
+        let cs = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle });
         wire(&mut c, cs, 0, m, next);
         Self { s: sim(&c), m, dw: data_bits, addr, data, rw, cs }
     }
@@ -744,7 +744,7 @@ fn engine_thread_publishes_snapshots_and_halts_on_race() {
     wait_for(&h, |s| s.revision == 1 && s.level(gi) == L1);
 
     let mut osc = Circuit::new();
-    let sw = add(&mut osc, ComponentKind::Switch { on: true });
+    let sw = add(&mut osc, ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle });
     let n = add(&mut osc, ComponentKind::Gate { op: GateOp::Nand, inputs: 2 });
     wire(&mut osc, sw, 0, n, 0);
     wire(&mut osc, n, 0, n, 1);
@@ -778,7 +778,7 @@ fn engine_applies_incremental_edits() {
     // Replace input b by a new switch that is on: AND becomes 1.
     h.send(Command::Edit { edit: Edit::RemoveComponent(b), revision: 2 });
     let add_on = Edit::AddComponent {
-        kind: ComponentKind::Switch { on: true },
+        kind: ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle },
         pos: GridPos::default(),
         rotation: Rotation::R0,
     };
@@ -802,8 +802,8 @@ fn engine_applies_incremental_edits() {
 #[test]
 fn edits_keep_sequential_state_and_stop_resets_it() {
     let mut c = Circuit::new();
-    let d = add(&mut c, ComponentKind::Switch { on: true });
-    let clk = add(&mut c, ComponentKind::Switch { on: false });
+    let d = add(&mut c, ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle });
+    let clk = add(&mut c, ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle });
     let ff = add(&mut c, ComponentKind::flip_flop(FlipFlopType::D));
     wire(&mut c, d, 0, ff, 0);
     wire(&mut c, clk, 0, ff, 1);
@@ -850,7 +850,7 @@ fn edits_keep_sequential_state_and_stop_resets_it() {
 fn sim_bench_flip_flops_and_memory() {
     let mut c = Circuit::new();
     let clk = add(&mut c, ComponentKind::Clock { half_period: 1 });
-    let one = add(&mut c, ComponentKind::Switch { on: true });
+    let one = add(&mut c, ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle });
     let mut rams = vec![];
     for _ in 0..512 {
         let mut prev = clk;
@@ -916,7 +916,13 @@ fn seg_at(c: &Circuit, p: GridPos) -> SegmentId {
 #[test]
 fn fanout_through_a_junction_drives_every_branch() {
     let mut c = Circuit::new();
-    let sw = c.add_component(ComponentKind::Switch { on: false }, GridPos::new(0, 0), Rotation::R0).unwrap();
+    let sw = c
+        .add_component(
+            ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle },
+            GridPos::new(0, 0),
+            Rotation::R0,
+        )
+        .unwrap();
     let n1 = c.add_component(ComponentKind::Not, GridPos::new(12, 0), Rotation::R0).unwrap();
     let n2 = c.add_component(ComponentKind::Not, GridPos::new(12, 8), Rotation::R0).unwrap();
     c.connect(pin(sw, 0), pin(n1, 0), vec![]).unwrap();
@@ -946,10 +952,30 @@ fn fanout_through_a_junction_drives_every_branch() {
 fn tristate_bus_through_junctions() {
     let mut c = Circuit::new();
     let (d1, d2, e1, e2) = (
-        c.add_component(ComponentKind::Switch { on: true }, GridPos::new(0, 0), Rotation::R0).unwrap(),
-        c.add_component(ComponentKind::Switch { on: false }, GridPos::new(0, 10), Rotation::R0).unwrap(),
-        c.add_component(ComponentKind::Switch { on: false }, GridPos::new(4, -6), Rotation::R0).unwrap(),
-        c.add_component(ComponentKind::Switch { on: false }, GridPos::new(4, 4), Rotation::R0).unwrap(),
+        c.add_component(
+            ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle },
+            GridPos::new(0, 0),
+            Rotation::R0,
+        )
+        .unwrap(),
+        c.add_component(
+            ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle },
+            GridPos::new(0, 10),
+            Rotation::R0,
+        )
+        .unwrap(),
+        c.add_component(
+            ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle },
+            GridPos::new(4, -6),
+            Rotation::R0,
+        )
+        .unwrap(),
+        c.add_component(
+            ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle },
+            GridPos::new(4, 4),
+            Rotation::R0,
+        )
+        .unwrap(),
     );
     let t1 = c.add_component(ComponentKind::TriState, GridPos::new(6, 0), Rotation::R0).unwrap();
     let t2 = c.add_component(ComponentKind::TriState, GridPos::new(6, 10), Rotation::R0).unwrap();
@@ -986,7 +1012,13 @@ fn tristate_bus_through_junctions() {
 #[test]
 fn moving_a_bend_does_not_recompile() {
     let mut c = Circuit::new();
-    let sw = c.add_component(ComponentKind::Switch { on: true }, GridPos::new(0, 0), Rotation::R0).unwrap();
+    let sw = c
+        .add_component(
+            ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle },
+            GridPos::new(0, 0),
+            Rotation::R0,
+        )
+        .unwrap();
     let led = c.add_component(ComponentKind::Led, GridPos::new(12, 6), Rotation::R0).unwrap();
     c.connect(pin(sw, 0), pin(led, 0), vec![GridPos::new(6, 1), GridPos::new(6, 7)]).unwrap();
     let bend = c.nodes().find(|(_, n)| n.is_free()).unwrap().0;

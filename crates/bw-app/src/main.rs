@@ -5,14 +5,24 @@
 //! * `bw-sim`: simulation engine (commands in via channel, snapshots out via
 //!   `ArcSwap`, never blocks the UI);
 //! * `bw-scene`: rebuilds GPU instance arrays + R-tree after edits;
-//! * short-lived worker for generating the debug stress circuit.
+//! * short-lived worker for generating the debug stress circuit;
+//! * short-lived workers for Digital Works imports (`bw-dw-import`: one
+//!   `.dwm` file; `bw-dw-folder`: a folder of macros into the library,
+//!   reporting progress and polling a cancel flag between files).
+//!
+//! Command line: `bitwerk [file.bitwerk | file.dwm]` opens / imports a file
+//! (a `.dwm` import shows the Import report; `--no-report` hides it);
+//! `--import-dw-folder DIR` imports a folder of Digital Works macros into
+//! the user library; see `app.rs` for the other options.
 
 #![forbid(unsafe_code)]
 
 mod app;
 mod canvas;
+mod dwimport;
 mod hier;
 mod icons;
+mod kind_props;
 mod macro_props;
 mod memwin;
 mod menu;

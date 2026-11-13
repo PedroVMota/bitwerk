@@ -4,10 +4,11 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::component::{Component, ComponentId, ComponentKind, MacroId, PinRef, Rotation};
+use crate::component::{Color, Component, ComponentId, ComponentKind, MacroId, PinRef, Rotation};
 use crate::geom::GridPos;
 use crate::macros::{MAX_FLAT_COMPONENTS, MacroDef, MacroTable, pin_remap};
 use crate::memenc;
+use crate::note::Note;
 use crate::wiring::{NodeId, NodeRecord, Segment, SegmentId, SegmentRecord, WireEnd, WireLog, WireNode};
 
 /// Maximum number of bend points of one wire drawn in a single edit.
@@ -74,6 +75,41 @@ pub enum CircuitError {
     BadMacro(String),
     #[error("macro definitions live in the root circuit only")]
     NotRoot,
+    #[error("component {0:?} is not a text annotation")]
+    NotAText(ComponentId),
+    #[error("invalid text annotation {0:?} (too long, too many lines, control characters or bad height)")]
+    BadNote(ComponentId),
+}
+
+/// How the simulator propagates changes (see `bw-sim`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum EvalMode {
+    /// Unit delay: every gate takes one delta cycle; all changes of a delta
+    /// are committed together (the native semantics).
+    #[default]
+    UnitDelay,
+    /// Immediate propagation: gates are evaluated one after another and
+    /// each new output is visible to the next evaluation at once (Digital
+    /// Works compatible; gate-level latches settle instead of racing).
+    Sequential,
+}
+
+impl EvalMode {
+    pub const ALL: [Self; 2] = [Self::UnitDelay, Self::Sequential];
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::UnitDelay => "Unit delay",
+            Self::Sequential => "Sequential (Digital Works compatible)",
+        }
+    }
+
+    #[allow(clippy::trivially_copy_pass_by_ref, reason = "serde skip predicate signature")]
+    #[must_use]
+    pub const fn is_default(&self) -> bool {
+        matches!(self, Self::UnitDelay)
+    }
 }
 
 /// Contents of one memory device (exactly `kind.memory_words()` words, each
@@ -136,6 +172,15 @@ pub enum Edit {
     },
     /// Removes an unused macro definition.
     RemoveMacro(MacroId),
+    /// Sets (or clears, `None` = default) a component's display colour.
+    SetColor(ComponentId, Option<Color>),
+    /// Replaces the text and style of a text annotation (its box follows).
+    SetNote {
+        id: ComponentId,
+        note: Note,
+    },
+    /// Chooses how the simulator propagates changes (root circuit).
+    SetEvalMode(EvalMode),
 }
 
 impl Edit {
@@ -153,6 +198,8 @@ impl Edit {
                 | Self::SetMemoryWord { .. }
                 | Self::SetMemory { .. }
                 | Self::RemoveMacro(..)
+                | Self::SetColor(..)
+                | Self::SetNote { .. }
         )
     }
 }
@@ -205,6 +252,10 @@ pub struct Circuit {
     pub(crate) pin_node: HashMap<PinRef, NodeId>,
     /// Memory contents; a memory without an entry is all zeros.
     pub(crate) memories: BTreeMap<ComponentId, MemoryImage>,
+    /// Text and style of every text annotation.
+    pub(crate) notes: BTreeMap<ComponentId, Note>,
+    /// Propagation semantics for the simulator (root circuit).
+    pub(crate) eval: EvalMode,
     next_component: u32,
     /// Macro definitions (root circuit only; empty in definition bodies).
     pub(crate) macros: MacroTable,
@@ -227,6 +278,14 @@ pub struct MemoryRecord {
     pub words: String,
 }
 
+/// On-disk shape of a text annotation's note.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NoteRecord {
+    pub id: ComponentId,
+    pub note: Note,
+}
+
 /// On-disk shape of a circuit; converted to [`Circuit`] only after validation.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -238,6 +297,12 @@ pub struct CircuitRaw {
     pub segments: Vec<SegmentRecord>,
     #[serde(default)]
     pub memories: Vec<MemoryRecord>,
+    /// Text annotations (format 5).
+    #[serde(default)]
+    pub notes: Vec<NoteRecord>,
+    /// Simulation semantics (format 5).
+    #[serde(default)]
+    pub eval: EvalMode,
 }
 
 #[derive(Serialize)]
@@ -247,12 +312,22 @@ struct MemoryRecordOut {
 }
 
 #[derive(Serialize)]
+struct NoteRecordOut<'a> {
+    id: ComponentId,
+    note: &'a Note,
+}
+
+#[derive(Serialize)]
 struct CircuitRef<'a> {
     components: Vec<&'a Component>,
     nodes: Vec<NodeRecord>,
     segments: Vec<SegmentRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     memories: Vec<MemoryRecordOut>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    notes: Vec<NoteRecordOut<'a>>,
+    #[serde(skip_serializing_if = "EvalMode::is_default")]
+    eval: EvalMode,
 }
 
 impl Serialize for Circuit {
@@ -264,7 +339,16 @@ impl Serialize for Circuit {
             .map(|(&id, m)| MemoryRecordOut { id, words: memenc::encode(m) })
             .collect();
         let (nodes, segments) = self.wiring_records();
-        CircuitRef { components: self.components.values().collect(), nodes, segments, memories }.serialize(s)
+        let note_recs = self.notes.iter().map(|(&id, note)| NoteRecordOut { id, note }).collect();
+        CircuitRef {
+            components: self.components.values().collect(),
+            nodes,
+            segments,
+            memories,
+            notes: note_recs,
+            eval: self.eval,
+        }
+        .serialize(s)
     }
 }
 
@@ -291,10 +375,33 @@ impl Circuit {
                 comp.kind = ComponentKind::Macro(e.shape);
             }
         }
-        let mut c = Self { body, ..Self::default() };
+        let mut c = Self { body, eval: if body { EvalMode::default() } else { raw.eval }, ..Self::default() };
         if !body {
             c.macros = table.clone();
         }
+        // Text annotations: the box follows the note (a missing note is
+        // the default one).
+        let mut notes: BTreeMap<ComponentId, Note> = BTreeMap::new();
+        for rec in raw.notes {
+            if !rec.note.is_valid() {
+                return Err(CircuitError::BadNote(rec.id));
+            }
+            if notes.insert(rec.id, rec.note).is_some() {
+                return Err(CircuitError::DuplicateComponent(rec.id));
+            }
+        }
+        for comp in &mut raw.components {
+            if matches!(comp.kind, ComponentKind::Text { .. }) {
+                let note = notes.entry(comp.id).or_default();
+                comp.kind = note.kind();
+            }
+        }
+        for &id in notes.keys() {
+            if !raw.components.iter().any(|k| k.id == id && matches!(k.kind, ComponentKind::Text { .. })) {
+                return Err(CircuitError::NotAText(id));
+            }
+        }
+        c.notes = notes;
         for comp in raw.components {
             if !comp.kind.is_valid() {
                 return Err(CircuitError::InvalidComponent(comp.id));
@@ -398,7 +505,61 @@ impl Circuit {
     /// Same components, wiring and memory contents (definition equality).
     #[must_use]
     pub fn content_eq(&self, o: &Self) -> bool {
-        self.components == o.components && self.memories == o.memories && self.wiring_records() == o.wiring_records()
+        self.components == o.components
+            && self.memories == o.memories
+            && self.notes == o.notes
+            && self.eval == o.eval
+            && self.wiring_records() == o.wiring_records()
+    }
+
+    /// Text and style of a text annotation.
+    #[must_use]
+    pub fn note(&self, id: ComponentId) -> Option<&Note> {
+        self.notes.get(&id)
+    }
+
+    /// Every text annotation's note, in id order.
+    pub fn notes(&self) -> impl Iterator<Item = (ComponentId, &Note)> {
+        self.notes.iter().map(|(&id, n)| (id, n))
+    }
+
+    /// How the simulator should propagate changes.
+    #[must_use]
+    pub fn eval_mode(&self) -> EvalMode {
+        self.eval
+    }
+
+    /// Sets the propagation semantics (root circuits; ignored in bodies).
+    pub fn set_eval_mode(&mut self, mode: EvalMode) {
+        if !self.body {
+            self.eval = mode;
+        }
+    }
+
+    /// Replaces a text annotation's note; its box follows.
+    ///
+    /// # Errors
+    /// Not a text annotation, or an invalid note.
+    pub fn set_note(&mut self, id: ComponentId, note: Note) -> Result<(), CircuitError> {
+        let c = self.components.get_mut(&id).ok_or(CircuitError::NoSuchComponent(id))?;
+        if !matches!(c.kind, ComponentKind::Text { .. }) {
+            return Err(CircuitError::NotAText(id));
+        }
+        if !note.is_valid() {
+            return Err(CircuitError::BadNote(id));
+        }
+        c.kind = note.kind();
+        self.notes.insert(id, note);
+        Ok(())
+    }
+
+    /// Sets a component's display colour (`None` = the kind's default).
+    ///
+    /// # Errors
+    /// The component does not exist.
+    pub fn set_color(&mut self, id: ComponentId, color: Option<Color>) -> Result<(), CircuitError> {
+        self.components.get_mut(&id).ok_or(CircuitError::NoSuchComponent(id))?.color = color;
+        Ok(())
     }
 
     /// Keeps the macro index and the primitive count up to date.
@@ -414,7 +575,7 @@ impl Circuit {
                     }
                 }
             }
-            ComponentKind::Tag { .. } => {}
+            ComponentKind::Tag { .. } | ComponentKind::Text { .. } => {}
             _ => {
                 if add {
                     self.prims += 1;
@@ -439,7 +600,7 @@ impl Circuit {
                 }
                 e.flat
             }
-            ComponentKind::Tag { .. } => 0,
+            ComponentKind::Tag { .. } | ComponentKind::Text { .. } => 0,
             _ => 1,
         };
         if !self.body {
@@ -573,8 +734,16 @@ impl Circuit {
         }
         self.check_macro_kind(id, &kind)?;
         self.next_component = self.next_component.checked_add(1).ok_or(CircuitError::IdSpaceExhausted)?;
+        let kind = if matches!(kind, ComponentKind::Text { .. }) {
+            let note = Note::default();
+            let k = note.kind();
+            self.notes.insert(id, note);
+            k
+        } else {
+            kind
+        };
         self.index_kind(id, &kind, true);
-        self.components.insert(id, Component { id, kind, pos, rotation });
+        self.components.insert(id, Component { id, kind, pos, rotation, color: None });
         Ok(id)
     }
 
@@ -590,6 +759,7 @@ impl Circuit {
         let comp = self.components.remove(&id).ok_or(CircuitError::NoSuchComponent(id))?;
         self.index_kind(id, &comp.kind, false);
         self.memories.remove(&id);
+        self.notes.remove(&id);
         Ok(comp)
     }
 
@@ -634,6 +804,12 @@ impl Circuit {
             return Err(CircuitError::InvalidComponent(id));
         }
         let c = self.components.get(&id).ok_or(CircuitError::NoSuchComponent(id))?;
+        // A text annotation's box follows its note (see `set_note`).
+        if matches!(c.kind, ComponentKind::Text { .. }) != matches!(kind, ComponentKind::Text { .. })
+            || (matches!(kind, ComponentKind::Text { .. }) && c.kind != kind)
+        {
+            return Err(CircuitError::InvalidComponent(id));
+        }
         let same_pins = c.kind.input_count() == kind.input_count() && c.kind.output_count() == kind.output_count();
         if (!same_pins || c.kind.tristate_mask() != kind.tristate_mask()) && self.has_wires(id, c.kind.pin_count()) {
             return Err(CircuitError::InvalidComponent(id));
@@ -740,6 +916,12 @@ impl Circuit {
                 macros = defs;
             }),
             Edit::RemoveMacro(id) => self.remove_macro(*id).map(|()| macros.push(*id)),
+            Edit::SetColor(id, color) => self.set_color(*id, *color).map(|()| components.push(*id)),
+            Edit::SetNote { id, note } => self.set_note(*id, note.clone()).map(|()| components.push(*id)),
+            Edit::SetEvalMode(mode) => {
+                self.set_eval_mode(*mode);
+                Ok(())
+            }
         };
         let log = std::mem::take(&mut self.log);
         r?;
@@ -774,8 +956,20 @@ mod tests {
     #[test]
     fn connect_rules() {
         let mut c = Circuit::new();
-        let s = c.add_component(ComponentKind::Switch { on: false }, GridPos::new(0, 0), Rotation::R0).unwrap();
-        let s2 = c.add_component(ComponentKind::Switch { on: false }, GridPos::new(0, 6), Rotation::R0).unwrap();
+        let s = c
+            .add_component(
+                ComponentKind::Switch { on: false, mode: crate::SwitchMode::Toggle },
+                GridPos::new(0, 0),
+                Rotation::R0,
+            )
+            .unwrap();
+        let s2 = c
+            .add_component(
+                ComponentKind::Switch { on: false, mode: crate::SwitchMode::Toggle },
+                GridPos::new(0, 6),
+                Rotation::R0,
+            )
+            .unwrap();
         let g = c.add_component(and2(), GridPos::new(4, 0), Rotation::R0).unwrap();
         let out = PinRef { component: s, pin: 0 };
         let in0 = PinRef { component: g, pin: 0 };
@@ -797,7 +991,13 @@ mod tests {
         let mut c = Circuit::new();
         let t1 = c.add_component(ComponentKind::TriState, GridPos::new(0, 0), Rotation::R0).unwrap();
         let t2 = c.add_component(ComponentKind::TriState, GridPos::new(0, 6), Rotation::R0).unwrap();
-        let sw = c.add_component(ComponentKind::Switch { on: true }, GridPos::new(0, 12), Rotation::R0).unwrap();
+        let sw = c
+            .add_component(
+                ComponentKind::Switch { on: true, mode: crate::SwitchMode::Toggle },
+                GridPos::new(0, 12),
+                Rotation::R0,
+            )
+            .unwrap();
         let led = c.add_component(ComponentKind::Led, GridPos::new(10, 0), Rotation::R0).unwrap();
         let led2 = c.add_component(ComponentKind::Led, GridPos::new(10, 6), Rotation::R0).unwrap();
         let o = |id| PinRef { component: id, pin: 2 };
@@ -846,7 +1046,7 @@ mod tests {
         let pin = |c, p| PinRef { component: ComponentId(c), pin: p };
         let edits = [
             Edit::AddComponent {
-                kind: ComponentKind::Switch { on: true },
+                kind: ComponentKind::Switch { on: true, mode: crate::SwitchMode::Toggle },
                 pos: GridPos::new(0, 0),
                 rotation: Rotation::R0,
             },

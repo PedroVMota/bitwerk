@@ -1,6 +1,6 @@
 (
     format: "bitwerk-macro",
-    version: 1,
+    version: 2,
     root: (3),
     macros: [
         (

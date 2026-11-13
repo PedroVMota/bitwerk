@@ -16,12 +16,31 @@ pub const DATA_WIDTHS: [u8; 5] = [1, 2, 4, 8, 16];
 /// Largest memory in words (`2^MAX_ADDR_BITS`).
 pub const MAX_MEMORY_WORDS: usize = 1 << MAX_ADDR_BITS;
 
+/// Longest pattern of a sequence generator (bits).
+pub const MAX_SEQ_LEN: u8 = 64;
+/// Input lines of a numeric output display.
+pub const MIN_NUMERIC_BITS: u8 = 2;
+pub const MAX_NUMERIC_BITS: u8 = 16;
+/// Segments of a 7-segment display (a … g).
+pub const SEGMENTS: u8 = 7;
+/// Half-period (ticks) of a pulsing interactive input: the documented
+/// default clock speed (1 Hz at the default 20 ticks/s), the same as a
+/// newly placed clock.
+pub const PULSE_HALF_PERIOD: u32 = 10;
+
 /// Largest DIL package (pins).
 pub const MAX_DIL_PINS: usize = 28;
 /// DIL package sizes a macro template may use.
 pub const DIL_SIZES: [u8; 7] = [8, 14, 16, 18, 20, 24, 28];
 /// Maximum inputs (and, separately, outputs) of a macro.
 pub const MAX_MACRO_SIDE_PINS: u8 = 32;
+/// Maximum inputs, and separately outputs, of a macro (imported Digital
+/// Works parts have wide buses: a 7 → 128 decoder, a 154-input interrupt
+/// controller). Inputs plus outputs must fit in 255 pins, and only the first
+/// [`MAX_TRISTATE_OUTPUTS`] outputs can be tri-state.
+pub const MAX_MACRO_INPUTS: u8 = 254;
+/// Outputs of a macro that may be tri-state (the mask is 64 bits).
+pub const MAX_TRISTATE_OUTPUTS: u8 = 64;
 /// Body width limits of a macro instance (grid units).
 pub const MIN_MACRO_WIDTH: u8 = 4;
 pub const MAX_MACRO_WIDTH: u8 = 32;
@@ -59,7 +78,7 @@ pub struct MacroShape {
     /// count of a DIL package.
     pub dil: u8,
     /// Bit `k` set: output `k` is tri-state (may share a bus).
-    pub tristate: u32,
+    pub tristate: u64,
     /// DIL package pin number (1-based) of each instance pin (inputs, then
     /// outputs); unused for the automatic box.
     pub dil_pins: [u8; MAX_DIL_PINS],
@@ -88,13 +107,13 @@ impl MacroShape {
     #[must_use]
     pub const fn is_valid(&self) -> bool {
         let pins = self.inputs as usize + self.outputs as usize;
-        if self.inputs > MAX_MACRO_SIDE_PINS || self.outputs > MAX_MACRO_SIDE_PINS {
+        if self.inputs > MAX_MACRO_INPUTS || self.outputs > MAX_MACRO_INPUTS || pins > 255 {
             return false;
         }
         if self.width < MIN_MACRO_WIDTH || self.width > MAX_MACRO_WIDTH || self.width % 2 != 0 {
             return false;
         }
-        if self.outputs < 32 && self.tristate >> self.outputs != 0 {
+        if self.outputs < 64 && self.tristate >> self.outputs != 0 {
             return false;
         }
         if self.dil == 0 {
@@ -299,6 +318,212 @@ impl MemoryType {
     }
 }
 
+/// How an interactive input (switch) responds to the hand tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum SwitchMode {
+    /// Each click toggles the level (the documented default).
+    #[default]
+    Toggle,
+    /// Push button: the level is the inverse of `on` while the mouse button
+    /// is held (`on = false`: push-to-make, `on = true`: push-to-break).
+    Momentary,
+    /// Pulse input: produces a square wave with the default clock speed
+    /// ([`PULSE_HALF_PERIOD`]); `on` is the level the cycle starts with.
+    Pulse,
+}
+
+impl SwitchMode {
+    pub const ALL: [Self; 3] = [Self::Toggle, Self::Momentary, Self::Pulse];
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Toggle => "Toggle",
+            Self::Momentary => "Push button",
+            Self::Pulse => "Pulse",
+        }
+    }
+
+    #[must_use]
+    #[allow(clippy::trivially_copy_pass_by_ref, reason = "serde skip predicate signature")]
+    pub const fn is_toggle(&self) -> bool {
+        matches!(self, Self::Toggle)
+    }
+}
+
+/// Display format of a numeric output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum NumFormat {
+    /// One digit per input line (the documented default).
+    #[default]
+    Bin,
+    Hex,
+    Dec,
+}
+
+impl NumFormat {
+    pub const ALL: [Self; 3] = [Self::Bin, Self::Hex, Self::Dec];
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Bin => "Binary",
+            Self::Hex => "Hexadecimal",
+            Self::Dec => "Decimal",
+        }
+    }
+
+    #[must_use]
+    pub const fn index(self) -> u8 {
+        match self {
+            Self::Bin => 0,
+            Self::Hex => 1,
+            Self::Dec => 2,
+        }
+    }
+}
+
+/// Characters a numeric output shows for `bits` input lines in `format`
+/// (the sign column included for two's complement decimals).
+#[must_use]
+pub const fn numeric_digits(bits: u8, format: NumFormat, signed: bool) -> u8 {
+    let bits = if bits < MIN_NUMERIC_BITS {
+        MIN_NUMERIC_BITS
+    } else if bits > MAX_NUMERIC_BITS {
+        MAX_NUMERIC_BITS
+    } else {
+        bits
+    };
+    match format {
+        NumFormat::Bin => bits,
+        NumFormat::Hex => bits.div_ceil(4),
+        NumFormat::Dec => {
+            // Decimal digits of the largest magnitude.
+            let max: u32 = if signed { 1 << (bits - 1) } else { (1u32 << bits) - 1 };
+            let mut n = 1;
+            let mut v = max / 10;
+            while v > 0 {
+                n += 1;
+                v /= 10;
+            }
+            if signed { n + 1 } else { n }
+        }
+    }
+}
+
+/// Display colour of an LED, clock, sequence generator, 7-segment display,
+/// numeric output or text annotation (a small fixed palette, so the GPU
+/// instance only carries an index). `None` on a component means the
+/// kind's default colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum Color {
+    Red = 0,
+    Orange = 1,
+    Yellow = 2,
+    Lime = 3,
+    Green = 4,
+    Cyan = 5,
+    Blue = 6,
+    Navy = 7,
+    Purple = 8,
+    Magenta = 9,
+    White = 10,
+    Grey = 11,
+    Black = 12,
+    Brown = 13,
+    Olive = 14,
+    Teal = 15,
+}
+
+impl Color {
+    pub const ALL: [Self; 16] = [
+        Self::Red,
+        Self::Orange,
+        Self::Yellow,
+        Self::Lime,
+        Self::Green,
+        Self::Cyan,
+        Self::Blue,
+        Self::Navy,
+        Self::Purple,
+        Self::Magenta,
+        Self::White,
+        Self::Grey,
+        Self::Black,
+        Self::Brown,
+        Self::Olive,
+        Self::Teal,
+    ];
+
+    /// Palette index (0..16), as packed into GPU instances.
+    #[must_use]
+    pub const fn index(self) -> u8 {
+        self as u8
+    }
+
+    #[must_use]
+    pub const fn from_index(i: u8) -> Option<Self> {
+        if (i as usize) < Self::ALL.len() { Some(Self::ALL[i as usize]) } else { None }
+    }
+
+    /// Nominal sRGB value (0..=255 per channel).
+    #[must_use]
+    pub const fn rgb(self) -> [u8; 3] {
+        match self {
+            Self::Red => [255, 0, 0],
+            Self::Orange => [255, 140, 0],
+            Self::Yellow => [255, 255, 0],
+            Self::Lime => [0, 255, 0],
+            Self::Green => [0, 128, 0],
+            Self::Cyan => [0, 255, 255],
+            Self::Blue => [0, 0, 255],
+            Self::Navy => [0, 0, 128],
+            Self::Purple => [128, 0, 128],
+            Self::Magenta => [255, 0, 255],
+            Self::White => [255, 255, 255],
+            Self::Grey => [128, 128, 128],
+            Self::Black => [0, 0, 0],
+            Self::Brown => [128, 64, 0],
+            Self::Olive => [128, 128, 64],
+            Self::Teal => [0, 128, 128],
+        }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Red => "Red",
+            Self::Orange => "Orange",
+            Self::Yellow => "Yellow",
+            Self::Lime => "Lime",
+            Self::Green => "Green",
+            Self::Cyan => "Cyan",
+            Self::Blue => "Blue",
+            Self::Navy => "Navy",
+            Self::Purple => "Purple",
+            Self::Magenta => "Magenta",
+            Self::White => "White",
+            Self::Grey => "Grey",
+            Self::Black => "Black",
+            Self::Brown => "Brown",
+            Self::Olive => "Olive",
+            Self::Teal => "Teal",
+        }
+    }
+
+    /// The palette entry closest to an sRGB colour, and whether it is exact.
+    #[must_use]
+    pub fn nearest(rgb: [u8; 3]) -> (Self, bool) {
+        let d = |c: Self| -> u32 {
+            let p = c.rgb();
+            (0..3).map(|i| (i32::from(p[i]) - i32::from(rgb[i])).unsigned_abs().pow(2)).sum()
+        };
+        let best = Self::ALL.iter().copied().min_by_key(|&c| d(c)).unwrap_or(Self::Red);
+        (best, d(best) == 0)
+    }
+}
+
 /// The kind (and kind-specific parameters) of a component.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ComponentKind {
@@ -306,8 +531,13 @@ pub enum ComponentKind {
     Gate { op: GateOp, inputs: u8 },
     /// Inverter (one input, one output).
     Not,
-    /// Manual toggle switch (one output).
-    Switch { on: bool },
+    /// Interactive input (one output): a toggle switch, a push button or a
+    /// pulse input (see [`SwitchMode`]).
+    Switch {
+        on: bool,
+        #[serde(default, skip_serializing_if = "SwitchMode::is_toggle")]
+        mode: SwitchMode,
+    },
     /// Square-wave clock (one output); toggles every `half_period` ticks.
     Clock { half_period: u32 },
     /// Light-emitting diode (one input).
@@ -329,6 +559,22 @@ pub enum ComponentKind {
     Tag { dir: TagDir, tristate: bool },
     /// An instance of a macro definition (a reference, not a copy).
     Macro(MacroShape),
+    /// Fixed level source (one output): power supply (VCC, logic 1) or
+    /// ground (logic 0).
+    Const { high: bool },
+    /// Sequence generator (one output): a cyclic pattern of `len` bits
+    /// (bit `i` of `pattern` is step `i`), one step every `half_period`
+    /// ticks, like a clock (whose pattern is `01`).
+    SeqGen { pattern: u64, len: u8, half_period: u32 },
+    /// 7-segment display: inputs a … g (left to right along the bottom);
+    /// a segment lights at 1 (common cathode) or at 0 (common anode).
+    SevenSeg { common_anode: bool },
+    /// Numeric output: `bits` input lines (input `k` = bit `k`) shown in
+    /// binary, hexadecimal or decimal (two's complement if `signed`).
+    Numeric { bits: u8, format: NumFormat, signed: bool },
+    /// Text annotation (no pins): a box of `w` × `h` grid units whose text
+    /// and style live in the circuit's notes ([`crate::Note`]).
+    Text { w: u8, h: u8 },
 }
 
 /// Where a pin sits on the body edge (unrotated).
@@ -358,7 +604,14 @@ impl ComponentKind {
         match self {
             Self::Gate { inputs, .. } => *inputs,
             Self::Not | Self::Led | Self::Tag { dir: TagDir::Out, .. } => 1,
-            Self::Switch { .. } | Self::Clock { .. } | Self::Tag { dir: TagDir::In, .. } => 0,
+            Self::Switch { .. }
+            | Self::Clock { .. }
+            | Self::Tag { dir: TagDir::In, .. }
+            | Self::Const { .. }
+            | Self::SeqGen { .. }
+            | Self::Text { .. } => 0,
+            Self::SevenSeg { .. } => SEGMENTS,
+            Self::Numeric { bits, .. } => *bits,
             Self::TriState => 2,
             Self::FlipFlop { ty, preset_clear, .. } => ty.sync_inputs() + if *preset_clear { 2 } else { 0 },
             Self::Memory { ty: MemoryType::Ram, addr_bits, data_bits } => *addr_bits + *data_bits + 2,
@@ -370,7 +623,11 @@ impl ComponentKind {
     #[must_use]
     pub const fn output_count(&self) -> u8 {
         match self {
-            Self::Led | Self::Tag { dir: TagDir::Out, .. } => 0,
+            Self::Led
+            | Self::Tag { dir: TagDir::Out, .. }
+            | Self::SevenSeg { .. }
+            | Self::Numeric { .. }
+            | Self::Text { .. } => 0,
             Self::FlipFlop { .. } => 2,
             Self::Memory { data_bits, .. } => *data_bits,
             Self::Macro(m) => m.outputs,
@@ -381,6 +638,32 @@ impl ComponentKind {
     #[must_use]
     pub const fn pin_count(&self) -> u8 {
         self.input_count() + self.output_count()
+    }
+
+    /// Input levels a display shows (7-segment, numeric output): the
+    /// simulator mirrors them as extra *display signals* after the outputs,
+    /// so the renderer can colour each segment / digit from the per-pin
+    /// signal slots it already has.
+    #[must_use]
+    pub const fn display_count(&self) -> u8 {
+        match self {
+            Self::SevenSeg { .. } => SEGMENTS,
+            Self::Numeric { bits, .. } => *bits,
+            _ => 0,
+        }
+    }
+
+    /// Signal slots of a component: its outputs, then its display signals.
+    #[must_use]
+    pub const fn signal_count(&self) -> u8 {
+        self.output_count() + self.display_count()
+    }
+
+    /// Is this a primitive that the simulator evaluates or shows (not a
+    /// macro instance, tag or text annotation)?
+    #[must_use]
+    pub const fn is_primitive(&self) -> bool {
+        !matches!(self, Self::Macro(_) | Self::Tag { .. } | Self::Text { .. })
     }
 
     /// Are all outputs tri-state outputs (which may share a net with other
@@ -396,21 +679,21 @@ impl ComponentKind {
     pub const fn output_tristate(&self, k: u8) -> bool {
         match self {
             Self::TriState | Self::Memory { .. } => true,
-            Self::Macro(m) => k < 32 && m.tristate & (1 << k) != 0,
+            Self::Macro(m) => k < 64 && m.tristate & (1 << k) != 0,
             _ => false,
         }
     }
 
     /// Tri-state outputs as a bit mask (bit `k` = output `k`).
     #[must_use]
-    pub const fn tristate_mask(&self) -> u32 {
+    pub const fn tristate_mask(&self) -> u64 {
         match self {
             Self::TriState => 1,
             Self::Memory { data_bits, .. } => {
-                if *data_bits >= 32 {
-                    u32::MAX
+                if *data_bits >= 64 {
+                    u64::MAX
                 } else {
-                    (1u32 << *data_bits) - 1
+                    (1u64 << *data_bits) - 1
                 }
             }
             Self::Macro(m) => m.tristate,
@@ -423,8 +706,17 @@ impl ComponentKind {
     pub const fn size(&self) -> (i32, i32) {
         match self {
             Self::Gate { inputs, .. } => (4, 2 * (*inputs as i32)),
-            Self::Not | Self::Tag { .. } => (4, 2),
-            Self::Switch { .. } | Self::Clock { .. } | Self::Led => (2, 2),
+            Self::Not | Self::Tag { .. } | Self::SeqGen { .. } => (4, 2),
+            Self::Switch { .. } | Self::Clock { .. } | Self::Led | Self::Const { .. } => (2, 2),
+            Self::SevenSeg { .. } => (8, 12),
+            Self::Numeric { bits, format, signed } => {
+                let digits = numeric_digits(*bits, *format, *signed) as i32;
+                // About 1.2 units per digit plus margins, rounded up to even.
+                let w = (12 * digits + 9) / 10 + 3;
+                let rows = if *bits < 2 { 2 } else { *bits as i32 };
+                (w + w % 2, 2 * rows)
+            }
+            Self::Text { w, h } => (*w as i32, *h as i32),
             Self::TriState => (4, 3),
             Self::FlipFlop { ty, .. } => {
                 let h = 2 * ty.sync_inputs() as i32;
@@ -452,9 +744,23 @@ impl ComponentKind {
                 *addr_bits >= MIN_ADDR_BITS && *addr_bits <= MAX_ADDR_BITS && data_width_index(*data_bits).is_some()
             }
             Self::Macro(m) => m.is_valid(),
-            Self::Not | Self::Switch { .. } | Self::Led | Self::TriState | Self::FlipFlop { .. } | Self::Tag { .. } => {
-                true
+            Self::SeqGen { pattern, len, half_period } => {
+                *len >= 1
+                    && *len <= MAX_SEQ_LEN
+                    && (*len == MAX_SEQ_LEN || *pattern >> *len == 0)
+                    && *half_period >= 1
+                    && *half_period <= MAX_CLOCK_HALF_PERIOD
             }
+            Self::Numeric { bits, .. } => *bits >= MIN_NUMERIC_BITS && *bits <= MAX_NUMERIC_BITS,
+            Self::Text { w, h } => *w >= 1 && *h >= 1,
+            Self::Not
+            | Self::Switch { .. }
+            | Self::Led
+            | Self::TriState
+            | Self::FlipFlop { .. }
+            | Self::Tag { .. }
+            | Self::Const { .. }
+            | Self::SevenSeg { .. } => true,
         }
     }
 
@@ -474,6 +780,12 @@ impl ComponentKind {
             Self::Tag { dir: TagDir::In, .. } => "In tag",
             Self::Tag { dir: TagDir::Out, .. } => "Out tag",
             Self::Macro(_) => "Macro",
+            Self::Const { high: true } => "VCC",
+            Self::Const { high: false } => "Ground",
+            Self::SeqGen { .. } => "Sequence",
+            Self::SevenSeg { .. } => "7-segment",
+            Self::Numeric { .. } => "Numeric",
+            Self::Text { .. } => "Text",
         }
     }
 
@@ -531,6 +843,8 @@ impl ComponentKind {
                     (w, row(pin - ins))
                 }
             }
+            // Segments a … g along the bottom, one unit apart.
+            Self::SevenSeg { .. } => (1 + i32::from(pin), h),
             Self::Tag { dir: TagDir::In, .. } => (w, 1),
             Self::Tag { dir: TagDir::Out, .. } => (0, 1),
             _ => {
@@ -576,7 +890,14 @@ impl ComponentKind {
                     "out".into()
                 }
             }
-            Self::Switch { .. } | Self::Clock { .. } | Self::Tag { dir: TagDir::In, .. } => "out".into(),
+            Self::Switch { .. }
+            | Self::Clock { .. }
+            | Self::Tag { dir: TagDir::In, .. }
+            | Self::Const { .. }
+            | Self::SeqGen { .. } => "out".into(),
+            Self::SevenSeg { .. } => ["a", "b", "c", "d", "e", "f", "g"][usize::from(pin.min(6))].into(),
+            Self::Numeric { .. } => format!("D{pin}"),
+            Self::Text { .. } => String::new(),
             Self::Tag { dir: TagDir::Out, .. } => "in".into(),
             Self::Macro(m) => {
                 if pin < ins {
@@ -678,6 +999,10 @@ pub struct Component {
     pub pos: GridPos,
     #[serde(default)]
     pub rotation: Rotation,
+    /// Display colour (LEDs, clocks, sequence generators, displays, text);
+    /// `None` = the kind's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<Color>,
 }
 
 impl Component {
@@ -756,6 +1081,7 @@ mod tests {
             kind: ComponentKind::Gate { op: GateOp::And, inputs: 2 },
             pos: GridPos::new(10, 10),
             rotation: Rotation::R0,
+            color: None,
         };
         assert_eq!(c.pin_pos(0), Some(GridPos::new(10, 11)));
         assert_eq!(c.pin_pos(1), Some(GridPos::new(10, 13)));

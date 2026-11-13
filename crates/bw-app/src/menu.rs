@@ -1,6 +1,7 @@
 //! Native macOS menu bar (muda). On other platforms the egui toolbar is the
 //! only menu.
 
+use bw_core::EvalMode;
 use bw_render::SymbolStyle;
 use crossbeam_channel::Receiver;
 
@@ -26,6 +27,12 @@ pub enum MenuAction {
     PartsCentre,
     ImportMacro,
     StressMacros,
+    /// File → Import Digital Works… (`.dwm`).
+    ImportDw,
+    /// File → Import Digital Works Folder to Library…
+    ImportDwFolder,
+    /// Circuit → simulation mode.
+    EvalMode(EvalMode),
 }
 
 const ITEMS: &[(&str, MenuAction)] = &[
@@ -49,6 +56,10 @@ const ITEMS: &[(&str, MenuAction)] = &[
     ("macro.parts", MenuAction::PartsCentre),
     ("macro.import", MenuAction::ImportMacro),
     ("debug.stress_macros", MenuAction::StressMacros),
+    ("file.import_dw", MenuAction::ImportDw),
+    ("file.import_dw_folder", MenuAction::ImportDwFolder),
+    ("circuit.unit_delay", MenuAction::EvalMode(EvalMode::UnitDelay)),
+    ("circuit.sequential", MenuAction::EvalMode(EvalMode::Sequential)),
 ];
 
 pub struct NativeMenu {
@@ -57,6 +68,9 @@ pub struct NativeMenu {
     /// View → symbol style check items (ANSI, IEC).
     #[cfg(target_os = "macos")]
     style_items: (muda::CheckMenuItem, muda::CheckMenuItem),
+    /// Circuit → simulation mode check items (unit delay, sequential).
+    #[cfg(target_os = "macos")]
+    eval_items: (muda::CheckMenuItem, muda::CheckMenuItem),
     rx: Receiver<MenuAction>,
 }
 
@@ -95,6 +109,17 @@ impl NativeMenu {
         #[cfg(not(target_os = "macos"))]
         let _ = style;
     }
+
+    /// Shows which simulation mode is active.
+    pub fn sync_eval_mode(&self, mode: EvalMode) {
+        #[cfg(target_os = "macos")]
+        {
+            self.eval_items.0.set_checked(mode == EvalMode::UnitDelay);
+            self.eval_items.1.set_checked(mode == EvalMode::Sequential);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = mode;
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -126,8 +151,19 @@ fn build(ctx: &egui::Context) -> Result<NativeMenu, muda::Error> {
             &PredefinedMenuItem::separator(),
             &item("file.save", "Save", Some("CmdOrCtrl+S")),
             &item("file.save_as", "Save As…", Some("CmdOrCtrl+Shift+S")),
+            &PredefinedMenuItem::separator(),
+            &item("file.import_dw", "Import Digital Works…", Some("CmdOrCtrl+I")),
+            &item("file.import_dw_folder", "Import Digital Works Folder to Library…", None),
         ],
     )?;
+    let unit = CheckMenuItem::with_id("circuit.unit_delay", "Unit Delay Simulation", true, true, None);
+    let seq = CheckMenuItem::with_id(
+        "circuit.sequential",
+        "Sequential Simulation (Digital Works Compatible)",
+        true,
+        false,
+        None,
+    );
     let circuit = Submenu::with_items(
         "Circuit",
         true,
@@ -136,6 +172,9 @@ fn build(ctx: &egui::Context) -> Result<NativeMenu, muda::Error> {
             &item("circuit.stop", "Stop", Some("F10")),
             &item("circuit.pause", "Pause / Resume", Some("F11")),
             &item("circuit.step", "Step", Some("F12")),
+            &PredefinedMenuItem::separator(),
+            &unit,
+            &seq,
         ],
     )?;
     let macros = Submenu::with_items(
@@ -174,5 +213,5 @@ fn build(ctx: &egui::Context) -> Result<NativeMenu, muda::Error> {
             ctx.request_repaint();
         }
     }));
-    Ok(NativeMenu { _menu: menu, style_items: (ansi, iec), rx })
+    Ok(NativeMenu { _menu: menu, style_items: (ansi, iec), eval_items: (unit, seq), rx })
 }

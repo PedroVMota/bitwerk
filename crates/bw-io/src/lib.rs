@@ -26,6 +26,14 @@
 //!   false)`) and instances (`Macro((3))`, a reference by definition id).
 //!   Version 3 files load unchanged (no macros). See also [`bwmacro`] for
 //!   single-macro files.
+//! * **5** — power / ground (`Const`), sequence generators (`SeqGen`),
+//!   7-segment displays (`SevenSeg`), numeric outputs (`Numeric`), text
+//!   annotations (`Text` components and the circuit's `notes`), push-button
+//!   and pulse switches (`Switch(on, mode: Momentary | Pulse)`), display
+//!   colours (`color` on a component) and the simulation mode (`eval:
+//!   Sequential`, the Digital Works compatible propagation). Every addition
+//!   has a default, so version 4 files load unchanged; a version 4 file
+//!   using any of them is refused.
 //!
 //! Loading treats every file as hostile input: the size is capped *before*
 //! reading, RON nesting depth is bounded, object counts are bounded, and the
@@ -56,7 +64,7 @@ use thiserror::Error;
 /// Magic string identifying a bitwerk project.
 pub const FORMAT_MAGIC: &str = "bitwerk";
 /// Current (and highest understood) format version.
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 /// Oldest version that can still be loaded (and is migrated).
 pub const OLDEST_VERSION: u32 = 1;
 /// Maximum accepted file size in bytes.
@@ -105,6 +113,8 @@ pub enum IoError {
     FeatureNotInVersion { version: u32, feature: &'static str },
     #[error("legacy .dwm files are not yet supported")]
     LegacyNotSupported,
+    #[error("Digital Works file: {0}")]
+    Dwm(String),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -346,6 +356,12 @@ pub fn load_from_bytes(bytes: &[u8]) -> Result<Project, IoError> {
                 return Err(IoError::FeatureNotInVersion { version: header.version, feature });
             }
         }
+        if header.version < 5 {
+            let bodies = file.macros.iter().map(|m| &m.body);
+            if let Some(feature) = std::iter::once(&file.circuit).chain(bodies).find_map(v5_feature) {
+                return Err(IoError::FeatureNotInVersion { version: header.version, feature });
+            }
+        }
         check_raw_limits(&file.circuit)?;
         let table = build_table(file.macros)?;
         let circuit = Circuit::from_raw(file.circuit, &table, false).map_err(|e| IoError::Parse(e.to_string()))?;
@@ -360,6 +376,32 @@ pub fn load_from_bytes(bytes: &[u8]) -> Result<Project, IoError> {
     };
     check_limits(&project.circuit, &project.name)?;
     Ok(project)
+}
+
+/// Format 5 additions used by a circuit (see the version history).
+pub(crate) fn v5_feature(c: &CircuitRaw) -> Option<&'static str> {
+    if !c.notes.is_empty() {
+        return Some("text annotations");
+    }
+    if c.eval != bw_core::EvalMode::UnitDelay {
+        return Some("the sequential simulation mode");
+    }
+    c.components.iter().find_map(|k| {
+        if k.color.is_some() {
+            return Some("display colours");
+        }
+        match k.kind {
+            ComponentKind::Const { .. } => Some("power / ground"),
+            ComponentKind::SeqGen { .. } => Some("sequence generators"),
+            ComponentKind::SevenSeg { .. } => Some("7-segment displays"),
+            ComponentKind::Numeric { .. } => Some("numeric outputs"),
+            ComponentKind::Text { .. } => Some("text annotations"),
+            ComponentKind::Switch { mode, .. } if mode != bw_core::SwitchMode::Toggle => {
+                Some("push-button and pulse switches")
+            }
+            _ => None,
+        }
+    })
 }
 
 /// Format 4 component kinds used by a circuit (macro tags or instances).
@@ -415,8 +457,10 @@ fn upgrade_wires(version: u32, legacy: LegacyCircuit) -> Result<Circuit, IoError
 ///
 /// Version 2 → 3 (wires to a wire graph) happens while parsing, see
 /// `upgrade_wires`. Version 3 → 4 adds macros and needs no change (a
-/// version 3 file using format 4 kinds is refused). Saving writes
-/// version 4.
+/// version 3 file using format 4 kinds is refused). Version 4 → 5 adds
+/// kinds, colours, notes and the simulation mode, all with defaults (a
+/// version 4 file using them is refused while parsing). Saving writes
+/// version 5.
 ///
 /// # Errors
 /// [`IoError::FeatureNotInVersion`] for a version 1 file with version 2 content.
@@ -435,7 +479,7 @@ pub fn migrate(version: u32, project: Project) -> Result<Project, IoError> {
     Ok(project)
 }
 
-fn check_limits(c: &Circuit, name: &str) -> Result<(), IoError> {
+pub(crate) fn check_limits(c: &Circuit, name: &str) -> Result<(), IoError> {
     if c.component_count() > MAX_COMPONENTS {
         return Err(IoError::LimitExceeded { what: "components", limit: MAX_COMPONENTS });
     }
@@ -553,7 +597,13 @@ mod tests {
 
     fn sample() -> Project {
         let mut c = Circuit::new();
-        let s = c.add_component(ComponentKind::Switch { on: true }, GridPos::new(0, 0), Rotation::R0).unwrap();
+        let s = c
+            .add_component(
+                ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle },
+                GridPos::new(0, 0),
+                Rotation::R0,
+            )
+            .unwrap();
         let g = c
             .add_component(ComponentKind::Gate { op: GateOp::Xor, inputs: 2 }, GridPos::new(6, 0), Rotation::R90)
             .unwrap();
@@ -576,7 +626,7 @@ mod tests {
     fn roundtrip() {
         let p = sample();
         let text = save_to_string(&p).unwrap();
-        assert!(text.contains("version: 4") && text.contains("Free((") && text.contains("segments:"), "{text}");
+        assert!(text.contains("version: 5") && text.contains("Free((") && text.contains("segments:"), "{text}");
         let q = load_from_bytes(text.as_bytes()).unwrap();
         assert_eq!(q.name, "sample");
         assert_eq!(q.circuit.component_count(), 3);
@@ -592,7 +642,7 @@ mod tests {
         let text = save_to_string(&p).unwrap();
         let wrong = text.replace("\"bitwerk\"", "\"other\"");
         assert!(matches!(load_from_bytes(wrong.as_bytes()), Err(IoError::NotABitwerkFile)));
-        let future = text.replace("version: 4", "version: 99");
+        let future = text.replace("version: 5", "version: 99");
         assert!(matches!(load_from_bytes(future.as_bytes()), Err(IoError::UnsupportedVersion { found: 99 })));
     }
 
@@ -747,8 +797,8 @@ mod tests {
     }
 
     #[test]
-    fn dwm_is_not_supported_yet() {
-        assert!(matches!(dwm::load(b"anything"), Err(IoError::LegacyNotSupported)));
+    fn dwm_garbage_is_a_clean_error() {
+        assert!(matches!(dwm::load(b"anything"), Err(IoError::Dwm(_))));
     }
 }
 
@@ -832,9 +882,12 @@ mod migration {
         let (mut v1, mut v2) = (0, 0);
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "bitwerk") {
+                continue;
+            }
             let text = std::fs::read_to_string(&path).unwrap();
-            if text.contains("version: 3,") {
-                continue; // see v3_fixtures_migrate_to_v4
+            if text.contains("version: 3,") || text.contains("version: 4,") {
+                continue; // see v3_fixtures_migrate_to_v4 / v4_fixtures_migrate_to_v5
             }
             if text.contains("version: 1,") {
                 v1 += 1;
@@ -989,6 +1042,9 @@ mod v4 {
         let mut n = 0;
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "bitwerk") {
+                continue;
+            }
             let text = std::fs::read_to_string(&path).unwrap();
             if !text.contains("version: 3,") {
                 continue;
@@ -998,7 +1054,7 @@ mod v4 {
             p.circuit.check().unwrap();
             assert_eq!(p.circuit.component_count(), text.matches("kind:").count());
             let saved = crate::save_to_string(&p).unwrap();
-            assert!(saved.contains("version: 4") && !saved.contains("macros:"), "no macro table without macros");
+            assert!(saved.contains("version: 5") && !saved.contains("macros:"), "no macro table without macros");
             let q = crate::load_from_bytes(saved.as_bytes()).unwrap();
             assert_eq!(q.circuit.components().collect::<Vec<_>>(), p.circuit.components().collect::<Vec<_>>());
             assert_eq!(nets(&q.circuit), nets(&p.circuit));
@@ -1020,7 +1076,13 @@ mod v4 {
         }
         let shape = c.macros().get(root).unwrap().shape;
         let inst = c.add_component(ComponentKind::Macro(shape), GridPos::new(20, 0), Rotation::R0).unwrap();
-        let s = c.add_component(ComponentKind::Switch { on: true }, GridPos::new(0, 0), Rotation::R0).unwrap();
+        let s = c
+            .add_component(
+                ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle },
+                GridPos::new(0, 0),
+                Rotation::R0,
+            )
+            .unwrap();
         c.apply(&Edit::AddWire {
             from: WireEnd::Pin(PinRef { component: s, pin: 0 }),
             to: WireEnd::Pin(PinRef { component: inst, pin: 3 }),
@@ -1043,7 +1105,7 @@ mod v4 {
         }
         q.circuit.check().unwrap();
         // A format 3 file may not use macros.
-        let old = text.replace("version: 4", "version: 3");
+        let old = text.replace("version: 5", "version: 3");
         assert!(matches!(crate::load_from_bytes(old.as_bytes()), Err(crate::IoError::FeatureNotInVersion { .. })));
     }
 
@@ -1056,7 +1118,8 @@ mod v4 {
         assert_eq!(bwmacro::save_to_string(&f.table, f.root).unwrap(), text);
         let bad = |t: &str| bwmacro::load_from_bytes(t.as_bytes()).is_err();
         assert!(bad(&text.replace("bitwerk-macro", "bitwerk")), "magic");
-        assert!(bad(&text.replace("version: 1,", "version: 2,")), "version");
+        assert!(bad(&text.replace("version: 2,", "version: 3,")), "version");
+        assert!(!bad(&text.replace("version: 2,", "version: 1,")), "version 1 still loads");
         assert!(bad(&text.replace("root: (", "root: (9")), "unknown root");
         assert!(bad("garbage"));
         assert!(bad(&"(".repeat(5000)), "deep nesting");
@@ -1086,5 +1149,104 @@ mod v4 {
             }
         }
         assert!(accepted < 400);
+    }
+}
+
+/// Format 5: new kinds, colours, notes and the simulation mode.
+#[cfg(test)]
+mod v5 {
+    use bw_core::{
+        Circuit, Color, ComponentKind, Edit, EvalMode, GridPos, Note, NumFormat, PinRef, Rotation, SwitchMode,
+    };
+
+    fn bitwerk_fixtures(version: &str) -> Vec<(std::path::PathBuf, String)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let mut v: Vec<(std::path::PathBuf, String)> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                if p.extension().is_none_or(|x| x != "bitwerk") {
+                    return None;
+                }
+                let t = std::fs::read_to_string(&p).ok()?;
+                t.contains(&format!("version: {version},")).then_some((p, t))
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The format 4 fixtures (saved by the previous version, before format
+    /// 5 existed) load with the same components, nets and macros, save as
+    /// format 5 and load back identically.
+    #[test]
+    fn v4_fixtures_migrate_to_v5() {
+        let files = bitwerk_fixtures("4");
+        assert_eq!(files.len(), 5, "five format 4 fixtures");
+        for (path, _) in files {
+            let p = crate::load_from_path(&path).unwrap();
+            p.circuit.check().unwrap();
+            let saved = crate::save_to_string(&p).unwrap();
+            assert!(saved.contains("version: 5,"), "{}", path.display());
+            let q = crate::load_from_bytes(saved.as_bytes()).unwrap();
+            assert!(q.circuit.content_eq(&p.circuit), "{}", path.display());
+            assert_eq!(q.circuit.macros().len(), p.circuit.macros().len());
+            for (id, e) in p.circuit.macros().iter() {
+                assert_eq!(q.circuit.macros().get(id).map(|x| x.hash), Some(e.hash), "macro hashes are stable");
+            }
+            assert_eq!(crate::save_to_string(&q).unwrap(), saved);
+        }
+    }
+
+    fn project() -> crate::Project {
+        let mut c = Circuit::new();
+        let add = |c: &mut Circuit, kind, x| c.add_component(kind, GridPos::new(x, 0), Rotation::R0).unwrap();
+        let vcc = add(&mut c, ComponentKind::Const { high: true }, 0);
+        add(&mut c, ComponentKind::Const { high: false }, 4);
+        add(&mut c, ComponentKind::SeqGen { pattern: 0b1011, len: 4, half_period: 3 }, 8);
+        let seg = add(&mut c, ComponentKind::SevenSeg { common_anode: true }, 14);
+        add(&mut c, ComponentKind::Numeric { bits: 8, format: NumFormat::Dec, signed: true }, 24);
+        add(&mut c, ComponentKind::Switch { on: true, mode: SwitchMode::Momentary }, 40);
+        add(&mut c, ComponentKind::Switch { on: false, mode: SwitchMode::Pulse }, 44);
+        let led = add(&mut c, ComponentKind::Led, 48);
+        let text = add(&mut c, ComponentKind::Text { w: 1, h: 1 }, 52);
+        c.apply(&Edit::SetColor(led, Some(Color::Blue))).unwrap();
+        c.apply(&Edit::SetColor(seg, Some(Color::Lime))).unwrap();
+        let note = Note { text: "Hello\nworld Ā".into(), height: 20, bold: true, italic: true, overbar: true };
+        c.apply(&Edit::SetNote { id: text, note: note.clone() }).unwrap();
+        c.apply(&Edit::SetEvalMode(EvalMode::Sequential)).unwrap();
+        c.connect(PinRef { component: vcc, pin: 0 }, PinRef { component: seg, pin: 0 }, vec![]).unwrap();
+        assert_eq!(c.component(text).unwrap().kind, note.kind(), "the box follows the note");
+        crate::Project { name: "v5".into(), circuit: c }
+    }
+
+    #[test]
+    fn new_features_round_trip() {
+        let p = project();
+        let text = crate::save_to_string(&p).unwrap();
+        let q = crate::load_from_bytes(text.as_bytes()).unwrap();
+        assert!(q.circuit.content_eq(&p.circuit));
+        assert_eq!(q.circuit.eval_mode(), EvalMode::Sequential);
+        assert_eq!(crate::save_to_string(&q).unwrap(), text);
+        // The same file claiming to be format 4 is refused.
+        let old = text.replacen("version: 5,", "version: 4,", 1);
+        assert!(matches!(crate::load_from_bytes(old.as_bytes()), Err(crate::IoError::FeatureNotInVersion { .. })));
+    }
+
+    #[test]
+    fn bad_notes_and_kinds_are_refused() {
+        let text = crate::save_to_string(&project()).unwrap();
+        for (from, to) in [
+            ("height: 20", "height: 0"),
+            ("len: 4", "len: 0"),
+            ("len: 4", "len: 65"),
+            ("bits: 8", "bits: 1"),
+            ("bits: 8", "bits: 17"),
+            ("\"Hello", "\"\\u{7}Hello"),
+        ] {
+            assert!(text.contains(from), "{from}");
+            let t = text.replacen(from, to, 1);
+            assert!(crate::load_from_bytes(t.as_bytes()).is_err(), "{from} -> {to} accepted");
+        }
     }
 }

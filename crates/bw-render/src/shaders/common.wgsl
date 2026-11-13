@@ -83,9 +83,16 @@ fn level_color(lvl: u32) -> vec3<f32> {
 
 // kind code: 0..5 gates (AND OR NAND NOR XOR XNOR), 6 NOT, 7 switch, 8 clock,
 // 9 LED, 10 tri-state, 11..13 D / RS / JK flip-flops, 14 RAM, 15 ROM,
-// 16 macro tag, 17 macro instance, 18 junction dot (mirrors
-// SymbolKind::accent).
-const JUNCTION_CODE: u32 = 18u;
+// 16 macro tag, 17 macro instance, 18 VCC / ground, 19 sequence generator,
+// 20 7-segment display, 21 numeric output, 22 text, 23 junction dot
+// (mirrors symbols::SymbolKind::code and ::accent).
+const MACRO_CODE: u32 = 17u;
+const CONST_CODE: u32 = 18u;
+const SEQ_CODE: u32 = 19u;
+const SEVEN_SEG_CODE: u32 = 20u;
+const NUMERIC_CODE: u32 = 21u;
+const TEXT_CODE: u32 = 22u;
+const JUNCTION_CODE: u32 = 23u;
 fn kind_accent(kind: u32) -> vec3<f32> {
     switch kind {
         case 0u, 2u: { return vec3<f32>(0.35, 0.62, 0.95); }
@@ -93,14 +100,62 @@ fn kind_accent(kind: u32) -> vec3<f32> {
         case 4u, 5u: { return vec3<f32>(0.70, 0.45, 0.95); }
         case 6u, 10u: { return vec3<f32>(0.85, 0.85, 0.40); }
         case 7u: { return vec3<f32>(0.40, 0.85, 0.55); }
-        case 8u: { return vec3<f32>(0.40, 0.85, 0.85); }
+        case 8u, 19u: { return vec3<f32>(0.40, 0.85, 0.85); }
         case 11u, 12u, 13u: { return vec3<f32>(0.95, 0.55, 0.78); }
         case 14u, 15u: { return vec3<f32>(0.55, 0.78, 0.95); }
         case 16u: { return vec3<f32>(0.95, 0.80, 0.35); }
         case 17u: { return vec3<f32>(0.78, 0.78, 0.84); }
-        case 18u: { return vec3<f32>(0.45, 0.50, 0.58); }
+        case 18u: { return vec3<f32>(0.92, 0.66, 0.38); }
+        case 22u: { return vec3<f32>(0.80, 0.82, 0.86); }
+        case 23u: { return vec3<f32>(0.45, 0.50, 0.58); }
         default: { return vec3<f32>(0.95, 0.35, 0.35); }
     }
+}
+
+// Default display colour of a kind (mirrors symbols::SymbolKind::ink).
+fn kind_ink(kind: u32) -> vec3<f32> {
+    switch kind {
+        case 19u, 20u: { return vec3<f32>(0.95, 0.35, 0.35); }
+        case 21u, 22u: { return vec3<f32>(0.86, 0.88, 0.92); }
+        default: { return kind_accent(kind); }
+    }
+}
+
+// Display colours of the 16-entry palette (mirrors symbols::palette_rgb;
+// black is drawn as the default foreground on the dark canvas).
+fn palette_color(i: u32) -> vec3<f32> {
+    // A switch, not a local array: no per-invocation table copy.
+    switch i & 15u {
+        case 0u: { return vec3<f32>(0.95, 0.25, 0.22); }
+        case 1u: { return vec3<f32>(1.00, 0.58, 0.12); }
+        case 2u: { return vec3<f32>(0.98, 0.92, 0.20); }
+        case 3u: { return vec3<f32>(0.45, 0.98, 0.30); }
+        case 4u: { return vec3<f32>(0.18, 0.72, 0.28); }
+        case 5u: { return vec3<f32>(0.25, 0.92, 0.95); }
+        case 6u: { return vec3<f32>(0.32, 0.48, 1.00); }
+        case 7u: { return vec3<f32>(0.32, 0.38, 0.82); }
+        case 8u: { return vec3<f32>(0.70, 0.38, 0.88); }
+        case 9u: { return vec3<f32>(0.98, 0.32, 0.92); }
+        case 10u: { return vec3<f32>(1.00, 1.00, 1.00); }
+        case 11u: { return vec3<f32>(0.62, 0.63, 0.66); }
+        case 12u: { return vec3<f32>(0.86, 0.88, 0.92); }
+        case 13u: { return vec3<f32>(0.74, 0.47, 0.22); }
+        case 14u: { return vec3<f32>(0.68, 0.68, 0.34); }
+        default: { return vec3<f32>(0.16, 0.70, 0.68); }
+    }
+}
+
+// Display colour of an instance: its palette colour (packed kind: flag 16 |
+// index, at bits 18..23, or 8..13 for text), else the kind's default.
+fn inst_ink(kind: u32, code: u32) -> vec3<f32> {
+    var c = (kind >> 18u) & 31u;
+    if (code == TEXT_CODE) {
+        c = (kind >> 8u) & 31u;
+    }
+    if (code == MACRO_CODE || (c & 16u) == 0u) {
+        return kind_ink(code);
+    }
+    return palette_color(c & 15u);
 }
 
 // Wires are 0.12 grid units wide, but never thinner than 1 physical pixel.

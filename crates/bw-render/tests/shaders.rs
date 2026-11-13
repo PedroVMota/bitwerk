@@ -29,7 +29,13 @@ fn cull_shaders_parse_and_validate() {
 fn scene_build_and_query() {
     use bw_core::{Circuit, ComponentKind, GateOp, GridPos, PinRef, Rotation};
     let mut c = Circuit::new();
-    let s = c.add_component(ComponentKind::Switch { on: true }, GridPos::new(0, 0), Rotation::R0).unwrap();
+    let s = c
+        .add_component(
+            ComponentKind::Switch { on: true, mode: bw_core::SwitchMode::Toggle },
+            GridPos::new(0, 0),
+            Rotation::R0,
+        )
+        .unwrap();
     let g = c
         .add_component(ComponentKind::Gate { op: GateOp::And, inputs: 2 }, GridPos::new(100, 0), Rotation::R0)
         .unwrap();

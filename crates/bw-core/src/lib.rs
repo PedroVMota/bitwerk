@@ -23,15 +23,20 @@ mod component;
 mod geom;
 pub mod macros;
 pub mod memenc;
+pub mod note;
 pub mod stress;
 pub mod wiring;
 
-pub use circuit::{Applied, Circuit, CircuitError, CircuitRaw, Edit, MAX_WIRE_VERTICES, MemoryImage, MemoryRecord};
+pub use circuit::{
+    Applied, Circuit, CircuitError, CircuitRaw, Edit, EvalMode, MAX_WIRE_VERTICES, MemoryImage, MemoryRecord,
+    NoteRecord,
+};
 pub use component::{
-    Component, ComponentId, ComponentKind, DATA_WIDTHS, DIL_SIZES, FfTrigger, FlipFlopType, GateOp, MAX_ADDR_BITS,
-    MAX_CLOCK_HALF_PERIOD, MAX_DIL_PINS, MAX_GATE_INPUTS, MAX_MACRO_SIDE_PINS, MAX_MACRO_WIDTH, MAX_MEMORY_WORDS,
-    MIN_ADDR_BITS, MIN_GATE_INPUTS, MIN_MACRO_WIDTH, MacroId, MacroShape, MemoryType, PinDir, PinRef, PinSide,
-    Rotation, TagDir, data_width_index,
+    Color, Component, ComponentId, ComponentKind, DATA_WIDTHS, DIL_SIZES, FfTrigger, FlipFlopType, GateOp,
+    MAX_ADDR_BITS, MAX_CLOCK_HALF_PERIOD, MAX_DIL_PINS, MAX_GATE_INPUTS, MAX_MACRO_INPUTS, MAX_MACRO_SIDE_PINS,
+    MAX_MACRO_WIDTH, MAX_MEMORY_WORDS, MAX_NUMERIC_BITS, MAX_SEQ_LEN, MAX_TRISTATE_OUTPUTS, MIN_ADDR_BITS,
+    MIN_GATE_INPUTS, MIN_MACRO_WIDTH, MIN_NUMERIC_BITS, MacroId, MacroShape, MemoryType, NumFormat, PULSE_HALF_PERIOD,
+    PinDir, PinRef, PinSide, Rotation, SEGMENTS, SwitchMode, TagDir, data_width_index, numeric_digits,
 };
 pub use geom::{GridPos, GridRect};
 pub use macros::{
@@ -39,4 +44,5 @@ pub use macros::{
     MAX_MACRO_DEPTH, MAX_MACRO_NAME, MAX_PIN_NAME, MacroDef, MacroEntry, MacroPin, MacroPlan, MacroTable, Package,
     PlanTarget, pin_remap, run_macro_plan,
 };
+pub use note::Note;
 pub use wiring::{Nets, NodeAt, NodeId, NodeRecord, Segment, SegmentId, SegmentRecord, WireEnd, WireNode};

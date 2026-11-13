@@ -9,8 +9,12 @@
 //! an edit costs microseconds instead of a full rebuild.
 //!
 //! Net levels are addressed by *signal slot*: every output pin of a
-//! component owns one, and a component's signal slots are contiguous (the
-//! body's `net` field is the first; output `k` is `net + k`). A segment's
+//! component owns one, and so does every *display signal* of a display
+//! (the input levels a 7-segment display or numeric output shows, mirrored
+//! by the simulator after the outputs; see
+//! [`bw_core::ComponentKind::signal_count`]). A component's signal slots are
+//! contiguous (the body's `net` field is the first; signal `k` is
+//! `net + k`). A segment's
 //! `net` (and a junction dot's, and an LED body's) is the signal slot of the
 //! driver of its wire net — its smallest output pin, or [`NO_NET`] for an
 //! undriven net (drawn as floating). Signal slots are as stable as body
@@ -19,6 +23,11 @@
 //! renderer maps the simulator's nets onto signal slots through the output
 //! pins driving each net (several on a tri-state bus).
 //!
+//! Text annotations also own a *note slot* (1 ..= [`MAX_NOTE_SLOT`], packed
+//! in their body kind) with a copy of their note: the renderer keeps one
+//! mesh per note slot and rebuilds only the notes listed by
+//! [`Scene::take_dirty_notes`].
+//!
 //! A full [`Scene::build`] is only needed when a whole circuit is replaced
 //! (file load, stress test); it runs on a worker thread.
 
@@ -26,14 +35,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bw_core::{
-    Applied, Circuit, Component, ComponentId, ComponentKind, GridPos, NodeId, PinDir, PinRef, Rotation, SegmentId,
+    Applied, Circuit, Component, ComponentId, ComponentKind, GridPos, NodeId, Note, PinDir, PinRef, Rotation, SegmentId,
 };
 use bytemuck::{Pod, Zeroable};
 use glam::Vec2;
 use rstar::primitives::{GeomWithData, Rectangle};
 use rstar::{AABB, RTree};
 
-use crate::symbols::SymbolKind;
+use crate::symbols::{SymbolKind, takes_color};
 
 /// "No net" marker shared with the shaders.
 pub const NO_NET: u32 = u32::MAX;
@@ -47,14 +56,17 @@ pub const WIRE_HIDDEN: u32 = 1;
 pub struct BodyInstance {
     pub min: [f32; 2],
     pub size: [f32; 2],
-    /// Packed: kind code (bits 0..8, see [`kind_code`]), mesh variant
-    /// (8..16: gate input count, flip-flop trigger, memory size, tag
-    /// direction), rotation (16..18) and, for macro instances, the
-    /// definition id (18..32: its mesh in the per-definition table);
-    /// [`HIDDEN_KIND`] for a free slot. See [`body_kind`].
+    /// Packed: kind code (bits 0..8, see [`kind_code`]), variant (8..16:
+    /// gate input count, flip-flop trigger, memory size, tag direction,
+    /// switch mode, VCC / ground, 7-segment polarity, numeric layout; for
+    /// text the colour field), rotation (16..18) and bits 18..32: the
+    /// definition id of a macro instance (its mesh in the per-definition
+    /// table), the note slot of a text annotation, or else the colour field
+    /// (bits 18..23). [`HIDDEN_KIND`] for a free slot. See [`body_kind`].
     pub kind: u32,
-    /// First signal slot of the body's outputs (output `k` is `net + k`),
-    /// or for an LED the signal slot driving it, or [`NO_NET`].
+    /// First signal slot of the body's outputs and display signals (signal
+    /// `k` is `net + k`), or for an LED the signal slot driving it, or
+    /// [`NO_NET`].
     pub net: u32,
 }
 
@@ -133,11 +145,25 @@ const NO_SLOT: u32 = u32::MAX;
 /// Shader kind code of a component (one GPU draw bucket per code).
 #[must_use]
 pub fn kind_code(kind: &ComponentKind) -> u32 {
-    SymbolKind::of(kind).code().unwrap_or(0)
+    SymbolKind::of(kind).code()
 }
 
+/// Colour field of a packed body kind: [`COLOR_FLAG`] | palette index, or
+/// 0 for the kind's default colour.
+pub const COLOR_FLAG: u32 = 0x10;
+/// Bit position of the colour field (all kinds but macros and text).
+pub const COLOR_SHIFT: u32 = 18;
+/// Bit position of the colour field of text annotations (their variant
+/// byte; bits 18..32 hold the note slot).
+pub const TEXT_COLOR_SHIFT: u32 = 8;
+/// Bit position of a text annotation's note slot.
+pub const NOTE_SHIFT: u32 = 18;
+/// Largest note slot (14 bits; 0 = no note mesh).
+pub const MAX_NOTE_SLOT: u32 = (1 << 14) - 1;
+
 /// Packed `kind` field of a component's body instance: the shader picks the
-/// symbol mesh (kind × variant × style) and the rotation from it.
+/// symbol mesh (kind × variant × style), the rotation and the display
+/// colour from it. A text annotation's note slot is added by the scene.
 #[must_use]
 pub fn body_kind(c: &Component) -> u32 {
     let rot = match c.rotation {
@@ -147,11 +173,14 @@ pub fn body_kind(c: &Component) -> u32 {
         Rotation::R270 => 3,
     };
     let sym = SymbolKind::of(&c.kind);
-    let def = match c.kind {
-        ComponentKind::Macro(s) => s.def.0.min(MAX_MACRO_SLOT) << 18,
-        _ => 0,
+    let color = c.color.filter(|_| takes_color(&c.kind)).map_or(0, |col| COLOR_FLAG | u32::from(col.index()));
+    let (variant, high) = match c.kind {
+        ComponentKind::Macro(s) => (sym.variant(), s.def.0.min(MAX_MACRO_SLOT) << 18),
+        ComponentKind::Text { .. } => (color, 0),
+        ComponentKind::SevenSeg { common_anode } => (u32::from(common_anode), color << COLOR_SHIFT),
+        _ => (sym.variant(), color << COLOR_SHIFT),
     };
-    sym.code().unwrap_or(0) | ((sym.variant() & 0xff) << 8) | (rot << 16) | def
+    sym.code() | ((variant & 0xff) << 8) | (rot << 16) | high
 }
 
 /// Largest macro definition id the packed body kind can hold (14 bits).
@@ -160,7 +189,12 @@ pub const MAX_MACRO_SLOT: u32 = (1 << 14) - 1;
 /// Packed `kind` of a junction dot.
 #[must_use]
 pub fn junction_kind() -> u32 {
-    SymbolKind::Junction.code().unwrap_or(0)
+    SymbolKind::Junction.code()
+}
+
+/// Body kind of a text annotation with note slot `slot`.
+fn with_note(kind: u32, slot: u32) -> u32 {
+    (kind & !(MAX_NOTE_SLOT << NOTE_SHIFT)) | (slot.min(MAX_NOTE_SLOT) << NOTE_SHIFT)
 }
 
 /// Signal slot range of a body: `start..start + len` (`len` = outputs).
@@ -224,7 +258,7 @@ pub struct Scene {
     /// Body slot of each junction dot, by node id.
     dot_slot: Vec<u32>,
     dots: usize,
-    /// Signal slots of each body slot's outputs.
+    /// Signal slots of each body slot's outputs and display signals.
     body_sig: Vec<SigRange>,
     /// Free signal ranges, by length.
     sig_free: Vec<Vec<u32>>,
@@ -243,6 +277,12 @@ pub struct Scene {
     /// World bounds of everything (`min`, `max`); grows with edits and is
     /// recomputed exactly by a full build.
     bounds: (Vec2, Vec2),
+    /// Note of each note slot (index 0 unused) and its annotation.
+    notes: Vec<Option<(ComponentId, Note)>>,
+    note_of: HashMap<ComponentId, u32>,
+    note_free: Vec<u32>,
+    /// Note slots whose mesh must be rebuilt (or dropped) by the renderer.
+    note_dirty: Vec<u32>,
 }
 
 impl std::fmt::Debug for Scene {
@@ -312,6 +352,10 @@ impl Scene {
             dirty: Dirty::default(),
             layout: 0,
             bounds: (Vec2::ZERO, Vec2::ZERO),
+            notes: vec![None],
+            note_of: HashMap::new(),
+            note_free: Vec::new(),
+            note_dirty: Vec::new(),
         }
     }
 
@@ -335,9 +379,14 @@ impl Scene {
 
         for c in circuit.components() {
             let slot = slot_u32(s.bodies.len());
-            let sig = s.alloc_sig(c.kind.output_count());
+            let sig = s.alloc_sig(c.kind.signal_count());
             s.body_sig.push(sig);
-            let b = body_geom(c, body_kind(c), sig.start);
+            let mut kind = body_kind(c);
+            if matches!(c.kind, ComponentKind::Text { .. }) {
+                let note = s.alloc_note(c.id, circuit.note(c.id).cloned().unwrap_or_default());
+                kind = with_note(kind, note);
+            }
+            let b = body_geom(c, kind, sig.start);
             entries.push(Entry::new(b.rect(), Item::Body(slot)));
             lo = lo.min(Vec2::from(b.min));
             hi = hi.max(Vec2::from(b.min) + Vec2::from(b.size));
@@ -411,6 +460,8 @@ impl Scene {
         }
         s.bounds = (lo, hi);
         s.tree = RTree::bulk_load(entries);
+        // A renderer meeting a new scene builds every note mesh anyway.
+        s.note_dirty.clear();
         s
     }
 
@@ -483,7 +534,8 @@ impl Scene {
         self.wire_owner.get(slot as usize).copied().flatten()
     }
 
-    /// Signal slot of output `k` (0-based among the outputs) of a component.
+    /// Signal slot of signal `k` of a component: output `k` for
+    /// `k < output_count`, then the display signals.
     #[must_use]
     pub fn signal_slot(&self, id: ComponentId, k: u8) -> Option<u32> {
         let slot = *self.body_slot.get(&id)?;
@@ -534,6 +586,70 @@ impl Scene {
     /// Takes the slots changed since the last call.
     pub fn take_dirty(&mut self) -> Dirty {
         std::mem::take(&mut self.dirty)
+    }
+
+    /// Takes the note slots whose annotation appeared, changed or went
+    /// away since the last call (in order; a slot may repeat).
+    pub fn take_dirty_notes(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.note_dirty)
+    }
+
+    /// The note shown in a note slot (`None`: free).
+    #[must_use]
+    pub fn note_at(&self, slot: u32) -> Option<&Note> {
+        self.notes.get(slot as usize).and_then(Option::as_ref).map(|(_, n)| n)
+    }
+
+    /// Every live note slot with its note.
+    pub fn note_slots(&self) -> impl Iterator<Item = (u32, &Note)> {
+        self.notes.iter().enumerate().filter_map(|(i, n)| n.as_ref().map(|(_, n)| (slot_u32(i), n)))
+    }
+
+    /// Note slot of a text annotation (`None`: not a text, or every slot is
+    /// taken and it draws the generic text symbol).
+    #[must_use]
+    pub fn note_slot(&self, id: ComponentId) -> Option<u32> {
+        self.note_of.get(&id).copied()
+    }
+
+    /// Assigns a note slot to an annotation (0 when they are exhausted).
+    fn alloc_note(&mut self, id: ComponentId, note: Note) -> u32 {
+        let slot = if let Some(s) = self.note_free.pop() {
+            s
+        } else if self.notes.len() <= MAX_NOTE_SLOT as usize {
+            self.notes.push(None);
+            slot_u32(self.notes.len() - 1)
+        } else {
+            return 0;
+        };
+        self.notes[slot as usize] = Some((id, note));
+        self.note_of.insert(id, slot);
+        self.note_dirty.push(slot);
+        slot
+    }
+
+    fn free_note(&mut self, id: ComponentId) {
+        if let Some(slot) = self.note_of.remove(&id) {
+            self.notes[slot as usize] = None;
+            self.note_free.push(slot);
+            self.note_dirty.push(slot);
+        }
+    }
+
+    /// Note slot of a text annotation, with its note brought up to date.
+    fn sync_note(&mut self, circuit: &Circuit, id: ComponentId) -> u32 {
+        let note = circuit.note(id).cloned().unwrap_or_default();
+        match self.note_of.get(&id).copied() {
+            Some(slot) => {
+                let entry = &mut self.notes[slot as usize];
+                if entry.as_ref().is_none_or(|(_, n)| *n != note) {
+                    *entry = Some((id, note));
+                    self.note_dirty.push(slot);
+                }
+                slot
+            }
+            None => self.alloc_note(id, note),
+        }
     }
 
     // ---- queries ---------------------------------------------------------
@@ -716,7 +832,8 @@ impl Scene {
     }
 
     fn set_led_net(&mut self, circuit: &Circuit, id: ComponentId, net: u32) {
-        let is_led = circuit.component(id).is_some_and(|c| c.kind.output_count() == 0);
+        // Bodies without signals of their own show the net at their input.
+        let is_led = circuit.component(id).is_some_and(|c| c.kind.signal_count() == 0);
         if let (true, Some(&slot)) = (is_led, self.body_slot.get(&id)) {
             self.set_body_net(slot, net);
         }
@@ -835,26 +952,33 @@ impl Scene {
                 self.body_slot.insert(id, s);
                 (s, true)
             };
-            // (Re)assign the signal range if the output count changed.
-            let outs = c.kind.output_count();
+            // (Re)assign the signal range if the signal count changed.
+            let sigs = c.kind.signal_count();
             let old = self.body_sig[slot as usize];
-            if old.len != outs {
+            if old.len != sigs {
                 self.free_sig(old);
-                self.body_sig[slot as usize] = self.alloc_sig(outs);
+                self.body_sig[slot as usize] = self.alloc_sig(sigs);
             }
             // An LED keeps the net it shows (recoloured with its net).
-            let net = if outs > 0 {
+            let net = if sigs > 0 {
                 self.body_sig[slot as usize].start
             } else if fresh {
                 NO_NET
             } else {
                 self.bodies[slot as usize].net
             };
-            let b = body_geom(c, body_kind(c), net);
+            let mut kind = body_kind(c);
+            if matches!(c.kind, ComponentKind::Text { .. }) {
+                kind = with_note(kind, self.sync_note(circuit, id));
+            } else {
+                self.free_note(id);
+            }
+            let b = body_geom(c, kind, net);
             self.set_body(slot, b);
         } else if let Some(slot) = self.body_slot.remove(&id) {
             self.layout += 1;
             self.free_body(slot);
+            self.free_note(id);
         }
     }
 
@@ -967,7 +1091,16 @@ impl Scene {
         for c in circuit.components() {
             let mine = self.body_slot(c.id).ok_or(format!("{:?} has no slot", c.id))?;
             let theirs = fresh.body_slot(c.id).ok_or("fresh build lacks component")?;
-            let (a, b) = (self.bodies[mine as usize], fresh.bodies[theirs as usize]);
+            let (mut a, mut b) = (self.bodies[mine as usize], fresh.bodies[theirs as usize]);
+            if matches!(c.kind, ComponentKind::Text { .. }) {
+                // Note slots may differ; the note they hold may not.
+                let slot = (a.kind >> NOTE_SHIFT) & MAX_NOTE_SLOT;
+                if slot != 0 && (self.note_slot(c.id) != Some(slot) || self.note_at(slot) != circuit.note(c.id)) {
+                    return Err(format!("note slot {slot} of {:?} is stale", c.id));
+                }
+                a.kind = with_note(a.kind, 0);
+                b.kind = with_note(b.kind, 0);
+            }
             if a.min != b.min || a.size != b.size || a.kind != b.kind {
                 return Err(format!("body of {:?} differs: {a:?} vs {b:?}", c.id));
             }
@@ -1014,6 +1147,17 @@ impl Scene {
             }
             if self.wire_owner[m as usize] != Some(id) {
                 return Err(format!("wire slot {m} owner mismatch"));
+            }
+        }
+        // Note slots: one per live annotation, free ones empty.
+        if self.note_of.len() != fresh.note_of.len()
+            || self.note_of.len() + self.note_free.len() + 1 != self.notes.len()
+        {
+            return Err(format!("{} note slots for {} annotations", self.note_of.len(), fresh.note_of.len()));
+        }
+        for &s in &self.note_free {
+            if self.notes[s as usize].is_some() {
+                return Err(format!("free note slot {s} still holds a note"));
             }
         }
         // Free slots are hidden and unowned.

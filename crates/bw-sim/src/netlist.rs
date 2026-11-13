@@ -19,7 +19,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use bw_core::{Circuit, ComponentId, ComponentKind, FfTrigger, FlipFlopType, GateOp, MemoryImage, MemoryType, TagDir};
+use bw_core::{
+    Circuit, ComponentId, ComponentKind, EvalMode, FfTrigger, FlipFlopType, GateOp, MemoryImage, MemoryType,
+    PULSE_HALF_PERIOD, SwitchMode, TagDir,
+};
 
 use crate::SimError;
 use crate::flatten::{CompileStats, Flat, FlattenCache, Local, NO_HANDLE};
@@ -35,10 +38,15 @@ enum NodeOp {
     Gate(GateOp),
     Not,
     Switch,
-    Clock {
-        half_period: u32,
-    },
+    /// Fixed level (VCC / ground): the level is in `src`.
+    Const,
+    /// Time-driven source (clock, sequence generator, pulse input): index
+    /// into `Netlist::timed`.
+    Timed(u32),
     TriState,
+    /// 7-segment display / numeric output: its drivers mirror its inputs
+    /// (display signals for the renderer, never read by other nodes).
+    Display,
     /// Index into `Netlist::ffs`.
     FlipFlop(u32),
     /// Index into `Netlist::mems`.
@@ -52,6 +60,25 @@ struct FfCfg {
     ty: FlipFlopType,
     trigger: FfTrigger,
     preset_clear: bool,
+}
+
+/// A time-driven source: a cyclic pattern of `len` steps (bit `i` of
+/// `pattern` is step `i`), one step every `half_period` ticks. A clock is
+/// `01`, a pulse input starting high `10`.
+#[derive(Debug, Clone, Copy)]
+struct TimedCfg {
+    node: u32,
+    half_period: u32,
+    pattern: u64,
+    len: u8,
+    /// A pulse input (its phase follows `SetSwitch`).
+    pulse: bool,
+}
+
+impl TimedCfg {
+    fn level(&self, step: u8) -> u8 {
+        u8::from(self.pattern >> (step % self.len.max(1)) & 1 == 1)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -124,8 +151,10 @@ pub struct Netlist {
     fanout: Vec<u32>,
     /// Root-level component id → node index.
     node_of: HashMap<ComponentId, u32>,
-    /// Indices of clock nodes.
-    clocks: Vec<u32>,
+    /// Time-driven sources (clocks, sequence generators, pulse inputs).
+    timed: Vec<TimedCfg>,
+    /// Propagation semantics.
+    eval: EvalMode,
     /// Initial level of switch nodes (by node).
     src_init: Vec<u8>,
     ffs: Vec<FfCfg>,
@@ -172,7 +201,8 @@ impl Netlist {
         let mut out_start = Vec::with_capacity(n_guess + 1);
         let mut node_of = HashMap::new();
         let mut prim_node = vec![NO_NET; n_guess];
-        let mut clocks = Vec::new();
+        let mut timed: Vec<TimedCfg> = Vec::new();
+        let mut node_outs: Vec<u8> = Vec::with_capacity(n_guess);
         let mut src_init = Vec::with_capacity(n_guess);
         let mut ffs = Vec::new();
         let mut mems = Vec::new();
@@ -181,11 +211,30 @@ impl Netlist {
         // Pass 1: nodes and their drivers.
         for (pi, p) in flat.prims.iter().enumerate() {
             let prim = u32_of(pi)?;
+            let node = u32_of(op.len())?;
+            let mut timed_op = |cfg: TimedCfg| -> Result<NodeOp, SimError> {
+                timed.push(TimedCfg { node, ..cfg });
+                Ok(NodeOp::Timed(u32_of(timed.len() - 1)?))
+            };
             let this_op = match p.kind {
                 ComponentKind::Gate { op, .. } => NodeOp::Gate(op),
                 ComponentKind::Not => NodeOp::Not,
+                ComponentKind::Switch { on, mode: SwitchMode::Pulse } => timed_op(TimedCfg {
+                    node,
+                    half_period: PULSE_HALF_PERIOD,
+                    pattern: if on { 0b01 } else { 0b10 },
+                    len: 2,
+                    pulse: true,
+                })?,
                 ComponentKind::Switch { .. } => NodeOp::Switch,
-                ComponentKind::Clock { half_period } => NodeOp::Clock { half_period },
+                ComponentKind::Clock { half_period } => {
+                    timed_op(TimedCfg { node, half_period, pattern: 0b10, len: 2, pulse: false })?
+                }
+                ComponentKind::SeqGen { pattern, len, half_period } => {
+                    timed_op(TimedCfg { node, half_period, pattern, len, pulse: false })?
+                }
+                ComponentKind::Const { .. } => NodeOp::Const,
+                ComponentKind::SevenSeg { .. } | ComponentKind::Numeric { .. } => NodeOp::Display,
                 ComponentKind::TriState => NodeOp::TriState,
                 ComponentKind::FlipFlop { ty, trigger, preset_clear } => {
                     ffs.push(FfCfg { prim, ty, trigger, preset_clear });
@@ -196,25 +245,28 @@ impl Netlist {
                     mems.push(MemCfg { prim, ram: ty == MemoryType::Ram, addr_bits, data_bits, init });
                     NodeOp::Memory(u32_of(mems.len() - 1)?)
                 }
-                ComponentKind::Led | ComponentKind::Tag { .. } | ComponentKind::Macro(_) => continue,
+                ComponentKind::Led
+                | ComponentKind::Tag { .. }
+                | ComponentKind::Macro(_)
+                | ComponentKind::Text { .. } => continue,
             };
-            let node = u32_of(op.len())?;
-            if matches!(this_op, NodeOp::Clock { .. }) {
-                clocks.push(node);
-            }
             src_init.push(match p.kind {
-                ComponentKind::Switch { on } => u8::from(on),
+                ComponentKind::Switch { on, .. } => u8::from(on),
+                ComponentKind::Const { high } => u8::from(high),
+                ComponentKind::SeqGen { pattern, .. } => u8::from(pattern & 1 == 1),
                 _ => L0,
             });
             op.push(this_op);
             node_prim.push(prim);
             prim_node[pi] = node;
             node_ins.push(p.kind.input_count());
+            node_outs.push(p.kind.output_count());
             if p.scope == 0 {
                 node_of.insert(p.id, node);
             }
             out_start.push(drivers);
-            drivers = drivers.checked_add(u32::from(p.kind.output_count())).ok_or(SimError::TooLarge)?;
+            // Outputs, then the display signals (mirrors of the inputs).
+            drivers = drivers.checked_add(u32::from(p.kind.signal_count())).ok_or(SimError::TooLarge)?;
         }
         out_start.push(drivers);
         let n = op.len();
@@ -227,7 +279,8 @@ impl Netlist {
         for node in 0..n {
             let prim = node_prim[node] as usize;
             let ps = flat.pin_start[prim] as usize + usize::from(node_ins[node]);
-            for d in out_start[node]..out_start[node + 1] {
+            // Only real outputs are pins; display signals get nets of their own.
+            for d in out_start[node]..out_start[node] + u32::from(node_outs[node]) {
                 let h = flat.pin_handle[ps + (d - out_start[node]) as usize];
                 if h == NO_HANDLE {
                     continue;
@@ -360,7 +413,8 @@ impl Netlist {
                 fan_start,
                 fanout,
                 node_of,
-                clocks,
+                timed,
+                eval: circuit.eval_mode(),
                 src_init,
                 ffs,
                 mems,
@@ -453,7 +507,7 @@ impl Netlist {
             }
         };
         for p in &t.prims {
-            push_outputs(p.id, p.kind.output_count());
+            push_outputs(p.id, p.kind.signal_count());
         }
         for i in &t.insts {
             push_outputs(i.id, i.outputs);
@@ -522,8 +576,10 @@ pub struct SimState {
     /// Current value of each driver of a bus net (unused for single-driver
     /// nets, whose value is the net's).
     drv: Vec<u8>,
-    /// Switch / clock levels, indexed by node.
+    /// Source levels (switches, constants, clocks, sequences), by node.
     src: Vec<u8>,
+    /// Current step of each time-driven source.
+    step: Vec<u8>,
     ff: Vec<FfState>,
     mem: Vec<MemState>,
     pub tick: u64,
@@ -542,6 +598,13 @@ pub struct SimState {
     bus_stamp: Vec<u32>,
     bus_epoch: u32,
     bus_touched: Vec<u32>,
+}
+
+/// Input reading of the Digital Works compatible mode: a floating net
+/// (Z) reads as 0; 0, 1 and X are kept.
+#[inline]
+const fn float_low(v: u8) -> u8 {
+    if v == Z { L0 } else { v }
 }
 
 /// Packs four-state levels, 16 per `u32` (net `i` at bits `2(i % 16)`).
@@ -570,6 +633,7 @@ impl SimState {
             values: vec![Z; nn],
             drv: vec![Z; nd],
             src,
+            step: vec![0; net.timed.len()],
             ff,
             mem,
             tick: 0,
@@ -660,10 +724,15 @@ impl SimState {
     /// [`SimError::RaceCondition`] or [`SimError::BusContention`].
     pub fn reinit(&mut self) -> Result<(), SimError> {
         self.tick = 0;
-        self.values.iter_mut().for_each(|v| *v = Z);
-        self.drv.iter_mut().for_each(|v| *v = Z);
-        for &c in &self.net.clocks {
-            self.src[c as usize] = L0;
+        // Digital Works compatible mode starts like Digital Works: every
+        // net at 0 (two-valued start), so gate-level latches begin in a
+        // definite state instead of an unresolvable X.
+        let start = if self.net.eval == EvalMode::Sequential { L0 } else { Z };
+        self.values.iter_mut().for_each(|v| *v = start);
+        self.drv.iter_mut().for_each(|v| *v = start);
+        for (k, t) in self.net.timed.iter().enumerate() {
+            self.step[k] = 0;
+            self.src[t.node as usize] = t.level(0);
         }
         for s in &mut self.ff {
             s.clk = X;
@@ -683,10 +752,26 @@ impl SimState {
     /// [`SimError::RaceCondition`] or [`SimError::BusContention`].
     pub fn set_switch(&mut self, id: ComponentId, on: bool) -> Result<(), SimError> {
         if let Some(&i) = self.net.node_of.get(&id) {
-            if self.net.op[i as usize] == NodeOp::Switch {
-                self.src[i as usize] = u8::from(on);
-                self.pending.push(i);
-                return self.settle();
+            match self.net.op[i as usize] {
+                NodeOp::Switch => {
+                    self.src[i as usize] = u8::from(on);
+                    self.pending.push(i);
+                    return self.settle();
+                }
+                NodeOp::Timed(k) if self.net.timed[k as usize].pulse => {
+                    // A pulse input: the hand sets the level the cycle is
+                    // in now; the pattern keeps alternating from there.
+                    let t = &mut self.net.timed[k as usize];
+                    let step = self.step[k as usize];
+                    let now_high = t.level(step) == 1;
+                    if now_high != on {
+                        t.pattern ^= 0b11;
+                    }
+                    self.src[i as usize] = u8::from(on);
+                    self.pending.push(i);
+                    return self.settle();
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -753,34 +838,58 @@ impl SimState {
     pub fn tick(&mut self) -> Result<bool, SimError> {
         self.tick = self.tick.wrapping_add(1);
         let mut edge = false;
-        for i in 0..self.net.clocks.len() {
-            let node = self.net.clocks[i];
-            if let NodeOp::Clock { half_period } = self.net.op[node as usize] {
-                if self.tick % u64::from(half_period.max(1)) == 0 {
-                    self.src[node as usize] ^= 1;
-                    self.pending.push(node);
-                    edge = true;
+        for k in 0..self.net.timed.len() {
+            let t = self.net.timed[k];
+            if self.tick % u64::from(t.half_period.max(1)) == 0 {
+                let step = (self.step[k] + 1) % t.len.max(1);
+                self.step[k] = step;
+                let v = t.level(step);
+                if self.src[t.node as usize] != v {
+                    self.src[t.node as usize] = v;
+                    self.pending.push(t.node);
                 }
+                // Every step of a clock or sequence is a step boundary
+                // (for Step), even when the level stays the same.
+                edge = true;
             }
         }
         self.settle()?;
         Ok(edge)
     }
 
+    /// Are there time-driven sources (clocks, sequence generators, pulse
+    /// inputs)?
     #[must_use]
     pub fn has_clocks(&self) -> bool {
-        !self.net.clocks.is_empty()
+        !self.net.timed.is_empty()
     }
 
     /// Evaluates a single-output, stateless node (the hot path).
     #[allow(clippy::inline_always, reason = "measured: ~10% of the tick cost in the 100k stress circuit")]
     #[inline(always)]
     fn eval_comb(&self, i: usize) -> u8 {
+        self.eval_comb_in::<false>(i)
+    }
+
+    /// [`Self::eval_comb`] with the input reading of the evaluation mode:
+    /// in the Digital Works compatible mode (`DW = true`) a floating or
+    /// unconnected input reads as 0, as in Digital Works; otherwise as X.
+    #[allow(clippy::inline_always, reason = "see eval_comb")]
+    #[inline(always)]
+    fn eval_comb_in<const DW: bool>(&self, i: usize) -> u8 {
         let h = &self.net.hot[i];
         let s = h.in_start as usize;
         let ins = &self.net.inputs[s..s + usize::from(h.in_len)];
         let values = &self.values;
-        let rd = |net: u32| if net == NO_NET { X } else { logic::input(values[net as usize]) };
+        let rd = |net: u32| {
+            if DW {
+                if net == NO_NET { L0 } else { float_low(values[net as usize]) }
+            } else if net == NO_NET {
+                X
+            } else {
+                logic::input(values[net as usize])
+            }
+        };
         match h.op {
             NodeOp::Gate(op) => logic::gate(op, ins.iter().map(|&n| rd(n))),
             NodeOp::Not => logic::not(ins.first().map_or(X, |&n| rd(n))),
@@ -796,13 +905,24 @@ impl SimState {
         let s = self.net.in_start[i] as usize;
         let ins = &self.net.inputs[s..s + self.net.in_len[i] as usize];
         let values = &self.values;
-        let rd = |net: u32| if net == NO_NET { X } else { logic::input(values[net as usize]) };
+        let dw = self.net.eval == EvalMode::Sequential;
+        let level = |v: u8| if dw { float_low(v) } else { logic::input(v) };
+        let rd = |net: u32| {
+            if net == NO_NET { if dw { L0 } else { X } } else { level(values[net as usize]) }
+        };
         // Optional control pins: an unconnected pin takes its inactive default.
-        let rd_or = |net: u32, default: u8| if net == NO_NET { default } else { logic::input(values[net as usize]) };
+        let rd_or = |net: u32, default: u8| if net == NO_NET { default } else { level(values[net as usize]) };
         match self.net.op[i] {
-            NodeOp::Gate(_) | NodeOp::Not | NodeOp::Switch | NodeOp::Clock { .. } | NodeOp::TriState => {
-                out[0] = self.eval_comb(i);
+            NodeOp::Gate(_) | NodeOp::Not | NodeOp::Switch | NodeOp::Const | NodeOp::Timed(_) | NodeOp::TriState => {
+                out[0] = if dw { self.eval_comb_in::<true>(i) } else { self.eval_comb(i) };
                 1
+            }
+            NodeOp::Display => {
+                // Raw net levels (a floating input shows as floating).
+                for (o, &n) in out.iter_mut().zip(ins) {
+                    *o = if n == NO_NET { Z } else { values[n as usize] };
+                }
+                ins.len().min(16)
             }
             NodeOp::FlipFlop(f) => {
                 let cfg = self.net.ffs[f as usize];
@@ -922,6 +1042,9 @@ impl SimState {
     /// overlap of two enables switching through gates of different depth is
     /// not reported.
     fn settle(&mut self) -> Result<(), SimError> {
+        if self.net.eval == EvalMode::Sequential {
+            return self.settle_sequential();
+        }
         let max_deltas = self.net.node_count().saturating_add(16);
         let mut deltas = 0usize;
         let mut out = [Z; 16];
@@ -948,7 +1071,7 @@ impl SimState {
             for k in 0..self.pending.len() {
                 let node = self.pending[k];
                 let h = self.net.hot[node as usize];
-                if matches!(h.op, NodeOp::FlipFlop(_) | NodeOp::Memory(_)) {
+                if matches!(h.op, NodeOp::FlipFlop(_) | NodeOp::Memory(_) | NodeOp::Display) {
                     let n = self.eval_seq(node, &mut out);
                     for (j, &v) in out[..n].iter().enumerate() {
                         #[allow(clippy::cast_possible_truncation, reason = "at most 16 outputs")]
@@ -1001,6 +1124,97 @@ impl SimState {
                 if self.bus_stamp[net as usize] != self.bus_epoch {
                     self.bus_stamp[net as usize] = self.bus_epoch;
                     self.bus_touched.push(net);
+                }
+            }
+            std::mem::swap(&mut self.pending, &mut self.next);
+        }
+        self.check_contention()
+    }
+
+    /// Starts a new fan-out dedup epoch (see `set_net`).
+    fn next_epoch(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.stamp.iter_mut().for_each(|s| *s = 0);
+            self.epoch = 1;
+        }
+    }
+
+    /// Commits one driver value at once (sequential mode).
+    fn commit_now(&mut self, d: u32, v: u8) {
+        let tag = self.net.drv_tag[d as usize];
+        if tag & BUS == 0 {
+            self.set_net(tag, v);
+        } else {
+            self.drv[d as usize] = v;
+            let net = tag & !BUS;
+            let r = self.resolve(net);
+            self.set_net(net, r);
+            if self.bus_stamp[net as usize] != self.bus_epoch {
+                self.bus_stamp[net as usize] = self.bus_epoch;
+                self.bus_touched.push(net);
+            }
+        }
+    }
+
+    /// Sequential ("immediate") propagation, the Digital Works compatible
+    /// mode ([`EvalMode::Sequential`]): the pending nodes are evaluated one
+    /// after another and every new output is committed at once, so a node
+    /// evaluated later in the same sweep already sees it (Gauss–Seidel
+    /// rather than Jacobi). Two cross-coupled gates that both see their
+    /// inputs change therefore resolve in a deterministic order instead
+    /// of oscillating in lock-step, which is what lets gate-level latches
+    /// (an RS latch whose inputs return to 1 together, a master-slave
+    /// flip-flop built from NANDs) settle.
+    ///
+    /// The race bound is the same as in unit-delay mode: a circuit still
+    /// scheduling evaluations after `nodes + 16` sweeps never settles (a
+    /// gate feeding itself an inverted signal re-schedules itself in every
+    /// sweep). Bus contention is checked once everything has settled.
+    fn settle_sequential(&mut self) -> Result<(), SimError> {
+        let max_sweeps = self.net.node_count().saturating_add(16);
+        let mut sweeps = 0usize;
+        let mut out = [Z; 16];
+        self.bus_epoch = self.bus_epoch.wrapping_add(1);
+        if self.bus_epoch == 0 {
+            self.bus_stamp.iter_mut().for_each(|s| *s = 0);
+            self.bus_epoch = 1;
+        }
+        self.bus_touched.clear();
+        while !self.pending.is_empty() {
+            sweeps += 1;
+            if sweeps > max_sweeps {
+                let node = self.pending.first().copied().unwrap_or(0) as usize;
+                let net = self.net.drv_net.get(self.net.out_start[node] as usize).copied().unwrap_or(0);
+                self.pending.clear();
+                return Err(SimError::RaceCondition {
+                    net,
+                    path: self.net.node_path(node),
+                    place: self.net.node_place(node),
+                });
+            }
+            self.next_epoch();
+            self.next.clear();
+            for k in 0..self.pending.len() {
+                let node = self.pending[k];
+                let h = self.net.hot[node as usize];
+                if matches!(h.op, NodeOp::FlipFlop(_) | NodeOp::Memory(_) | NodeOp::Display) {
+                    let n = self.eval_seq(node, &mut out);
+                    for (j, &v) in out[..n].iter().enumerate() {
+                        #[allow(clippy::cast_possible_truncation, reason = "at most 16 outputs")]
+                        let d = h.out + j as u32;
+                        let tag = self.net.drv_tag[d as usize];
+                        let old = if tag & BUS == 0 { self.values[tag as usize] } else { self.drv[d as usize] };
+                        if old != v {
+                            self.commit_now(d, v);
+                        }
+                    }
+                } else {
+                    let v = self.eval_comb_in::<true>(node as usize);
+                    let old = if h.tag & BUS == 0 { self.values[h.tag as usize] } else { self.drv[h.out as usize] };
+                    if old != v {
+                        self.commit_now(h.out, v);
+                    }
                 }
             }
             std::mem::swap(&mut self.pending, &mut self.next);

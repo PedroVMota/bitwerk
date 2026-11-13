@@ -11,7 +11,7 @@ help:
 	@echo "lint       - clippy (pedantic) with warnings as errors"
 	@echo "fmt        - format the code"
 	@echo "audit      - cargo deny check (advisories, licenses, bans, sources)"
-	@echo "fuzz       - fuzz the project loader and the .map parser (nightly + cargo-fuzz)"
+	@echo "fuzz       - fuzz the project, .map, .bwmacro and Digital Works loaders (nightly + cargo-fuzz)"
 	@echo "bench      - headless 100k-object GPU frame-cost measurement"
 	@echo "sweep      - scripted 20 s GUI measurement on the 100k stress test (opens a window)"
 	@echo "icon       - render the app icon from code into assets/ (PNG + .icns via iconutil)"
@@ -46,6 +46,7 @@ fuzz:
 	$(CARGO) +nightly fuzz run load_project fuzz/seeds/load_project -- -max_total_time=300
 	$(CARGO) +nightly fuzz run load_memory_map fuzz/seeds/load_memory_map -- -max_total_time=300
 	$(CARGO) +nightly fuzz run load_macro fuzz/seeds/load_macro -- -max_total_time=300
+	$(CARGO) +nightly fuzz run load_dwm fuzz/seeds/load_dwm -- -max_total_time=300
 
 # Compiles the fuzz crate on stable without running it.
 fuzz-check:

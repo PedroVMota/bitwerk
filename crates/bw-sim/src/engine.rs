@@ -423,8 +423,8 @@ impl Worker {
             }
             Command::SetSwitch(id, on) => {
                 // Keep the copy in sync so a later recompilation keeps the level.
-                if matches!(self.circuit.component(id).map(|c| c.kind), Some(ComponentKind::Switch { .. })) {
-                    let _ = self.circuit.set_kind(id, ComponentKind::Switch { on });
+                if let Some(ComponentKind::Switch { mode, .. }) = self.circuit.component(id).map(|c| c.kind) {
+                    let _ = self.circuit.set_kind(id, ComponentKind::Switch { on, mode });
                 }
                 if let Some(sim) = self.sim.as_mut() {
                     let r = sim.set_switch(id, on);
