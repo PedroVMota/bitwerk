@@ -359,7 +359,7 @@ fn report_body(ui: &mut egui::Ui, r: &ImportReport, mode: &str) {
             });
             if r.macro_copies > 0 || r.macro_defs > 0 {
                 ui.label(format!(
-                    "{} embedded macro cop{} → {} definition{}",
+                    "{} embedded macro cop{} -> {} definition{}",
                     r.macro_copies,
                     if r.macro_copies == 1 { "y" } else { "ies" },
                     r.macro_defs,
