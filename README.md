@@ -11,7 +11,7 @@ Simulador de circuitos lógicos digitais para macOS: portas, interruptores, rel�
 
 ## Arquitetura
 
-Workspace Cargo com cinco *crates*:
+Workspace Cargo com seis *crates*:
 
 | Crate | Função |
 |---|---|
@@ -20,6 +20,7 @@ Workspace Cargo com cinco *crates*:
 | `crates/bw-render` | Renderizador wgpu (Metal). Desenho instanciado com um número pequeno e **constante** de chamadas de desenho (grelha, fios e corpos: um quadrado por corpo ao longe, ou uma chamada indireta por tipo de componente com os símbolos). A câmara é um único *uniform* de 192 bytes. A cena tem *slots* estáveis e é atualizada no lugar a cada edição (instâncias, R-tree e GPU); o *culling* corre na GPU (*compute shader*). O módulo `symbols` define os símbolos esquemáticos. Ver [Símbolos](#símbolos) e [Renderização e desempenho](#renderização-e-desempenho). Os shaders WGSL estão em `src/shaders/`. |
 | `crates/bw-io` | Formato de projeto (RON, com cabeçalho `format` e `version`, versão 5 com migração da 4, 3, 2 e 1), o formato `.bwmacro` (uma macro com as dependências), a biblioteca de peças (`library`: incluídas no binário e as do utilizador), a validação dos *links* de *datasheet* (`datasheet`) com limites rígidos, o formato `.map` de conteúdo de memória (`memmap`, que lê também os `.map` binários do Digital Works) e a importação e exportação do Digital Works (`dwm`: `reader` lê o *stream* de objetos, `convert` constrói o modelo, `export` constrói o grafo de objetos a partir do modelo e `writer` escreve-o com os mesmos programas de campos do leitor; ver [Importação do Digital Works](#importação-do-digital-works) e [Exportação para o Digital Works](#exportação-para-o-digital-works)). |
 | `crates/bw-app` | Binário eframe/egui: navegação na hierarquia (`hier.rs`), Parts Centre (`parts.rs`), propriedades de macros (`macro_props.rs`), paleta com ícones à esquerda, *canvas* GPU ao centro, propriedades à direita, barra com Run/Stop/Pause/Step, menu nativo do macOS (muda) e diálogos de ficheiro nativos (rfd). Inclui também o gerador do ícone da aplicação (`bw-icon`). |
+| `crates/bw-w128` | O exemplo do computador de 128 bits: gerador determinístico das macros e da placa (com colocação e encaminhamento próprios), assembler, modelo de referência da ISA e testes. Não é usado pela app. Ver [Exemplo: computador de 128 bits](#exemplo-computador-de-128-bits-andorinha-w-128). |
 
 ### Modelo de threads
 
@@ -425,6 +426,7 @@ O executável chama-se `bitwerk`. `bitwerk <ficheiro.bitwerk>` abre um projeto n
 - `--frame-latency N`: frames em fila para apresentação (experimental; o valor por omissão do eframe é 2);
 - `--view X,Y,ZOOM`: posição e zoom da câmara quando a cena fica pronta (para capturas reprodutíveis);
 - `--run`: começa a simular logo no arranque;
+- `--tick-rate N`: velocidade da simulação no arranque (*ticks* por segundo; o mesmo que o campo *ticks/s* da barra);
 - `--memory-window ID`: abre a janela Memory Contents do componente com esse id;
 - `--on-top`: janela sempre por cima (como no `--sweep`), para capturas automáticas: uma janela tapada não é desenhada;
 - `--stress-macros`: carrega o teste de carga com macros (2 500 células "contador de 4 bits → somador de 4 bits", quatro níveis de macros: 37 500 instâncias, 70 150 componentes primitivos); funciona com `--sweep`;
@@ -449,6 +451,25 @@ O executável chama-se `bitwerk`. `bitwerk <ficheiro.bitwerk>` abre um projeto n
 - **Macros:** ver [Macros](#macros-sub-circuitos-hierárquicos). O exemplo `examples/macros-demo.bitwerk` tem um contador de décadas a alimentar um *driver* BCD → 7 segmentos com sete LEDs, um somador de 4 bits com interruptores e LEDs e uma NAND quádrupla em DIL-14 (`bitwerk examples/macros-demo.bitwerk --run`; `--enter 3` abre o contador a correr).
 - **Menu Debug → Spawn Stress Test** (⇧⌘T): gera 100k componentes. O canto superior esquerdo mostra FPS, tempos de frame, o modo de desenho (tudo ou *culling* na GPU) e o progresso do *upload*. **Debug → Continuous Repaint** força o redesenho contínuo para medir.
 - Há exemplos em `examples/half-adder.bitwerk` (cada entrada chega às duas portas por uma junção, com o cruzamento clássico sem ponto), `examples/all-components.bitwerk` (os tipos combinacionais, vários números de entradas e rotações; as entradas A e B correm em barras com uma junção por porta; `bitwerk examples/all-components.bitwerk --style iec` mostra o estilo IEC), `examples/flipflops-memory.bitwerk` e `examples/bus-contention.bitwerk`. O `flipflops-memory` tem um contador **síncrono** de 4 bits feito com JK master-slave: o relógio chega aos quatro flip-flops por uma única linha com uma junção por flip-flop, tal como o *clear* comum; J e K de cada flip-flop estão ligados por uma junção (J = K = 1 no primeiro, Q0 no segundo, Q0·Q1 e Q0·Q1·Q2 no terceiro e no quarto, com duas portas AND). Tem também um barramento tri-state (uma linha vertical com os dois condutores e uma junção em T para o LED) escolhido por um interruptor e um NOT (o interruptor chega aos dois por uma junção), e uma RAM de 16 × 4 endereçada pelo contador (dados de entrada, R/W̄ e C̄S̄ em interruptores; o conteúdo inicial é um padrão que se vê a andar nos LEDs). Com `bitwerk examples/flipflops-memory.bitwerk --run` o contador anda logo, e `--memory-window 18` abre a memória. Um teste do simulador abre este exemplo e confirma que conta 0, 1, …, 15, 0.
+
+### Exemplo: computador de 128 bits (Andorinha W-128)
+
+`examples/w128-computer.bitwerk` é um computador de 128 bits completo, feito só com portas, flip-flops e memórias do bitwerk e organizado como uma placa-mãe: *clock* e *reset*, ROM de programa, unidade de controlo, quatro *slices* de CPU de 32 bits, um chip de *carry lookahead*, dois módulos de RAM (DIMM 0 e DIMM 1, oito chips de 16 bits cada), uma placa de I/O com o registo OUT e mostradores. Ao abrir, corre um programa que calcula F(0)…F(186) de Fibonacci (F(186) é o maior abaixo de 2¹²⁸) e os fatoriais 1!…34! por multiplicação *shift-and-add*, guarda tudo na RAM e mostra cada valor no registo OUT; termina com 34! = `0xDE1BC4D19EFCAC82445DA75B00000000` no mostrador e o LED HALT aceso.
+
+```sh
+bitwerk examples/w128-computer.bitwerk --run --tick-rate 2000      # ≈1000 ciclos/s, ≈6 s até HALT
+bitwerk examples/w128-computer.bitwerk --run --tick-rate 200 --memory-window 38   # RAM (lane 0) a encher-se
+bitwerk examples/w128-computer.bitwerk --run --enter 15/74         # banco de registos do slice 0, ao vivo
+```
+
+- **Arquitetura** (*bit-slice*, como os minicomputadores dos anos 70): os 128 bits são quatro *slices* idênticos de 32 bits (macro `W128 SLICE32`), cada um com a sua fatia do banco de registos e da ALU. Uma macro tem no máximo 255 pinos, por isso um CPU de 128 bits com barramentos de 128 bits não cabe num só chip; dividi-lo é também o que se fazia nas máquinas reais. Oito registos de 128 bits (`r0` = 0), ALU com ADD/SUB/AND/OR/XOR/SHL/SHR e *carry lookahead* em três níveis (4 bits → 16 bits → slice) mais um CLA4 na placa entre *slices* (a soma de 128 bits estabiliza em ≈20 atrasos de porta e não em 256), *flags* Z/C/N, unidade de controlo *hardwired* (FETCH → EXEC → MEM), PC de 8 bits, MAR de 10 bits.
+- **Memória:** Harvard. Programa em duas ROM de 256 × 16 (instruções de 32 bits). Dados em 512 palavras de 128 bits: dois *ranks* de oito chips RAM 256 × 16 em paralelo, com descodificação de endereços (A8 escolhe o *rank* por C̄S̄, A9 = I/O), saídas tri-state num barramento partilhado e escrita assíncrona por um *strobe* na metade baixa do relógio. Os chips estão na placa (não dentro de macros), por isso a janela Memory Contents mostra-os ao vivo; cada chip guarda 16 bits de cada palavra (U10…U17 o *rank* 0, U18…U25 o *rank* 1).
+- **ISA** (instruções de 32 bits: `op[31:27] rd ra rb imm16`): `ADD SUB AND OR XOR rd, ra, rb`, `SHL SHR rd, ra`, `ADDI SUBI ANDI ORI XORI rd, ra, imm` (imediato com extensão de sinal), `LD rd, [ra+imm]`, `ST rb, [ra+imm]`, `JMP JZ JNZ JC JNC JN JNN addr`, `NOP`, `HALT`. Duas fases por instrução, três para LD/ST.
+- **Na placa:** quatro faixas horizontais de 32 bits (slice → chips de RAM dos dois DIMM → latches OUT → mostradores), PC, MAR e IR em hexadecimal, LEDs FETCH/EXEC/MEM/HALT, Z/C/N e WSTB. Dentro de cada *slice* há mostradores dos operandos A e B e do resultado Y, e dentro do banco de registos o valor de r1…r7 (32 bits por *slice*). Hierarquia com 5 níveis de macros (slice → ALU32 → ALU16 → ALU4 → ALU bit / CLA4).
+- **Gerado por código** (`crates/bw-w128`): o assembler (`asm`), o modelo de referência da ISA com contagem de ciclos (`isa`), o programa (`program`), as macros (`blocks`), a placa (`board`) e um pequeno sistema de colocação e encaminhamento (`layout`: componentes em colunas, uma pista por rede em cada canal, passagem por linhas livres entre componentes, ordenação das pistas sem sobreposições e com menos cruzamentos). `cargo run --release -p bw-w128 --bin w128-gen -- --run` reescreve o exemplo e imprime as estatísticas; um teste falha se o ficheiro não for igual ao gerado.
+- **Números** (MacBook Pro M1 Pro, *release*): 9 238 primitivas achatadas (5 666 AND, 1 789 OR, 393 XOR, 169 NOT, 1 079 flip-flops D, 16 RAM, 2 ROM, 100 mostradores), 25 676 componentes contando instâncias, *tags* e anotações, 11 937 redes, 111 109 segmentos de fio em todas as instâncias (4 155 na placa), 17 definições, profundidade 5. Ficheiro de 4,7 MB, abre em ≈70 ms; compilação da *netlist* ≈1 ms. O programa tem 2 639 instruções e 5 729 ciclos (11 457 *ticks*); sem janela demora 0,25 s (≈22 µs por *tick*, ≈45 000 *ticks*/s). `bitwerk examples/w128-computer.bitwerk --sweep` (o mesmo guião do teste de carga) dá 60 Hz com CPU por frame ≈1,4 ms.
+- **Testes** (`cargo test -p bw-w128`): cada bloco contra um modelo em Rust (CLA4 e descodificador exaustivos, ALU32 com 300 vetores aleatórios contra aritmética `u32`, registos, banco de registos, PC, *latch*), as sete operações da ALU com operandos aleatórios de 128 bits contra `u128`, o módulo de memória (*ranks* e I/O), *reset*, programas aleatórios executados em *lockstep* com o modelo (PC, *flags* e os sete registos comparados depois de cada instrução) e o programa de demonstração até HALT com RAM, OUT, registos, *flags* e número de ciclos iguais bit a bit ao modelo. Há ainda um teste de geometria: nenhum fio de uma rede se sobrepõe a outra e nenhum nó fica em cima de um fio de outra rede.
+- **Simplificações** em relação a um computador real: a RAM é estática e assíncrona (sem *refresh* nem *timings* de DRAM), os "DIMM" são grupos de chips na placa e não conectores, não há interrupções, *stack* nem chamadas a sub-rotinas, os deslocamentos são de 1 bit, os saltos são absolutos dentro de 256 instruções, e o relógio é ideal (sem *skew*: todos os flip-flops recebem o mesmo flanco no mesmo ciclo delta). A exportação para o Digital Works deste exemplo ainda não reproduz o comportamento (ver o teste `examples_behave_the_same_after_export`).
 
 ## Segurança
 
@@ -498,9 +519,10 @@ bitwerk/
 │   ├── bw-sim/           # motor de simulação (+ tests/sim.rs)
 │   ├── bw-render/        # renderizador wgpu (+ shaders WGSL, símbolos, testes GPU)
 │   ├── bw-io/            # formato de ficheiro, .map, .bwmacro, biblioteca (library/*.bwmacro), datasheets e importação do Digital Works (src/dwm; tests/fixtures: formatos 1–4 e fixtures/dwm)
-│   └── bw-app/           # aplicação eframe
+│   ├── bw-app/           # aplicação eframe
+│   └── bw-w128/          # computador de 128 bits: gerador, assembler, modelo de referência (examples/w128-computer.bitwerk)
 ├── assets/               # ícone gerado por código (AppIcon.icns, AppIcon-256.png) e Info.plist
-├── examples/             # half-adder, all-components, flipflops-memory, bus-contention, macros-demo
+├── examples/             # half-adder, all-components, flipflops-memory, bus-contention, macros-demo, w128-computer
 ├── docs/dwm/             # formato .dwm / .dwt / .map do Digital Works e cobertura
 ├── tools/dwm_parse.py    # parser Python de referência (investigação)
 └── fuzz/                 # cargo-fuzz
