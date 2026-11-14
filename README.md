@@ -11,6 +11,8 @@ Simulador de circuitos lógicos digitais para macOS: portas, interruptores, rel�
 
 ## Arquitetura
 
+Guia da base de código para quem começa (em inglês): [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 Workspace Cargo com cinco *crates*:
 
 | Crate | Função |
