@@ -398,7 +398,13 @@ Medido no mesmo MacBook (release). `make bench` (offscreen, 100k, 1× / 2×) ant
 
 ## Compilar, correr e testar
 
-Requisitos: Rust estável (fixado em `rust-toolchain.toml`) e macOS com Metal.
+Requisitos: Rust estável (fixado em `rust-toolchain.toml`, instalado com `rustup`) e uma GPU com Metal, Vulkan ou DirectX 12. O código compila em macOS, Linux e Windows (a CI em `.github/workflows/ci.yml` compila e testa nos três):
+
+- **macOS:** só o Rust. Backend gráfico Metal; menu nativo na barra de menus (muda).
+- **Linux:** Rust e um compilador C/*linker* (`sudo apt install build-essential pkg-config` em Debian/Ubuntu). Não são precisos pacotes `-dev` de sistema: Wayland, X11, xkbcommon, libdbus, Vulkan e EGL são carregados em tempo de execução, por isso o sistema tem de ter as bibliotecas normais de um ambiente gráfico (`libwayland-client0` ou `libx11-6` + `libxcursor1` + `libxi6` + `libxrandr2`, `libxkbcommon0`/`libxkbcommon-x11-0`, `libdbus-1-3`) e um *driver* Vulkan (`mesa-vulkan-drivers` ou o da NVIDIA) ou GL/EGL. Os diálogos de ficheiro usam o portal XDG (`xdg-desktop-portal` com um *backend* GTK/KDE, ou o `zenity`).
+- **Windows:** Rust com o *toolchain* MSVC (`rustup` por omissão) e as *Build Tools* do Visual Studio (C++). Backend gráfico DirectX 12 (ou Vulkan).
+
+Fora do macOS não há menu nativo (os comandos estão na barra de ferramentas egui), `make icon`/`make bundle` são específicos do macOS (`iconutil`, `.app`) e clicar num *datasheet* mostra o caminho do ficheiro em vez de o abrir. A biblioteca do utilizador fica em `~/Library/Application Support/bitwerk/Parts` (macOS), `$XDG_DATA_HOME/bitwerk/Parts` ou `~/.local/share/bitwerk/Parts` (Linux) e `%APPDATA%\bitwerk\Parts` (Windows).
 
 ```sh
 make build        # cargo build --workspace

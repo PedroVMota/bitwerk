@@ -6,6 +6,7 @@ use bw_render::SymbolStyle;
 use crossbeam_channel::Receiver;
 
 /// Actions the menu bar can trigger.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code, reason = "only the macOS menu bar emits these"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
     New,
@@ -37,6 +38,7 @@ pub enum MenuAction {
     EvalMode(EvalMode),
 }
 
+#[cfg(target_os = "macos")]
 const ITEMS: &[(&str, MenuAction)] = &[
     ("file.new", MenuAction::New),
     ("file.open", MenuAction::Open),
@@ -103,6 +105,7 @@ impl NativeMenu {
     }
 
     /// Shows which symbol style is active (radio-like check marks).
+    #[cfg_attr(not(target_os = "macos"), allow(clippy::unused_self))]
     pub fn sync_style(&self, style: SymbolStyle) {
         #[cfg(target_os = "macos")]
         {
@@ -114,6 +117,7 @@ impl NativeMenu {
     }
 
     /// Shows which simulation mode is active.
+    #[cfg_attr(not(target_os = "macos"), allow(clippy::unused_self))]
     pub fn sync_eval_mode(&self, mode: EvalMode) {
         #[cfg(target_os = "macos")]
         {

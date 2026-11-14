@@ -186,7 +186,7 @@ impl BitwerkApp {
             return;
         }
         let Some(dest) = bw_io::library::user_dir().map(|d| d.join("Imported")) else {
-            self.status = "No user library folder (HOME not set)".into();
+            self.status = "No user library folder (home/data folder not set)".into();
             return;
         };
         self.parts.open = true;

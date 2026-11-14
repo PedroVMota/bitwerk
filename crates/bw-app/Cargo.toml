@@ -28,7 +28,6 @@ eframe.workspace = true
 egui.workspace = true
 egui-wgpu.workspace = true
 wgpu.workspace = true
-muda.workspace = true
 rfd.workspace = true
 glam.workspace = true
 tracing.workspace = true
@@ -36,3 +35,7 @@ tracing-subscriber.workspace = true
 crossbeam-channel.workspace = true
 # PNG encoding for `bw-icon` (already in the tree through eframe).
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+# Native menu bar: macOS only (see src/menu.rs); other OSes use the egui toolbar.
+[target.'cfg(target_os = "macos")'.dependencies]
+muda.workspace = true

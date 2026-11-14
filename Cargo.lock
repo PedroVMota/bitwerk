@@ -195,6 +195,7 @@ dependencies = [
  "parking_lot",
  "percent-encoding",
  "windows-sys 0.52.0",
+ "wl-clipboard-rs",
  "x11rb",
 ]
 
@@ -656,6 +657,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
+name = "cgl"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ced0551234e87afee12411d535648dd89d2e7f34c78b753395567aff3d447ff"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "clipboard-win"
 version = "5.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -849,6 +859,9 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "egui_glow",
+ "glutin",
+ "glutin-winit",
  "image",
  "js-sys",
  "log",
@@ -931,6 +944,20 @@ dependencies = [
  "smithay-clipboard",
  "web-time",
  "windows-sys 0.61.2",
+ "winit",
+]
+
+[[package]]
+name = "egui_glow"
+version = "0.37.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9275ca5cc35a6b7c94e0e8cedf22542f66cb0cf45ed8ab2657c78ff49fec7268"
+dependencies = [
+ "bytemuck",
+ "egui",
+ "glow",
+ "log",
+ "profiling",
  "winit",
 ]
 
@@ -1093,6 +1120,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
+name = "fixedbitset"
+version = "0.5.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5905ec755cc8386d7928353e4d356d2be3e89e81e5ca01fe630a1ca4d08dc175"
+
+[[package]]
 name = "flate2"
 version = "1.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1102,6 +1135,12 @@ dependencies = [
  "miniz_oxide 0.9.1",
  "zlib-rs",
 ]
+
+[[package]]
+name = "foldhash"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "foldhash"
@@ -1260,7 +1299,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282a26c1e23de04bdab3e34a21b6f877a479b96737792516b9b8b8f69b6661be"
 dependencies = [
  "bytemuck",
- "foldhash",
+ "foldhash 0.2.0",
  "hashbrown 0.17.1",
  "log",
  "peniko",
@@ -1279,6 +1318,63 @@ dependencies = [
  "slotmap",
  "wasm-bindgen",
  "web-sys",
+]
+
+[[package]]
+name = "glutin"
+version = "0.32.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12124de845cacfebedff80e877bb37b5b75c34c5a4c89e47e1cdd67fb6041325"
+dependencies = [
+ "bitflags 2.13.2",
+ "cfg_aliases",
+ "cgl",
+ "dispatch2",
+ "glutin_egl_sys",
+ "glutin_glx_sys",
+ "glutin_wgl_sys",
+ "libloading",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+ "once_cell",
+ "raw-window-handle",
+ "wayland-sys",
+ "windows-sys 0.52.0",
+ "x11-dl",
+]
+
+[[package]]
+name = "glutin-winit"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85edca7075f8fc728f28cb8fbb111a96c3b89e930574369e3e9c27eb75d3788f"
+dependencies = [
+ "cfg_aliases",
+ "glutin",
+ "raw-window-handle",
+ "winit",
+]
+
+[[package]]
+name = "glutin_egl_sys"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c4680ba6195f424febdc3ba46e7a42a0e58743f2edb115297b86d7f8ecc02d2"
+dependencies = [
+ "gl_generator",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "glutin_glx_sys"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7bb2938045a88b612499fbcba375a77198e01306f52272e692f8c1f3751185"
+dependencies = [
+ "gl_generator",
+ "x11-dl",
 ]
 
 [[package]]
@@ -1348,13 +1444,22 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
+version = "0.15.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
+dependencies = [
+ "foldhash 0.1.5",
+]
+
+[[package]]
+name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash",
+ "foldhash 0.2.0",
 ]
 
 [[package]]
@@ -1363,7 +1468,7 @@ version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
- "foldhash",
+ "foldhash 0.2.0",
 ]
 
 [[package]]
@@ -1774,6 +1879,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 
 [[package]]
+name = "nom"
+version = "8.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2181,6 +2295,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "os_pipe"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2227,6 +2351,17 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "petgraph"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8701b58ea97060d5e5b155d383a69952a60943f0e6dfe30b04c287beb0b27455"
+dependencies = [
+ "fixedbitset",
+ "hashbrown 0.15.5",
+ "indexmap",
+]
 
 [[package]]
 name = "phf"
@@ -2561,9 +2696,13 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-uniform-type-identifiers 0.3.2",
  "percent-encoding",
+ "pollster",
  "raw-window-handle",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
  "web-sys",
  "windows-sys 0.61.2",
 ]
@@ -3109,6 +3248,17 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "tree_magic_mini"
+version = "3.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8765b90061cba6c22b5831f675da109ae5561588290f9fa2317adab2714d5a6"
+dependencies = [
+ "memchr",
+ "nom",
+ "petgraph",
 ]
 
 [[package]]
@@ -3919,6 +4069,24 @@ name = "wit-bindgen"
 version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
+
+[[package]]
+name = "wl-clipboard-rs"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "959c7ac3b8afde864f7a7448ac16f29b2b83350b7eccbf77fb781c3999aa6848"
+dependencies = [
+ "libc",
+ "log",
+ "os_pipe",
+ "rustix 1.1.6",
+ "thiserror 2.0.21",
+ "tree_magic_mini",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
+]
 
 [[package]]
 name = "x11-dl"
