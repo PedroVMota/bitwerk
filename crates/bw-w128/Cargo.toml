@@ -1,0 +1,16 @@
+[package]
+name = "bw-w128"
+description = "Andorinha W-128: a 128-bit computer built from bitwerk gates (generator, assembler and reference model of examples/w128-computer.bitwerk)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bw-core.workspace = true
+bw-io.workspace = true
+bw-sim.workspace = true

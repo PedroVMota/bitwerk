@@ -543,6 +543,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bw-w128"
+version = "0.1.0"
+dependencies = [
+ "bw-core",
+ "bw-io",
+ "bw-sim",
+]
+
+[[package]]
 name = "bytemuck"
 version = "1.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
