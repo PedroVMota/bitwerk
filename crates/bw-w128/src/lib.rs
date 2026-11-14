@@ -25,5 +25,10 @@
 )]
 
 pub mod asm;
+pub mod blocks;
+pub mod board;
 pub mod isa;
+pub mod layout;
 pub mod program;
+pub mod report;
+pub mod run;
