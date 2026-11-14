@@ -425,6 +425,7 @@ O executável chama-se `bitwerk`. `bitwerk <ficheiro.bitwerk>` abre um projeto n
 - `--frame-latency N`: frames em fila para apresentação (experimental; o valor por omissão do eframe é 2);
 - `--view X,Y,ZOOM`: posição e zoom da câmara quando a cena fica pronta (para capturas reprodutíveis);
 - `--run`: começa a simular logo no arranque;
+- `--tick-rate N`: velocidade da simulação no arranque (*ticks* por segundo; o mesmo que o campo *ticks/s* da barra);
 - `--memory-window ID`: abre a janela Memory Contents do componente com esse id;
 - `--on-top`: janela sempre por cima (como no `--sweep`), para capturas automáticas: uma janela tapada não é desenhada;
 - `--stress-macros`: carrega o teste de carga com macros (2 500 células "contador de 4 bits → somador de 4 bits", quatro níveis de macros: 37 500 instâncias, 70 150 componentes primitivos); funciona com `--sweep`;
