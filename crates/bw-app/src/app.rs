@@ -221,12 +221,23 @@ impl BitwerkApp {
             frame_events: String::new(),
             ui_ran: true,
         };
-        app.sim.send(Command::SetTickRate(app.tick_rate));
         app.commit_full();
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        // `--tick-rate N`: simulation speed (ticks per second) at start-up,
+        // e.g. to watch a large example run without touching the toolbar.
+        if let Some(rate) = args
+            .iter()
+            .position(|a| a == "--tick-rate")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|r| r.is_finite())
+        {
+            app.tick_rate = rate.clamp(0.1, bw_sim::engine::MAX_TICK_RATE);
+        }
+        app.sim.send(Command::SetTickRate(app.tick_rate));
         // Debug: `bitwerk --stress` loads the 100k stress test at start-up and
         // logs frame statistics; `--continuous` repaints every frame (for
         // measuring; normally the app only repaints when something changed).
-        let args: Vec<String> = std::env::args().skip(1).collect();
         if args.iter().any(|a| a == "--stress") {
             app.debug.log_stats = true;
             app.spawn_stress(&cc.egui_ctx);
