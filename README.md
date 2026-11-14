@@ -4,6 +4,21 @@ Simulador de circuitos lógicos digitais para macOS: portas, interruptores, rel�
 
 > Estado: **em desenvolvimento**. Há portas AND/OR/NAND/NOR/XOR/XNOR/NOT, interruptores, relógios, LEDs, *buffers* tri-state com barramentos, flip-flops D/RS/JK (latch, master-slave e por flanco, com *preset*/*clear* assíncronos), RAM e ROM com janela de conteúdo e ficheiros `.map`, desenhados com símbolos esquemáticos próprios (ANSI ou IEC), fios ortogonais com ramificações e junções (pontos de solda), caminhos de fios editáveis, simulação com deteção de *race conditions* e de *bus contention*, gravação e abertura de projetos, **macros hierárquicas** (definições referenciadas e não copiadas, navegação para dentro de uma instância com o estado ao vivo, criação a partir de uma seleção, modelos em caixa ou DIL, *datasheets*) com o **Parts Centre** e uma biblioteca de 20 peças incluída, alimentação (VCC) e massa, geradores de sequências, botões de pressão e entradas de impulsos, mostradores de 7 segmentos e saídas numéricas, anotações de texto, cores de LEDs e mostradores, um modo de simulação compatível com o Digital Works, a **importação de circuitos e macros do Digital Works** (`.dwm`, `.dwt` e `.map`, ver [Importação do Digital Works](#importação-do-digital-works)) e a **exportação** para `.dwm` e `.map` binário (ver [Exportação para o Digital Works](#exportação-para-o-digital-works)) e testes de carga com 100 mil componentes e com 37 500 instâncias de macros. Desfazer/refazer fica para depois.
 
+## Capturas de ecrã
+
+![Exemplo de macros a correr: contador de décadas a alimentar um driver BCD → 7 segmentos, um somador de 4 bits e uma NAND quádrupla em DIL-14](docs/screenshots/macros-demo.png)
+
+`examples/macros-demo.bitwerk` a correr (`--run`): contador de décadas → *driver* BCD → 7 segmentos, somador de 4 bits e uma NAND quádrupla em DIL-14, tudo feito com macros.
+
+| | |
+|---|---|
+| ![Dentro da macro do contador de décadas, com o estado ao vivo e as propriedades da macro](docs/screenshots/macro-inside.png) | ![Janela Memory Contents de uma RAM 16×4 por cima do contador síncrono](docs/screenshots/memory-window.png) |
+| Dentro da macro *Decade counter* (`--enter 3`): o estado ao vivo, os pinos, o modelo e o *datasheet*. | `examples/flipflops-memory.bitwerk`: contador síncrono com JK master-slave, barramento tri-state e a janela *Memory Contents* da RAM 16 × 4 (`--memory-window 18`). |
+| ![Todos os tipos de portas com símbolos IEC](docs/screenshots/all-components-iec.png) | ![Bus contention: dois buffers tri-state ativos na mesma rede, contornados a vermelho](docs/screenshots/bus-contention.png) |
+| `examples/all-components.bitwerk` com símbolos IEC (`--style iec`). | `examples/bus-contention.bitwerk`: a simulação para com *bus contention* e os condutores em conflito ficam a vermelho. |
+| ![Parts Centre com o Dual D flip-flop em DIL-14 e o datasheet](docs/screenshots/parts-centre.png) | |
+| O **Parts Centre** com a biblioteca incluída (`--parts builtin/dual-dff`). | |
+
 ## Prioridades
 
 1. **Desempenho.** A interface nunca pode engasgar ao fazer zoom ou *pan*, nem ao manipular muitos objetos. A simulação nunca bloqueia a interface.
