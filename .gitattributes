@@ -1,0 +1,3 @@
+# Keep LF everywhere (Windows checkouts default to CRLF, which breaks tests
+# that parse include_str! sources such as the WGSL shaders).
+* text=auto eol=lf

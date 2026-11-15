@@ -6,7 +6,7 @@
 //!   (`crates/bw-sim/tests/library.rs`, which also tests the behaviour of
 //!   every part and checks that the embedded files are up to date).
 //! * **User parts** live as `.bwmacro` files in a folder (by default
-//!   `~/Library/Application Support/bitwerk/Parts`, created on demand), one
+//!   the per-OS data folder + `bitwerk/Parts`, see [`user_dir`], created on demand), one
 //!   sub-folder level per library folder. Scanning never follows symbolic
 //!   links, skips hidden entries and is bounded in depth and file count;
 //!   every file is parsed as hostile input.
@@ -94,13 +94,38 @@ pub fn builtin() -> &'static [LibEntry] {
     &BUILTIN_PARTS
 }
 
-/// The default user library folder,
-/// `~/Library/Application Support/bitwerk/Parts`.
+/// The default user library folder:
+///
+/// * macOS: `~/Library/Application Support/bitwerk/Parts`;
+/// * Windows: `%APPDATA%\bitwerk\Parts`;
+/// * Linux and other Unixes: `$XDG_DATA_HOME/bitwerk/Parts`, falling back to
+///   `~/.local/share/bitwerk/Parts`.
+///
+/// `None` when the relevant variable is unset or not an absolute path.
 #[must_use]
 pub fn user_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let home = PathBuf::from(home);
-    home.is_absolute().then(|| home.join("Library/Application Support/bitwerk/Parts"))
+    data_dir().map(|d| d.join("bitwerk").join("Parts"))
+}
+
+/// An absolute path from an environment variable.
+fn env_dir(var: &str) -> Option<PathBuf> {
+    let p = PathBuf::from(std::env::var_os(var)?);
+    p.is_absolute().then_some(p)
+}
+
+#[cfg(target_os = "macos")]
+fn data_dir() -> Option<PathBuf> {
+    env_dir("HOME").map(|h| h.join("Library/Application Support"))
+}
+
+#[cfg(windows)]
+fn data_dir() -> Option<PathBuf> {
+    env_dir("APPDATA")
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn data_dir() -> Option<PathBuf> {
+    env_dir("XDG_DATA_HOME").or_else(|| env_dir("HOME").map(|h| h.join(".local/share")))
 }
 
 /// Creates the folder if missing.

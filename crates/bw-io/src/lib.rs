@@ -561,7 +561,9 @@ pub fn save_to_string(p: &Project) -> Result<String, IoError> {
         macros: macro_records(t, &ids),
         circuit: &p.circuit,
     };
-    let cfg = ron::ser::PrettyConfig::new().depth_limit(10);
+    // Always LF: ron defaults to CRLF on Windows, which would make saved files
+    // differ between platforms.
+    let cfg = ron::ser::PrettyConfig::new().depth_limit(10).new_line("\n");
     ron_options().to_string_pretty(&out, cfg).map_err(|e| IoError::Serialize(e.to_string()))
 }
 

@@ -158,7 +158,7 @@ impl BitwerkApp {
 
     pub fn add_to_library(&mut self, id: MacroId) {
         let Some(dir) = PartsCentre::dir() else {
-            self.status = "No user library folder (HOME not set)".into();
+            self.status = "No user library folder (home/data folder not set)".into();
             return;
         };
         let name = self.circuit.macros().def(id).map_or_else(|| "macro".into(), |d| d.name.clone());
