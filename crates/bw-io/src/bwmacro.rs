@@ -129,7 +129,7 @@ pub fn save_to_string(table: &MacroTable, root: MacroId) -> Result<String, IoErr
     }
     let ids = table.closure(root);
     let out = FileOut { format: MACRO_MAGIC, version: MACRO_VERSION, root, macros: macro_records(table, &ids) };
-    let cfg = ron::ser::PrettyConfig::new().depth_limit(10);
+    let cfg = ron::ser::PrettyConfig::new().depth_limit(10).new_line("\n");
     ron_options().to_string_pretty(&out, cfg).map_err(|e| IoError::Serialize(e.to_string()))
 }
 
