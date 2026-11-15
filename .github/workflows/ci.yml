@@ -30,5 +30,16 @@ jobs:
         run: cargo build --workspace --all-targets --locked
       - name: Test
         run: cargo test --workspace --locked
+      # On failure, regenerate the checked-in generated files and show how they
+      # differ on this runner.
+      - name: Diff generated files
+        if: failure()
+        shell: bash
+        env:
+          BITWERK_REGEN_LIBRARY: "1"
+        run: |
+          cargo test -p bw-sim --test library --locked -- up_to_date || true
+          git -c core.quotepath=off diff --stat
+          git diff | head -c 20000 | cat -A | head -200
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked
