@@ -25,6 +25,7 @@ mod canvas;
 mod dwexport;
 mod dwimport;
 mod hier;
+mod history;
 mod icons;
 mod kind_props;
 mod macro_props;
@@ -34,6 +35,7 @@ mod parts;
 mod scene_worker;
 mod stress;
 mod sweep;
+mod thumb;
 
 /// The app icon (256 px), generated from the symbol geometry by `bw-icon`.
 const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/AppIcon-256.png");

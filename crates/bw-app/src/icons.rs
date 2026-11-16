@@ -34,7 +34,7 @@ pub fn paint_with(
     }
 }
 
-fn build_mesh(
+pub(crate) fn build_mesh(
     kind: SymbolKind,
     style: SymbolStyle,
     level: u8,
@@ -199,6 +199,19 @@ pub fn paint_vertices(
     opacity: f32,
     to_screen: impl Fn([f32; 2]) -> Pos2,
 ) {
+    let out = vertices_mesh(verts, scale, opacity, to_screen);
+    if !out.is_empty() {
+        painter.add(egui::Shape::mesh(out));
+    }
+}
+
+/// The mesh [`paint_vertices`] paints.
+pub(crate) fn vertices_mesh(
+    verts: &[symbols::SymVertex],
+    scale: f32,
+    opacity: f32,
+    to_screen: impl Fn([f32; 2]) -> Pos2,
+) -> egui::Mesh {
     let accent = SymbolKind::Macro.accent();
     let level = 2;
     let hw = |w: Width| w.half_width(scale);
@@ -220,7 +233,5 @@ pub fn paint_vertices(
             out.indices.push(idx);
         }
     }
-    if !out.is_empty() {
-        painter.add(egui::Shape::mesh(out));
-    }
+    out
 }
