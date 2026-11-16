@@ -8,8 +8,8 @@ name: Release
 #   breaking change -> major
 # It builds the Linux and Windows binaries (no macOS), then creates the tag
 # and a GitHub release with both packages and SHA256SUMS.txt. Pushes to main
-# that are not a merged pull request, or whose pull request has no version
-# label, do not release.
+# that are not a merged pull request, whose pull request has no version label,
+# or whose pull request carries the label `no-deploy`, do not release.
 on:
   push:
     branches: [main]
@@ -48,6 +48,11 @@ jobs:
           echo "release=false" >> "$GITHUB_OUTPUT"
           labels=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq '.[].labels[].name')
           bump=""
+          # `no-deploy` wins over any version label.
+          if grep -qxF 'no-deploy' <<<"$labels"; then
+            echo "::notice::Pull request labelled no-deploy: no release."
+            exit 0
+          fi
           for l in $labels; do
             case "$l" in
               "breaking change") bump=breaking ;;

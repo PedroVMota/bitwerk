@@ -476,7 +476,7 @@ O executável chama-se `bitwerk`. `bitwerk <ficheiro.bitwerk>` abre um projeto n
 
 ### Versões e *releases*
 
-Cada *pull request* para `main` tem de levar **uma** destas etiquetas (verificado por `.github/workflows/pr-labels.yml`):
+Cada *pull request* para `main` tem de levar **uma** destas etiquetas (ou `no-deploy`, que dispensa o *release*) (verificado por `.github/workflows/pr-labels.yml`):
 
 | Etiqueta | Efeito na versão |
 |---|---|
@@ -484,7 +484,7 @@ Cada *pull request* para `main` tem de levar **uma** destas etiquetas (verificad
 | `major` | minor (1.2.3 → 1.3.0) |
 | `breaking change` | major (1.2.3 → 2.0.0) |
 
-Quando o PR é integrado na `main`, `.github/workflows/release.yml` calcula a versão a partir da última *tag* `vX.Y.Z`, compila e testa em Linux e Windows (sem macOS), cria a *tag* e a *release* com os pacotes (`.tar.gz` e `.zip`) e `SHA256SUMS.txt`. Um *push* direto, ou um PR sem etiqueta, não gera *release*.
+Quando o PR é integrado na `main`, `.github/workflows/release.yml` calcula a versão a partir da última *tag* `vX.Y.Z`, compila e testa em Linux e Windows (sem macOS), cria a *tag* e a *release* com os pacotes (`.tar.gz` e `.zip`) e `SHA256SUMS.txt`. Um PR com a etiqueta `no-deploy` (que dispensa a etiqueta de versão), um *push* direto, ou um PR sem etiqueta, não gera *release*.
 
 ## Segurança
 
