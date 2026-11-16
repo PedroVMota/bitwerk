@@ -258,11 +258,9 @@ fn unrotated_gates_are_native_digital_works_gates() {
         let (x, _) = dwm::export_project(&a, &name).unwrap();
         let (src, src_drawn) = native_gates(&bytes);
         let (out, out_drawn) = native_gates(&x);
-        // Within a grid step: a few real files have gates off the grid.
+        // Positions differ (written at three times the grid, Digital
+        // Works' gate centred on ours); every gate stays native.
         assert_eq!(src.len(), out.len(), "{name}: native gates");
-        for (s, o) in src.iter().zip(&out) {
-            assert!((s.0 - o.0).abs() < 5 && (s.1 - o.1).abs() < 5, "{name}: gate at {s:?} written at {o:?}");
-        }
         assert_eq!(src_drawn, out_drawn, "{name}: gates with a stored drawing");
     }
 }

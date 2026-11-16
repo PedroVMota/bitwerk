@@ -54,8 +54,20 @@ use super::reader::{Cls, F, Graph, Header, HeaderValue, MAX_OBJECTS, Obj, Val};
 
 /// Format version written (Digital Works 3.x).
 pub const EXPORT_VERSION: u8 = 0x22;
-/// Pixels per grid unit.
-const PX: f32 = 5.0;
+/// Pixels per grid unit. Digital Works draws its own devices (gates,
+/// tri-states, flip-flops, …) at a fixed size about three times ours
+/// (a gate is 60 px wide, ours 4 grid units), so a circuit is written at
+/// three times the Digital Works grid (5 px): its devices then fit where
+/// ours are instead of overlapping (the file is marked, see
+/// [`SCALE_MARK`], and the importer scales it back).
+pub const PX: f32 = 15.0;
+/// Factor between [`PX`] and the Digital Works grid the importer assumes.
+pub const SCALE: f32 = 3.0;
+/// [`SCALE`] for font sizes (points).
+const TEXT_SCALE: i32 = 3;
+/// Brush of the circuit's own icon box in a file written at [`SCALE`]
+/// (white to the eye; real files use 0xFFFFFF).
+pub const SCALE_MARK: i32 = 0x00FE_FFFF;
 const WHITE: i32 = 0x00FF_FFFF;
 /// Brush of a tag's connection pin in real files.
 const TAG_PIN_BRUSH: i32 = 0x00EE_FAFF;
@@ -191,7 +203,9 @@ impl Gb {
             (F::PenWidth, Val::Int(1)),
             (F::Points, rf(p)),
             (F::Brush, Val::Int(WHITE)),
-            (F::FontSize, Val::Int(t.size)),
+            // Times the layout scale (an exact multiple: the importer
+            // divides it back without loss).
+            (F::FontSize, Val::Int(t.size * TEXT_SCALE)),
             (F::FontColor, Val::Int(t.color)),
             (F::Italic, Val::Bool(t.italic)),
             (F::FontWeight, Val::Int(if t.bold { 700 } else { 400 })),
@@ -347,7 +361,7 @@ fn pin_px(c: &Component, pin: u8) -> P {
 
 /// Text box (pixels) of a short label centred at `at`.
 fn text_box(at: P, text: &str, size: i32) -> (P, P) {
-    let s = size as f32;
+    let s = (size * TEXT_SCALE) as f32;
     let w = (text.chars().count().max(1) as f32 * s * 0.6).max(4.0);
     let h = s * 1.7;
     ((at.0 - w / 2.0, at.1 - h / 2.0), (at.0 + w / 2.0, at.1 + h / 2.0))
@@ -815,9 +829,10 @@ fn dw_datasheet(text: &str) -> (String, bool) {
 }
 
 /// Font size (pt) of a note height (tenths of a grid unit); the inverse of
-/// the importer's conversion.
+/// the importer's conversion (at the Digital Works grid; [`Gb::text`]
+/// scales it).
 fn font_size(height: u8) -> i32 {
-    let s = (f32::from(height) / 10.0 * PX / (96.0 / 72.0 * 0.7)).round();
+    let s = (f32::from(height) / 10.0 * (PX / SCALE) / (96.0 / 72.0 * 0.7)).round();
     #[allow(clippy::cast_possible_truncation)]
     let s = s as i32;
     s.clamp(4, 72)
@@ -1336,6 +1351,15 @@ impl<'t> Exporter<'t> {
                 // C̄S̄ = 0), so the separate input and output nets stay
                 // separate.
                 let mut enable: Option<u32> = None;
+                // Helpers go in a column below the memory (not on its
+                // drawing): row `k`, `dx` px right of the column.
+                let (lo, hi) = {
+                    let b = c.bounds();
+                    let (a, z) = (px(b.min), px(b.max));
+                    ((a.0.min(z.0), a.1.min(z.1)), (a.0.max(z.0), a.1.max(z.1)))
+                };
+                let below = |k: usize, dx: f32| (lo.0 + 40.0 + dx, hi.1 + 40.0 + 45.0 * k as f32);
+                let mut helpers = 0usize;
                 for (our, k) in din {
                     let p = PinRef { component: c.id, pin: our };
                     if circ.pin_node(p).is_none() {
@@ -1356,8 +1380,9 @@ impl<'t> Exporter<'t> {
                                 lv,
                                 3,
                                 &[(rw.0 + 10.0, rw.1), (cs.0 + 10.0, cs.1)],
-                                (rw.0 + 20.0, f32::midpoint(rw.1, cs.1)),
+                                below(helpers, 60.0),
                             );
+                            helpers += 1;
                             lv.pin_terms
                                 .entry(PinRef { component: c.id, pin: addr_bits + data_bits })
                                 .or_default()
@@ -1371,10 +1396,10 @@ impl<'t> Exporter<'t> {
                             o
                         }
                     };
-                    let at = pin_px(c, our);
                     let tpins =
                         [(Some(p), (-20.0, 0.0), 1, 4.0), (None, (20.0, 0.0), 3, 4.0), (None, (0.0, 10.0), 1, 4.0)];
-                    let centre = (at.0 + 25.0, at.1);
+                    let centre = below(helpers, 0.0);
+                    helpers += 1;
                     let (_, tv) =
                         self.standard(gb, lv, None, Cls::TriState, &tpins, centre, Vec::new(), List::Devices, None);
                     self.notes.count("helper gates", 1);
@@ -1511,13 +1536,16 @@ impl<'t> Exporter<'t> {
             let stages = inputs - 1;
             let mut prev: Option<(u32, P)> = None;
             for s in 0..stages {
-                let x = 0.5 + 3.0 * f32::from(s) / f32::from(stages);
-                let x1 = 0.5 + 3.0 * f32::from(s + 1) / f32::from(stages);
-                let ya = if s == 0 { row(0) } else { row(s) };
+                let ya = row(s);
                 let yb = row(s + 1);
                 let last = s + 1 == stages;
-                let out = if last { map((4.0, f32::from(inputs))) } else { map((x1 - 0.2, f32::midpoint(ya, yb))) };
-                let ins = [map((x, ya)), map((x, yb))];
+                // Digital Works' gates are 4 grid units wide and the stages
+                // only 2 apart vertically: alternate between two columns
+                // (the last stage in the right one) so neighbours never
+                // overlap.
+                let x_out = if (stages - 1 - s) % 2 == 0 { 4.0 } else { 0.0 };
+                let out = map((x_out, f32::midpoint(ya, yb)));
+                let ins = [map((x_out - 4.0, ya)), map((x_out - 4.0, yb))];
                 let (o, iv) = self.helper(gb, lv, if last { op } else { 4 }, &ins, out);
                 match prev {
                     None => link_pin(lv, pr(0), iv[0]),
@@ -1773,7 +1801,36 @@ impl<'t> Exporter<'t> {
             (None, (-30.0, -10.0), 1, 4.0),
             (None, (-30.0, 10.0), 1, 4.0),
         ];
-        let (_, v) = self.standard(gb, lv, c, Cls::RsFlipFlop, &pins, at, Vec::new(), List::Devices, None);
+        // S and R are fed through gates, but the importer places the
+        // latch by all four pins (S, R on our first and last input): centre
+        // it the same way, so a re-export lands on the same spot.
+        let mut at = at;
+        if let Some(c) = c.filter(|c| c.rotation == Rotation::R0) {
+            let first_last = [(pr(0), (-30.0, -10.0)), (pr(ins.saturating_sub(1)), (-30.0, 10.0))];
+            let rel: Option<Vec<(P, P)>> = pins[..2]
+                .iter()
+                .map(|&(o, off, ..)| (o, off))
+                .chain(first_last)
+                .map(|(o, off)| {
+                    let q = c.pin_pos(o?.pin)?;
+                    Some((((q.x - c.pos.x) as f32, (q.y - c.pos.y) as f32), off))
+                })
+                .collect();
+            if let Some(rel) = rel {
+                let median = |f: &dyn Fn(&(P, P)) -> f32| {
+                    let mut v: Vec<f32> = rel.iter().map(f).collect();
+                    v.sort_by(f32::total_cmp);
+                    v[v.len() / 2]
+                };
+                let mx = median(&|(r, o)| o.0 / PX - r.0);
+                let my = median(&|(r, o)| o.1 / PX - r.1);
+                at = ((c.pos.x as f32 - mx) * PX, (c.pos.y as f32 - my) * PX);
+            }
+        }
+        if c.is_some_and(|c| c.rotation != Rotation::R0) {
+            self.approx(format!("{} drawn unrotated (Digital Works cannot rotate it)", Cls::RsFlipFlop.name()));
+        }
+        let (_, v) = self.standard(gb, lv, None, Cls::RsFlipFlop, &pins, at, Vec::new(), List::Devices, None);
         Self::feed(lv, links, s, v[2]);
         Self::feed(lv, links, r, v[3]);
         Sig::V(v[0])
@@ -1900,9 +1957,18 @@ impl<'t> Exporter<'t> {
 
     /// The icon of a macro: its box and name.
     fn icon(gb: &mut Gb, c: &Component, name: &str) -> u32 {
+        Self::icon_with(gb, c, name, WHITE)
+    }
+
+    /// The icon of the file's root object, carrying [`SCALE_MARK`].
+    fn root_icon(gb: &mut Gb, c: &Component, name: &str) -> u32 {
+        Self::icon_with(gb, c, name, SCALE_MARK)
+    }
+
+    fn icon_with(gb: &mut Gb, c: &Component, name: &str, brush: i32) -> u32 {
         let b = c.bounds();
         let (lo, hi) = (px(b.min), px(b.max));
-        let poly = gb.polygon(&[lo, (hi.0, lo.1), hi, (lo.0, hi.1)], WHITE);
+        let poly = gb.polygon(&[lo, (hi.0, lo.1), hi, (lo.0, hi.1)], brush);
         let (tl, th) = text_box((f32::midpoint(lo.0, hi.0), f32::midpoint(lo.1, hi.1)), name, 7);
         let t = gb.text(&Txt {
             text: name,
@@ -2014,10 +2080,10 @@ impl<'t> Exporter<'t> {
                     }
                     outer.push(o);
                 }
-                (Self::icon(gb, &t, name), outer)
+                (Self::root_icon(gb, &t, name), outer)
             }
             None => {
-                let poly = gb.polygon(&[(-35.0, -10.0), (35.0, -10.0), (35.0, 10.0), (-35.0, 10.0)], WHITE);
+                let poly = gb.polygon(&[(-35.0, -10.0), (35.0, -10.0), (35.0, 10.0), (-35.0, 10.0)], SCALE_MARK);
                 let (lo, hi) = text_box((0.0, 0.0), name, 7);
                 let t = gb.text(&Txt {
                     text: name,
@@ -2052,7 +2118,7 @@ impl<'t> Exporter<'t> {
         };
         let (outer, lists, ds) = self.macro_parts(gb, None, &c, &shape, 0)?;
         self.copies = self.copies.saturating_sub(1);
-        let icon = Self::icon(gb, &c, &name);
+        let icon = Self::root_icon(gb, &c, &name);
         Ok((Self::macro_rec(gb, icon, &outer, ds.clone(), false, lists), ds))
     }
 }
@@ -2119,7 +2185,7 @@ mod tests {
     fn font_size_inverts_the_importer() {
         for size in 6..=26 {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let height = (size as f32 * 96.0 / 72.0 * 0.7 / PX * 10.0).round() as u8;
+            let height = (size as f32 * 96.0 / 72.0 * 0.7 / (PX / SCALE) * 10.0).round() as u8;
             assert_eq!(font_size(height), size);
         }
     }
