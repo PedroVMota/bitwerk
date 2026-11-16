@@ -280,11 +280,54 @@ fn parse(bytes: &[u8]) -> Result<reader::Graph, IoError> {
     if bytes.len() as u64 > crate::MAX_FILE_SIZE {
         return Err(IoError::TooLarge);
     }
-    let g = reader::parse(bytes).map_err(|e| IoError::Dwm(e.to_string()))?;
+    let mut g = reader::parse(bytes).map_err(|e| IoError::Dwm(e.to_string()))?;
     if g.header.template {
         return Err(IoError::Dwm("this is a template (.dwt), not a circuit".into()));
     }
+    if written_scaled(&g) {
+        unscale(&mut g);
+    }
     Ok(g)
+}
+
+/// Whether bitwerk wrote the file at [`export::SCALE`] times the Digital
+/// Works grid: the first box of the root object's icon has the brush
+/// [`export::SCALE_MARK`].
+fn written_scaled(g: &reader::Graph) -> bool {
+    let Some(root) = g.roots.first().copied().flatten().and_then(|r| g.get(r)) else { return false };
+    if root.cls() != reader::Cls::Macro {
+        return false;
+    }
+    g.items(root.r(reader::F::Children))
+        .first()
+        .and_then(|&b| g.get(b))
+        .is_some_and(|b| b.cls() == reader::Cls::Polygon && b.int(reader::F::Brush) == Some(export::SCALE_MARK))
+}
+
+/// Brings a file written at [`export::SCALE`] back to the Digital Works
+/// grid: every coordinate and font size divided by the factor.
+fn unscale(g: &mut reader::Graph) {
+    use reader::{F, Obj, Val};
+    let k = export::SCALE;
+    for o in &mut g.objects {
+        match o {
+            Obj::Point(x, y) => {
+                *x /= k;
+                *y /= k;
+            }
+            Obj::Rec(_, fields) => {
+                for (f, v) in fields.iter_mut() {
+                    match (f, v) {
+                        (F::X | F::Y, Val::F32(c)) => *c /= k,
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+                        (F::FontSize, Val::Int(s)) => *s = ((*s as f32) / k).round().max(1.0) as i32,
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn file_stem(file_name: &str) -> &str {

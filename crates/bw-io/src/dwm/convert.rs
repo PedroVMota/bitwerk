@@ -725,13 +725,16 @@ impl<'g> Converter<'g> {
                 let c = Component { id: ComponentId(0), kind, pos, rotation: rot, color: None };
                 let mut ours: Vec<(u8, GridPos)> =
                     (first..first + n).filter_map(|p| c.pin_pos(p).map(|q| (p, q))).collect();
-                let mut theirs: Vec<(usize, GridPos)> = map2
+                // Exact (unrounded) positions: pins closer than a grid
+                // step (Digital Works' own gates in a scaled bitwerk file)
+                // keep their order instead of tying.
+                let mut theirs: Vec<(usize, (f32, f32))> = map2
                     .iter()
                     .filter(|&&(our, _)| our >= first && our < first + n)
-                    .filter_map(|&(_, k)| target(k).map(|t| (k, t)))
+                    .filter_map(|&(_, k)| pins.get(k).and_then(|&p| self.pin_centre(p)).map(|t| (k, t)))
                     .collect();
                 ours.sort_by_key(|&(_, q)| (q.x, q.y));
-                theirs.sort_by_key(|&(_, q)| (q.x, q.y));
+                theirs.sort_by(|a, b| a.1.0.total_cmp(&b.1.0).then(a.1.1.total_cmp(&b.1.1)));
                 if ours.len() == theirs.len() {
                     map2.retain(|&(our, _)| our < first || our >= first + n);
                     map2.extend(ours.iter().zip(&theirs).map(|(&(o, _), &(k, _))| (o, k)));

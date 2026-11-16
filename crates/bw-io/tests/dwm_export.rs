@@ -4,7 +4,8 @@
     clippy::unwrap_used,
     clippy::missing_panics_doc,
     clippy::many_single_char_names,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss
 )]
 
 use std::collections::BTreeMap;
@@ -221,4 +222,297 @@ fn re_export_is_stable() {
     }
     eprintln!("byte-identical re-exports: {same}/{total}");
     assert_eq!(same, total);
+}
+
+/// Centres of the gates Digital Works draws itself (`x`, `y`, no stored
+/// drawing), sorted.
+fn native_gates(bytes: &[u8]) -> (Vec<(i64, i64)>, usize) {
+    use bw_io::dwm::reader::{Cls, F};
+    let g = dwm::reader::parse(bytes).unwrap();
+    let mut native = Vec::new();
+    let mut drawn = 0;
+    for o in &g.objects {
+        if !matches!(o.cls(), Cls::Gate(..)) {
+            continue;
+        }
+        if o.bool(F::HasGraphics) == Some(false) {
+            native.push((o.f32(F::X).unwrap() as i64, o.f32(F::Y).unwrap() as i64));
+        } else {
+            drawn += 1;
+        }
+    }
+    native.sort_unstable();
+    (native, drawn)
+}
+
+/// Unrotated gates are written as Digital Works' own gates (centre only,
+/// its standard pin positions), as Digital Works writes them itself: a
+/// gate with a stored drawing and pins at bitwerk's spacing does not keep
+/// its wires attached once it is opened in Digital Works.
+#[test]
+fn unrotated_gates_are_native_digital_works_gates() {
+    for path in fixtures() {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let bytes = std::fs::read(&path).unwrap();
+        let (a, _) = dwm::import_project(&bytes, &name).unwrap();
+        let (x, _) = dwm::export_project(&a, &name).unwrap();
+        let (src, src_drawn) = native_gates(&bytes);
+        let (out, out_drawn) = native_gates(&x);
+        // Positions differ (written at three times the grid, Digital
+        // Works' gate centred on ours); every gate stays native.
+        assert_eq!(src.len(), out.len(), "{name}: native gates");
+        assert_eq!(src_drawn, out_drawn, "{name}: gates with a stored drawing");
+    }
+}
+
+/// Pin positions (pixels from the centre, pin kind) of every device
+/// Digital Works draws itself, in its pin order, as in every real file
+/// (`tests/fixtures/dwm` and the Digital Works package).
+fn native_layout(class: &str) -> Option<&'static [(f32, f32, i32)]> {
+    Some(match class {
+        "T2AndGate" | "T2NandGate" | "T2OrGate" | "T2NorGate" | "T2XorGate" | "T2XnorGate" => {
+            &[(30.0, 0.0, 2), (-30.0, 10.0, 1), (-30.0, -10.0, 1)]
+        }
+        "T3AndGate" | "T3NandGate" | "T3OrGate" | "T3NorGate" => {
+            &[(30.0, 0.0, 2), (-30.0, 10.0, 1), (-30.0, 0.0, 1), (-30.0, -10.0, 1)]
+        }
+        "T4AndGate" | "T4NandGate" | "T4OrGate" | "T4NorGate" => {
+            &[(30.0, 0.0, 2), (-30.0, 15.0, 1), (-30.0, 5.0, 1), (-30.0, -5.0, 1), (-30.0, -15.0, 1)]
+        }
+        "TNotGate" => &[(30.0, 0.0, 2), (-20.0, 0.0, 1)],
+        "TTriState" => &[(-20.0, 0.0, 1), (20.0, 0.0, 3), (0.0, 10.0, 1)],
+        "TBitGenerator" | "TClockDevice" => &[(15.0, 0.0, 2)],
+        "TSupply" => &[(10.0, 0.0, 2)],
+        "TGround" => &[(0.0, -10.0, 2)],
+        "TInteractiveInput" => &[(0.0, 0.0, 2)],
+        "TInteractiveSwitch" => &[(0.0, -15.0, 3), (0.0, 15.0, 3)],
+        "TLEDDevice" => &[(0.0, 0.0, 1)],
+        "TLEDSegmentDevice" => &[
+            (-15.0, 50.0, 1),
+            (-10.0, 50.0, 1),
+            (-5.0, 50.0, 1),
+            (0.0, 50.0, 1),
+            (5.0, 50.0, 1),
+            (10.0, 50.0, 1),
+            (15.0, 50.0, 1),
+        ],
+        "TDFlipFlop" => {
+            &[(30.0, -10.0, 2), (30.0, 10.0, 2), (-30.0, -10.0, 1), (-30.0, 0.0, 1), (-20.0, 20.0, 1), (-10.0, 20.0, 1)]
+        }
+        "TJKFlipFlop" => &[
+            (30.0, -10.0, 2),
+            (30.0, 10.0, 2),
+            (-30.0, -10.0, 1),
+            (-30.0, 0.0, 1),
+            (-20.0, 20.0, 1),
+            (-10.0, 20.0, 1),
+            (-30.0, 10.0, 1),
+        ],
+        "TRSFlipFlop" => &[(30.0, -10.0, 2), (30.0, 10.0, 2), (-30.0, -10.0, 1), (-30.0, 10.0, 1)],
+        _ => return None,
+    })
+}
+
+/// Checks a written file against what Digital Works itself writes, so
+/// that every wire stays attached when the file is opened there:
+///
+/// * devices Digital Works always draws itself are stored without a
+///   drawing, with their pins exactly at its standard positions and kinds
+///   (otherwise it draws the device in one place and the wire ends sit in
+///   another);
+/// * only macros, tags, memories, numeric outputs and (rotated) gates
+///   carry a drawing;
+/// * every wire has two ends, each a pin, macro pin or solder that refers
+///   back to the wire, and the wire's first / last point lies on that
+///   pin's centre or the solder;
+/// * every pin's wire and every solder's three wires refer back.
+fn check_digital_works_conformance(name: &str, bytes: &[u8]) {
+    use bw_io::dwm::reader::{Cls, F, Obj};
+    let g = dwm::reader::parse(bytes).unwrap();
+    let centre = |r: u32| -> (f32, f32) {
+        let o = g.get(r).unwrap();
+        if o.cls() == Cls::Solder {
+            return (o.f32(F::X).unwrap(), o.f32(F::Y).unwrap());
+        }
+        let pts = g.points(o.r(F::Points));
+        assert!(!pts.is_empty(), "{name}: pin #{r} without outline");
+        let n = pts.len() as f32;
+        (pts.iter().map(|p| p.0).sum::<f32>() / n, pts.iter().map(|p| p.1).sum::<f32>() / n)
+    };
+    let near = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() <= 0.5 && (a.1 - b.1).abs() <= 0.5;
+    for (i, o) in g.objects.iter().enumerate() {
+        let i = i as u32;
+        let Obj::Rec(cls, _) = o else { continue };
+        let class = cls.name();
+        if let Some(gfx) = o.bool(F::HasGraphics) {
+            let pins = g.items(o.r(F::Pins));
+            if let Some(layout) = native_layout(class) {
+                let rotatable_gate = matches!(cls, Cls::Gate(..));
+                if gfx {
+                    assert!(rotatable_gate, "{name}: {class} #{i} stored with a drawing");
+                    continue;
+                }
+                let at = (o.f32(F::X).unwrap(), o.f32(F::Y).unwrap());
+                assert_eq!(pins.len(), layout.len(), "{name}: {class} #{i} pin count");
+                for (k, (&p, &(dx, dy, kind))) in pins.iter().zip(layout).enumerate() {
+                    let c = centre(p);
+                    assert!(
+                        near(c, (at.0 + dx, at.1 + dy)),
+                        "{name}: {class} #{i} at {at:?}: pin {k} at {c:?}, Digital Works puts it at ({dx}, {dy})"
+                    );
+                    assert_eq!(g.get(p).unwrap().int(F::PinKind), Some(kind), "{name}: {class} #{i} pin {k} kind");
+                }
+            } else {
+                assert!(
+                    matches!(cls, Cls::Macro | Cls::Tag | Cls::Memory | Cls::Numeric) == gfx,
+                    "{name}: {class} #{i} has_graphics = {gfx}"
+                );
+            }
+        }
+        match cls {
+            Cls::Wire => {
+                let pts = g.points(o.r(F::Points));
+                assert!(!pts.is_empty(), "{name}: wire #{i} without points");
+                for (f, pt) in [(F::End1, pts[0]), (F::End2, pts[pts.len() - 1])] {
+                    let e = o.r(f).unwrap_or_else(|| panic!("{name}: wire #{i} with a loose end"));
+                    let eo = g.get(e).unwrap();
+                    let back = match eo.cls() {
+                        Cls::Pin | Cls::MacroPin => eo.r(F::Wire) == Some(i),
+                        Cls::Solder => [F::Wire1, F::Wire2, F::Wire3].iter().any(|&w| eo.r(w) == Some(i)),
+                        other => panic!("{name}: wire #{i} ends on a {}", other.name()),
+                    };
+                    assert!(back, "{name}: wire #{i}: its end #{e} does not refer back to it");
+                    assert!(
+                        near(centre(e), pt),
+                        "{name}: wire #{i} ends at {pt:?}, its pin / solder is at {:?}",
+                        centre(e)
+                    );
+                }
+            }
+            Cls::Pin | Cls::MacroPin => {
+                if let Some(w) = o.r(F::Wire) {
+                    let wo = g.get(w).unwrap();
+                    assert!(
+                        wo.cls() == Cls::Wire && (wo.r(F::End1) == Some(i) || wo.r(F::End2) == Some(i)),
+                        "{name}: pin #{i}: its wire #{w} does not end on it"
+                    );
+                }
+            }
+            Cls::Solder => {
+                for f in [F::Wire1, F::Wire2, F::Wire3] {
+                    let w = o.r(f).unwrap_or_else(|| panic!("{name}: solder #{i} with fewer than 3 wires"));
+                    let wo = g.get(w).unwrap();
+                    assert!(
+                        wo.r(F::End1) == Some(i) || wo.r(F::End2) == Some(i),
+                        "{name}: solder #{i}: wire #{w} does not end on it"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Every export (real files re-exported, their macros, the examples and
+/// random circuits with every component kind, rotations, wide gates,
+/// flip-flop variants, memories and nested macros) follows the rules
+/// above.
+#[test]
+fn every_export_conforms_to_digital_works() {
+    // The real files themselves pass the check (it encodes their rules).
+    for path in fixtures() {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        check_digital_works_conformance(&format!("original {name}"), &std::fs::read(&path).unwrap());
+    }
+    for path in fixtures() {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let bytes = std::fs::read(&path).unwrap();
+        let (a, _) = dwm::import_project(&bytes, &name).unwrap();
+        check_digital_works_conformance(&name, &dwm::export_project(&a, &name).unwrap().0);
+        if let Ok((m, _)) = dwm::import_macro(&bytes, &name) {
+            check_digital_works_conformance(&name, &dwm::export_macro(&m.table, m.root, &name).unwrap().0);
+        }
+    }
+    for path in examples() {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let a = bw_io::load_from_path(&path).unwrap();
+        check_digital_works_conformance(&name, &dwm::export_project(&a, &name).unwrap().0);
+    }
+    for seed in 0..200u64 {
+        let o = randcirc::Opts { parts: 10 + (seed as usize % 30), rotate: seed % 3 != 0, exact: false, body: false };
+        let c = randcirc::random_project(seed, o);
+        let p = bw_io::Project { name: format!("random {seed}"), circuit: c };
+        let name = format!("random {seed}");
+        check_digital_works_conformance(&name, &dwm::export_project(&p, "r.dwm").unwrap().0);
+        for (id, _) in p.circuit.macros().iter() {
+            check_digital_works_conformance(&name, &dwm::export_macro(p.circuit.macros(), id, "m.dwm").unwrap().0);
+        }
+    }
+}
+
+/// Smallest x and y of the root page of a written file: wire points,
+/// solders, the centres of devices Digital Works draws itself and the
+/// drawings and pins of the others.
+fn page_min(bytes: &[u8]) -> (f32, f32) {
+    use bw_io::dwm::reader::F;
+    let g = dwm::reader::parse(bytes).unwrap();
+    let root = g.get(g.roots[0].unwrap()).unwrap();
+    let mut pts: Vec<(f32, f32)> = Vec::new();
+    for f in [F::Devices, F::Tags, F::Inputs, F::Outputs, F::Solders, F::Wires] {
+        for i in g.items(root.r(f)) {
+            let o = g.get(i).unwrap();
+            if let (Some(x), Some(y)) = (o.f32(F::X), o.f32(F::Y)) {
+                pts.push((x, y));
+            }
+            pts.extend(g.points(o.r(F::Points)));
+            for d in g.items(o.r(F::Children)) {
+                pts.extend(g.points(g.get(d).unwrap().r(F::Points)));
+            }
+            for p in g.items(o.r(F::Pins)) {
+                pts.extend(g.points(g.get(p).unwrap().r(F::Points)));
+            }
+        }
+    }
+    pts.iter().fold((f32::INFINITY, f32::INFINITY), |(a, b), &(x, y)| (a.min(x), b.min(y)))
+}
+
+/// Digital Works' page starts at (0, 0) and cuts off anything above or
+/// left of it: every export keeps the circuit at least
+/// [`dwm::export::PAGE_MARGIN`] from those edges (less the 4 px of a pin
+/// outline), wherever it was drawn in bitwerk (negative coordinates
+/// included).
+#[test]
+fn exports_keep_a_margin_from_the_page_edges() {
+    let limit = dwm::export::PAGE_MARGIN - 4.0;
+    let check = |name: &str, bytes: &[u8]| {
+        let (x, y) = page_min(bytes);
+        assert!(x >= limit && y >= limit, "{name}: circuit reaches ({x}, {y}), closer than the page margin");
+    };
+    for path in fixtures() {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let bytes = std::fs::read(&path).unwrap();
+        let (a, _) = dwm::import_project(&bytes, &name).unwrap();
+        check(&name, &dwm::export_project(&a, &name).unwrap().0);
+        if let Ok((m, _)) = dwm::import_macro(&bytes, &name) {
+            check(&name, &dwm::export_macro(&m.table, m.root, &name).unwrap().0);
+        }
+    }
+    for path in examples() {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        check(&name, &dwm::export_project(&bw_io::load_from_path(&path).unwrap(), &name).unwrap().0);
+    }
+    for seed in 0..60u64 {
+        let o = randcirc::Opts { parts: 10 + (seed as usize % 30), rotate: seed % 3 != 0, exact: false, body: false };
+        let c = randcirc::random_project(seed, o);
+        // Also drawn far into negative coordinates.
+        let mut moved = c.clone();
+        let parts: Vec<_> = moved.components().map(|k| (k.id, k.pos)).collect();
+        for (id, pos) in parts {
+            let _ = moved.move_component(id, bw_core::GridPos::new(pos.x - 200, pos.y - 150));
+        }
+        for (k, circuit) in [c, moved].into_iter().enumerate() {
+            let p = bw_io::Project { name: format!("random {seed}/{k}"), circuit };
+            check(&p.name, &dwm::export_project(&p, "r.dwm").unwrap().0);
+        }
+    }
 }
