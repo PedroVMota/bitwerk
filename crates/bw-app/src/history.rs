@@ -27,12 +27,13 @@
 //! (components as boxes, wires as lines), computed once per state and capped
 //! at [`THUMB_ITEMS`] items so that a 100k-component circuit stays cheap.
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bw_core::{Circuit, ComponentId, ComponentKind, Edit, MacroId};
-use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
+use bw_core::{Circuit, ComponentId, ComponentKind, Edit, MacroId, MacroShape, Rotation};
+use bw_render::symbols::{SymbolKind, SymbolStyle};
+use egui::{Color32, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 
 use crate::app::BitwerkApp;
 
@@ -44,20 +45,37 @@ const MAX_WEIGHT: usize = 1_500_000;
 const COALESCE: Duration = Duration::from_secs(2);
 /// Items (boxes or wires) a thumbnail draws at most; more are sampled.
 const THUMB_ITEMS: usize = 3000;
-/// Size of a thumbnail in the panel.
-const THUMB_SIZE: Vec2 = Vec2::new(216.0, 120.0);
-/// Height of one row of the panel (thumbnail, caption, spacing).
-const ROW_HEIGHT: f32 = 120.0 + 20.0 + 14.0;
+/// Size of the thumbnail in the hover tooltip.
+const PREVIEW_SIZE: Vec2 = Vec2::new(420.0, 280.0);
 
-/// Pre-computed geometry of a state, in grid units.
+/// A component of a thumbnail: where it is and how to draw its symbol.
+struct Item {
+    /// Top-left of the (rotated) bounds.
+    min: (i32, i32),
+    /// Unrotated size.
+    size: (i32, i32),
+    rot: Rotation,
+    sym: SymbolKind,
+    /// Macro instances draw their definition's symbol.
+    mac: Option<(Arc<bw_core::MacroDef>, MacroShape, u64)>,
+}
+
+/// Pre-computed geometry of a state, in grid units, and the shapes of the
+/// last size it was painted at.
 struct Thumb {
     lo: Pos2,
     hi: Pos2,
-    /// `(min x, min y, max x, max y, is a macro instance)`.
-    boxes: Vec<(i32, i32, i32, i32, bool)>,
+    items: Vec<Item>,
     /// Wire segments `(x1, y1, x2, y2)`.
     wires: Vec<(i32, i32, i32, i32)>,
+    /// Shapes relative to the rectangle's top-left, for `(size, style, dark)`.
+    cache: RefCell<Option<(CacheKey, Arc<Vec<Shape>>)>>,
 }
+
+type CacheKey = ([i32; 2], SymbolStyle, bool);
+
+/// Symbols drawn as real symbols (the rest become plain boxes).
+const THUMB_SYMBOLS: usize = 600;
 
 impl Thumb {
     fn build(c: &Circuit) -> Self {
@@ -68,13 +86,25 @@ impl Thumb {
             hi = (hi.0.max(x), hi.1.max(y));
         };
         let stride_c = c.component_count().div_ceil(THUMB_ITEMS).max(1);
-        let mut boxes = Vec::new();
+        let mut items = Vec::new();
         for (i, comp) in c.components().enumerate() {
             let b = comp.bounds();
             grow(b.min.x, b.min.y);
             grow(b.max.x, b.max.y);
             if i % stride_c == 0 {
-                boxes.push((b.min.x, b.min.y, b.max.x, b.max.y, matches!(comp.kind, ComponentKind::Macro(_))));
+                let mac = match comp.kind {
+                    ComponentKind::Macro(shape) => {
+                        c.macros().get(shape.def).map(|e| (Arc::clone(&e.def), shape, e.hash))
+                    }
+                    _ => None,
+                };
+                items.push(Item {
+                    min: (b.min.x, b.min.y),
+                    size: comp.kind.size(),
+                    rot: comp.rotation,
+                    sym: SymbolKind::of(&comp.kind),
+                    mac,
+                });
             }
         }
         let stride_w = c.segment_count().div_ceil(THUMB_ITEMS).max(1);
@@ -92,50 +122,88 @@ impl Thumb {
         }
         #[allow(clippy::cast_precision_loss, reason = "grid coordinates are far below 2^24 in practice")]
         let p = |t: (i32, i32)| Pos2::new(t.0 as f32, t.1 as f32);
-        Self { lo: p(lo), hi: p(hi), boxes, wires }
+        Self { lo: p(lo), hi: p(hi), items, wires, cache: RefCell::new(None) }
     }
 
-    /// Paints the snapshot fitted into `rect`.
-    fn paint(&self, painter: &egui::Painter, rect: Rect, dark: bool) {
-        let (bg, wire, body, mac) = if dark {
-            (
-                Color32::from_gray(22),
-                Color32::from_rgb(90, 190, 120),
-                Color32::from_gray(170),
-                Color32::from_rgb(230, 170, 70),
-            )
-        } else {
-            (
-                Color32::from_gray(246),
-                Color32::from_rgb(30, 140, 70),
-                Color32::from_gray(80),
-                Color32::from_rgb(200, 120, 20),
-            )
-        };
-        painter.rect_filled(rect, 3.0, bg);
-        let inner = rect.shrink(6.0);
-        let ext = (self.hi - self.lo).max(Vec2::splat(1.0));
-        let scale = (inner.width() / ext.x).min(inner.height() / ext.y);
-        let off = inner.center().to_vec2() - ((self.lo.to_vec2() + self.hi.to_vec2()) * 0.5) * scale;
-        let map = |x: i32, y: i32| {
-            #[allow(clippy::cast_precision_loss, reason = "grid coordinates are far below 2^24 in practice")]
-            Pos2::new(x as f32 * scale + off.x, y as f32 * scale + off.y)
+    /// Paints the snapshot fitted into `rect` with the real symbols.
+    fn paint(&self, painter: &egui::Painter, rect: Rect, style: SymbolStyle, dark: bool) {
+        #[allow(clippy::cast_possible_truncation, reason = "a panel size in points")]
+        let key = ([rect.width().round() as i32, rect.height().round() as i32], style, dark);
+        let shapes = {
+            let mut cache = self.cache.borrow_mut();
+            if let Some((_, s)) = cache.as_ref().filter(|(k, _)| *k == key) {
+                Arc::clone(s)
+            } else {
+                let s = Arc::new(self.shapes(Rect::from_min_size(Pos2::ZERO, rect.size()), style, dark));
+                *cache = Some((key, Arc::clone(&s)));
+                s
+            }
         };
         let painter = painter.with_clip_rect(rect);
-        let stroke = Stroke::new((scale * 0.18).clamp(0.6, 1.4), wire);
+        for shape in shapes.iter() {
+            let mut shape = shape.clone();
+            shape.translate(rect.min.to_vec2());
+            painter.add(shape);
+        }
+    }
+
+    /// Background, wires and components fitted into `rect`.
+    fn shapes(&self, rect: Rect, style: SymbolStyle, dark: bool) -> Vec<Shape> {
+        let (bg, wire, body) = if dark {
+            (Color32::from_gray(22), Color32::from_rgb(90, 190, 120), Color32::from_gray(170))
+        } else {
+            (Color32::from_gray(246), Color32::from_rgb(30, 140, 70), Color32::from_gray(80))
+        };
+        let mut out = vec![Shape::rect_filled(rect, 3.0, bg)];
+        let inner = rect.shrink(8.0);
+        let ext = (self.hi - self.lo).max(Vec2::splat(1.0));
+        let scale = (inner.width() / ext.x).min(inner.height() / ext.y).min(24.0);
+        let off = inner.center().to_vec2() - ((self.lo.to_vec2() + self.hi.to_vec2()) * 0.5) * scale;
+        #[allow(clippy::cast_precision_loss, reason = "grid coordinates are far below 2^24 in practice")]
+        let map = |x: f32, y: f32| Pos2::new(x * scale + off.x, y * scale + off.y);
+        let stroke = Stroke::new((scale * 0.12).clamp(0.6, 1.4), wire);
+        #[allow(clippy::cast_precision_loss, reason = "grid coordinates are far below 2^24 in practice")]
         for &(x1, y1, x2, y2) in &self.wires {
-            painter.line_segment([map(x1, y1), map(x2, y2)], stroke);
+            out.push(Shape::line_segment([map(x1 as f32, y1 as f32), map(x2 as f32, y2 as f32)], stroke));
         }
-        for &(x1, y1, x2, y2, is_macro) in &self.boxes {
-            let r = Rect::from_min_max(map(x1, y1), map(x2, y2));
-            let r = if r.width() < 1.5 || r.height() < 1.5 {
-                Rect::from_center_size(r.center(), Vec2::splat(1.5))
-            } else {
-                r
+        let detailed = self.items.len() <= THUMB_SYMBOLS;
+        for it in &self.items {
+            #[allow(clippy::cast_precision_loss, reason = "grid coordinates are far below 2^24 in practice")]
+            let (mx, my, w, h) = (it.min.0 as f32, it.min.1 as f32, it.size.0 as f32, it.size.1 as f32);
+            let (rw, rh) = if matches!(it.rot, Rotation::R90 | Rotation::R270) { (h, w) } else { (w, h) };
+            let box_rect = Rect::from_min_max(map(mx, my), map(mx + rw, my + rh));
+            if !detailed || scale * w.min(h) < 4.0 {
+                let r = if box_rect.width() < 1.5 || box_rect.height() < 1.5 {
+                    Rect::from_center_size(box_rect.center(), Vec2::splat(1.5))
+                } else {
+                    box_rect
+                };
+                out.push(Shape::rect_filled(r, 0.0, body.gamma_multiply(0.8)));
+                continue;
+            }
+            // Same mapping as the canvas shader (`sym_to_world`).
+            let to_screen = |p: [f32; 2]| {
+                let r = match it.rot {
+                    Rotation::R0 => p,
+                    Rotation::R90 => [h - p[1], p[0]],
+                    Rotation::R180 => [w - p[0], h - p[1]],
+                    Rotation::R270 => [p[1], w - p[0]],
+                };
+                map(mx + r[0], my + r[1])
             };
-            painter.rect_filled(r, 0.0, if is_macro { mac } else { body }.gamma_multiply(0.85));
+            let mesh = match &it.mac {
+                Some((def, shape, hash)) => {
+                    let verts = crate::icons::macro_mesh(def, shape, *hash);
+                    crate::icons::vertices_mesh(&verts, scale, 1.0, to_screen)
+                }
+                None => crate::icons::build_mesh(it.sym, style, 2, 1.0, scale, to_screen),
+            };
+            if !mesh.is_empty() {
+                out.push(Shape::mesh(mesh));
+            }
         }
-        painter.rect_stroke(rect, 3.0, Stroke::new(1.0, Color32::from_gray(110)), egui::StrokeKind::Inside);
+        out.push(Shape::rect_stroke(rect, 3.0, Stroke::new(1.0, Color32::from_gray(110)), egui::StrokeKind::Inside));
+        out
     }
 }
 
@@ -407,60 +475,48 @@ impl BitwerkApp {
         }
     }
 
-    /// The History panel: one entry per state, newest at the bottom, with a
-    /// thumbnail of the circuit as it was. Click an entry to go there.
+    /// The History panel: one compact row per state (`#3  Move component`),
+    /// like the other panels. Hovering a row previews the circuit as it was
+    /// then; clicking it goes there.
     pub fn history_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("History");
+        let n = self.history.states.len();
+        let cursor = self.history.cursor;
         ui.horizontal(|ui| {
-            ui.heading("History");
-            if ui.add_enabled(self.history.can_undo(), egui::Button::new("↶")).on_hover_text("Undo").clicked() {
+            if ui.add_enabled(self.history.can_undo(), egui::Button::new("Undo")).clicked() {
                 self.undo();
             }
-            if ui.add_enabled(self.history.can_redo(), egui::Button::new("↷")).on_hover_text("Redo").clicked() {
+            if ui.add_enabled(self.history.can_redo(), egui::Button::new("Redo")).clicked() {
                 self.redo();
             }
         });
-        let n = self.history.states.len();
-        ui.weak(format!("{} step{} · current: {}", n - 1, if n == 2 { "" } else { "s" }, self.history.cursor));
+        ui.label(format!("{} step{} · at #{cursor}", n - 1, if n == 2 { "" } else { "s" }));
         ui.separator();
         let dark = ui.visuals().dark_mode;
+        let style = self.style;
+        let row_h = ui.spacing().interact_size.y;
         let scroll_to = std::mem::take(&mut self.history.scroll_to_cursor);
-        let mut jump = None;
-        let cursor = self.history.cursor;
         let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
         if scroll_to {
             // Rows outside the viewport are not built, so scroll by offset.
             #[allow(clippy::cast_precision_loss, reason = "a few hundred rows at most")]
-            let y = cursor as f32 * ROW_HEIGHT - (ui.available_height() - ROW_HEIGHT) * 0.5;
+            let y = cursor as f32 * (row_h + ui.spacing().item_spacing.y) - ui.available_height() * 0.5;
             area = area.vertical_scroll_offset(y.max(0.0));
         }
-        area.show_rows(ui, ROW_HEIGHT, n, |ui, rows| {
+        let mut jump = None;
+        area.show_rows(ui, row_h, n, |ui, rows| {
             for i in rows {
                 let state = &self.history.states[i];
-                let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::click());
-                let future = i > cursor;
-                let painter = ui.painter_at(rect);
-                if i == cursor {
-                    painter.rect_filled(rect, 4.0, ui.visuals().selection.bg_fill);
-                } else if resp.hovered() {
-                    painter.rect_filled(rect, 4.0, ui.visuals().widgets.hovered.weak_bg_fill);
-                }
-                let thumb_rect =
-                    Rect::from_min_size(rect.min + Vec2::new(4.0, 4.0), THUMB_SIZE.min(rect.size() - Vec2::splat(8.0)));
-                let thumb = state.thumb.get_or_init(|| Thumb::build(&state.circuit));
-                let mut thumb_painter = painter.clone();
-                if future {
-                    thumb_painter.multiply_opacity(0.45);
-                }
-                thumb.paint(&thumb_painter, thumb_rect, dark);
-                let text_color = if future { ui.visuals().weak_text_color() } else { ui.visuals().text_color() };
-                let caption = if i == 0 { state.label.clone() } else { format!("{i}. {}", state.label) };
-                painter.text(
-                    Pos2::new(thumb_rect.left(), thumb_rect.bottom() + 3.0),
-                    egui::Align2::LEFT_TOP,
-                    caption,
-                    egui::FontId::proportional(13.0),
-                    text_color,
-                );
+                let text = format!("#{i}  {}", state.label);
+                let text = if i > cursor { egui::RichText::new(text).weak() } else { egui::RichText::new(text) };
+                let resp =
+                    ui.add_sized([ui.available_width(), row_h], egui::Button::selectable(i == cursor, text).truncate());
+                resp.clone().on_hover_ui(|ui| {
+                    ui.label(format!("#{i}  {}", state.label));
+                    let (rect, _) = ui.allocate_exact_size(PREVIEW_SIZE, Sense::hover());
+                    let thumb = state.thumb.get_or_init(|| Thumb::build(&state.circuit));
+                    thumb.paint(ui.painter(), rect, style, dark);
+                });
                 if resp.clicked() {
                     jump = Some(i);
                 }
@@ -468,7 +524,7 @@ impl BitwerkApp {
         });
         if let Some(i) = jump {
             self.history_goto(i);
-            self.status = format!("Went to step {i}: {}", self.history.states[i].label);
+            self.status = format!("Went to #{i}: {}", self.history.states[i].label);
         }
     }
 }
@@ -541,7 +597,7 @@ mod tests {
     #[test]
     fn thumbnail_covers_components_and_handles_empty() {
         let empty = Thumb::build(&Circuit::new());
-        assert!(empty.hi.x > empty.lo.x && empty.boxes.is_empty());
+        assert!(empty.hi.x > empty.lo.x && empty.items.is_empty());
         let mut c = Circuit::new();
         c.apply(&Edit::AddComponent {
             kind: ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle },
@@ -550,7 +606,32 @@ mod tests {
         })
         .expect("edit applies");
         let t = Thumb::build(&c);
-        assert_eq!(t.boxes.len(), 1);
+        assert_eq!(t.items.len(), 1);
         assert!(t.lo.x <= 5.0 && t.lo.y <= 7.0);
+    }
+
+    #[test]
+    fn thumbnail_draws_real_symbols_in_every_rotation() {
+        let mut c = Circuit::new();
+        for (i, rot) in [Rotation::R0, Rotation::R90, Rotation::R180, Rotation::R270].into_iter().enumerate() {
+            let x = i32::try_from(i).expect("small") * 8;
+            c.apply(&Edit::AddComponent {
+                kind: ComponentKind::Gate { op: bw_core::GateOp::Or, inputs: 2 },
+                pos: GridPos::new(x, 0),
+                rotation: rot,
+            })
+            .expect("edit applies");
+        }
+        let t = Thumb::build(&c);
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0));
+        let shapes = t.shapes(rect, SymbolStyle::Ansi, true);
+        let meshes: Vec<_> =
+            shapes.iter().filter_map(|s| if let Shape::Mesh(m) = s { Some(m) } else { None }).collect();
+        assert_eq!(meshes.len(), 4, "one symbol mesh per gate");
+        for m in meshes {
+            assert!(!m.is_empty());
+            // Inside the thumbnail.
+            assert!(m.vertices.iter().all(|v| rect.expand(2.0).contains(v.pos)), "symbol stays in the frame");
+        }
     }
 }
