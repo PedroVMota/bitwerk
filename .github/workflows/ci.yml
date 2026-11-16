@@ -1,9 +1,17 @@
 name: CI
 
+# Runs only for a pull request that carries a version level label (fix, major
+# or breaking change), and again when labels change. Without one the jobs are
+# skipped, so no Linux or Windows runner is billed. Pushes do not run it: the
+# Release workflow tests again before publishing.
 on:
-  push:
-    branches: [main, "feature/**"]
   pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+
+# A new push or label change cancels the run still in progress for the PR.
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -14,10 +22,14 @@ env:
 jobs:
   build:
     name: ${{ matrix.os }}
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'fix') ||
+      contains(github.event.pull_request.labels.*.name, 'major') ||
+      contains(github.event.pull_request.labels.*.name, 'breaking change')
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

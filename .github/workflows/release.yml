@@ -1,21 +1,18 @@
 name: Release
 
-# Manual only: Actions → Release → Run workflow, then enter the version.
-# Builds the Linux and Windows binaries from the selected branch, then creates
-# the tag `v<version>` and a GitHub release whose notes list every commit
-# since the previous tag (or every commit, for the first release).
+# Runs when a pull request is merged into main (any merge method). The
+# version label of the pull request decides the next version, counted from the
+# latest stable tag v<major>.<minor>.<patch>:
+#   fix             -> patch
+#   major           -> minor
+#   breaking change -> major
+# It builds the Linux and Windows binaries (no macOS), then creates the tag
+# and a GitHub release with both packages and SHA256SUMS.txt. Pushes to main
+# that are not a merged pull request, whose pull request has no version label,
+# or whose pull request carries the label `no-deploy`, do not release.
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version (e.g. 0.2.0 or v0.2.0)"
-        required: true
-        type: string
-      prerelease:
-        description: "Mark as pre-release"
-        required: false
-        type: boolean
-        default: false
+  push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -23,55 +20,86 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Never two releases at once: the second would compute the same version.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   prepare:
     name: Prepare
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
+      release: ${{ steps.version.outputs.release }}
       tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           fetch-tags: true
-      - name: Validate version
+      - name: Next version from the pull request label
         id: version
         env:
-          INPUT_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          version="${INPUT_VERSION#v}"
-          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::'$INPUT_VERSION' is not a version like 1.2.3 or 1.2.3-beta.1"
-            exit 1
+          echo "release=false" >> "$GITHUB_OUTPUT"
+          labels=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq '.[].labels[].name')
+          bump=""
+          # `no-deploy` wins over any version label.
+          if grep -qxF 'no-deploy' <<<"$labels"; then
+            echo "::notice::Pull request labelled no-deploy: no release."
+            exit 0
           fi
-          tag="v$version"
+          for l in $labels; do
+            case "$l" in
+              "breaking change") bump=breaking ;;
+              major) [ "$bump" = breaking ] || bump=major ;;
+              fix) [ -n "$bump" ] || bump=fix ;;
+            esac
+          done
+          if [ -z "$bump" ]; then
+            echo "::notice::No merged pull request with a fix / major / breaking change label for $GITHUB_SHA: no release."
+            exit 0
+          fi
+          prev=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
+          prev=${prev:-v0.0.0}
+          IFS=. read -r major minor patch <<<"${prev#v}"
+          case "$bump" in
+            breaking) major=$((major + 1)); minor=0; patch=0 ;;
+            major) minor=$((minor + 1)); patch=0 ;;
+            fix) patch=$((patch + 1)) ;;
+          esac
+          tag="v$major.$minor.$patch"
           if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
             echo "::error::Tag $tag already exists"
             exit 1
           fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-      - name: Changelog
-        env:
-          TAG: ${{ steps.version.outputs.tag }}
-        run: |
-          prev="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          echo "$prev + $bump -> $tag"
           {
-            if [ -n "$prev" ]; then
-              echo "## Changes since $prev"
-              range="$prev..HEAD"
-            else
+            echo "release=true"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+          {
+            if [ "$prev" = v0.0.0 ]; then
               echo "## Changes"
               range="HEAD"
+            else
+              echo "## Changes since $prev"
+              range="$prev..HEAD"
             fi
             echo
             git log "$range" --no-merges --pretty='- %s (%h)'
-            if [ -n "$prev" ]; then
+            if [ "$prev" != v0.0.0 ]; then
               echo
-              echo "**Full diff:** https://github.com/${GITHUB_REPOSITORY}/compare/$prev...$TAG"
+              echo "**Full diff:** https://github.com/${GITHUB_REPOSITORY}/compare/$prev...$tag"
             fi
           } > notes.md
           cat notes.md
       - uses: actions/upload-artifact@v4
+        if: steps.version.outputs.release == 'true'
         with:
           name: notes
           path: notes.md
@@ -79,6 +107,7 @@ jobs:
   build:
     name: Build ${{ matrix.name }}
     needs: prepare
+    if: needs.prepare.outputs.release == 'true'
     strategy:
       fail-fast: true
       matrix:
@@ -97,6 +126,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
+      - name: Test
+        run: cargo test --workspace --locked
       - name: Build
         run: cargo build --release --locked -p bw-app --bin bitwerk --target ${{ matrix.target }}
       - name: Package
@@ -145,13 +176,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.prepare.outputs.tag }}
-          PRERELEASE: ${{ inputs.prerelease }}
         run: |
-          flags=()
-          if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
           gh release create "$TAG" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "$TAG" \
-            --notes-file artifacts/notes/notes.md \
-            "${flags[@]}"
+            --notes-file artifacts/notes/notes.md
