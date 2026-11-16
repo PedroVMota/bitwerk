@@ -1,11 +1,13 @@
 //! Undo / redo and the History panel.
 //!
-//! The history is a linear timeline of **states**: `states[0]` is how the
-//! project looked when it was opened (or created), every later entry is the
-//! whole root circuit right after one user action. The cursor marks the state
-//! on the canvas: Undo moves it back, Redo forward, and clicking an entry in
-//! the panel jumps straight to it. A new action made after going back
-//! discards the states ahead (the classic redo rule).
+//! The history is a **tree** of states. The root is how the project looked
+//! when it was opened (or created); every other node is the whole root
+//! circuit right after one user action, child of the state the action was
+//! made from. The cursor marks the state on the canvas: Undo goes to its
+//! parent, Redo to the child last visited, and clicking a node in the panel
+//! jumps straight to it. Going back and making a *different* change does not
+//! discard what was there: it starts a new branch, and the old one stays in
+//! the tree.
 //!
 //! States are `Arc<Circuit>` snapshots. The root circuit holds the macro
 //! definitions too, so an edit made inside a macro is covered like any other,
@@ -15,199 +17,59 @@
 //!
 //! What counts as one action: every model edit made within one UI pass
 //! (a drag, "Delete" on a multi-selection, creating a macro, …) is merged
-//! into one entry, committed at the end of the pass. Typing into a memory or
+//! into one node, committed at the end of the pass. Typing into a memory or
 //! a note is merged further: consecutive edits of the same kind within
-//! [`COALESCE`] replace the last entry instead of adding one.
+//! [`COALESCE`] replace the last node (while it has no children) instead of
+//! adding one.
 //!
-//! Memory is bounded: at most [`MAX_STATES`] entries and about
-//! [`MAX_WEIGHT`] components + wire segments in total; the oldest states go
-//! first (the current one is never dropped).
+//! Memory is bounded: at most [`MAX_STATES`] nodes and about [`MAX_WEIGHT`]
+//! components + wire segments in total. The oldest node goes first among the
+//! branch tips (leaves other than the current state) and the root when it has
+//! a single child, so the current state and the path to it are never dropped.
 //!
-//! Thumbnails are drawn straight from the snapshot with the egui painter
-//! (components as boxes, wires as lines), computed once per state and capped
-//! at [`THUMB_ITEMS`] items so that a 100k-component circuit stays cheap.
+//! The panel draws the tree like a commit graph: one row per node in
+//! creation order, branches in lanes to the right of the trunk. Thumbnails
+//! live in [`crate::thumb`].
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::OnceCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bw_core::{Circuit, ComponentId, ComponentKind, Edit, MacroId, MacroShape, Rotation};
-use bw_render::symbols::{SymbolKind, SymbolStyle};
-use egui::{Color32, Pos2, Rect, Sense, Shape, Stroke, Vec2};
+use bw_core::{Circuit, ComponentId, ComponentKind, Edit, MacroId};
+use egui::{Color32, Pos2, Sense, Stroke, Vec2};
 
 use crate::app::BitwerkApp;
+use crate::thumb::Thumb;
 
-/// Most entries kept (including the initial state).
+/// Most nodes kept (including the root).
 const MAX_STATES: usize = 200;
-/// Budget of retained (components + wire segments) summed over all states.
+/// Budget of retained (components + wire segments) summed over all nodes.
 const MAX_WEIGHT: usize = 1_500_000;
-/// Typing-like edits closer together than this share one entry.
+/// Typing-like edits closer together than this share one node.
 const COALESCE: Duration = Duration::from_secs(2);
-/// Items (boxes or wires) a thumbnail draws at most; more are sampled.
-const THUMB_ITEMS: usize = 3000;
 /// Size of the thumbnail in the hover tooltip.
 const PREVIEW_SIZE: Vec2 = Vec2::new(420.0, 280.0);
+/// Colours of the branch lanes.
+const LANE_COLORS: [Color32; 6] = [
+    Color32::from_rgb(110, 170, 255),
+    Color32::from_rgb(240, 170, 80),
+    Color32::from_rgb(120, 210, 140),
+    Color32::from_rgb(230, 120, 170),
+    Color32::from_rgb(180, 140, 240),
+    Color32::from_rgb(90, 200, 210),
+];
 
-/// A component of a thumbnail: where it is and how to draw its symbol.
-struct Item {
-    /// Top-left of the (rotated) bounds.
-    min: (i32, i32),
-    /// Unrotated size.
-    size: (i32, i32),
-    rot: Rotation,
-    sym: SymbolKind,
-    /// Macro instances draw their definition's symbol.
-    mac: Option<(Arc<bw_core::MacroDef>, MacroShape, u64)>,
-}
-
-/// Pre-computed geometry of a state, in grid units, and the shapes of the
-/// last size it was painted at.
-struct Thumb {
-    lo: Pos2,
-    hi: Pos2,
-    items: Vec<Item>,
-    /// Wire segments `(x1, y1, x2, y2)`.
-    wires: Vec<(i32, i32, i32, i32)>,
-    /// Shapes relative to the rectangle's top-left, for `(size, style, dark)`.
-    cache: RefCell<Option<(CacheKey, Arc<Vec<Shape>>)>>,
-}
-
-type CacheKey = ([i32; 2], SymbolStyle, bool);
-
-/// Symbols drawn as real symbols (the rest become plain boxes).
-const THUMB_SYMBOLS: usize = 600;
-
-impl Thumb {
-    fn build(c: &Circuit) -> Self {
-        let mut lo = (i32::MAX, i32::MAX);
-        let mut hi = (i32::MIN, i32::MIN);
-        let mut grow = |x: i32, y: i32| {
-            lo = (lo.0.min(x), lo.1.min(y));
-            hi = (hi.0.max(x), hi.1.max(y));
-        };
-        let stride_c = c.component_count().div_ceil(THUMB_ITEMS).max(1);
-        let mut items = Vec::new();
-        for (i, comp) in c.components().enumerate() {
-            let b = comp.bounds();
-            grow(b.min.x, b.min.y);
-            grow(b.max.x, b.max.y);
-            if i % stride_c == 0 {
-                let mac = match comp.kind {
-                    ComponentKind::Macro(shape) => {
-                        c.macros().get(shape.def).map(|e| (Arc::clone(&e.def), shape, e.hash))
-                    }
-                    _ => None,
-                };
-                items.push(Item {
-                    min: (b.min.x, b.min.y),
-                    size: comp.kind.size(),
-                    rot: comp.rotation,
-                    sym: SymbolKind::of(&comp.kind),
-                    mac,
-                });
-            }
-        }
-        let stride_w = c.segment_count().div_ceil(THUMB_ITEMS).max(1);
-        let mut wires = Vec::new();
-        for (i, (id, _)) in c.segments().enumerate() {
-            let Some((a, b)) = c.segment_ends(id) else { continue };
-            grow(a.x, a.y);
-            grow(b.x, b.y);
-            if i % stride_w == 0 {
-                wires.push((a.x, a.y, b.x, b.y));
-            }
-        }
-        if lo.0 > hi.0 {
-            (lo, hi) = ((0, 0), (1, 1));
-        }
-        #[allow(clippy::cast_precision_loss, reason = "grid coordinates are far below 2^24 in practice")]
-        let p = |t: (i32, i32)| Pos2::new(t.0 as f32, t.1 as f32);
-        Self { lo: p(lo), hi: p(hi), items, wires, cache: RefCell::new(None) }
-    }
-
-    /// Paints the snapshot fitted into `rect` with the real symbols.
-    fn paint(&self, painter: &egui::Painter, rect: Rect, style: SymbolStyle, dark: bool) {
-        #[allow(clippy::cast_possible_truncation, reason = "a panel size in points")]
-        let key = ([rect.width().round() as i32, rect.height().round() as i32], style, dark);
-        let shapes = {
-            let mut cache = self.cache.borrow_mut();
-            if let Some((_, s)) = cache.as_ref().filter(|(k, _)| *k == key) {
-                Arc::clone(s)
-            } else {
-                let s = Arc::new(self.shapes(Rect::from_min_size(Pos2::ZERO, rect.size()), style, dark));
-                *cache = Some((key, Arc::clone(&s)));
-                s
-            }
-        };
-        let painter = painter.with_clip_rect(rect);
-        for shape in shapes.iter() {
-            let mut shape = shape.clone();
-            shape.translate(rect.min.to_vec2());
-            painter.add(shape);
-        }
-    }
-
-    /// Background, wires and components fitted into `rect`.
-    fn shapes(&self, rect: Rect, style: SymbolStyle, dark: bool) -> Vec<Shape> {
-        let (bg, wire, body) = if dark {
-            (Color32::from_gray(22), Color32::from_rgb(90, 190, 120), Color32::from_gray(170))
-        } else {
-            (Color32::from_gray(246), Color32::from_rgb(30, 140, 70), Color32::from_gray(80))
-        };
-        let mut out = vec![Shape::rect_filled(rect, 3.0, bg)];
-        let inner = rect.shrink(8.0);
-        let ext = (self.hi - self.lo).max(Vec2::splat(1.0));
-        let scale = (inner.width() / ext.x).min(inner.height() / ext.y).min(24.0);
-        let off = inner.center().to_vec2() - ((self.lo.to_vec2() + self.hi.to_vec2()) * 0.5) * scale;
-        #[allow(clippy::cast_precision_loss, reason = "grid coordinates are far below 2^24 in practice")]
-        let map = |x: f32, y: f32| Pos2::new(x * scale + off.x, y * scale + off.y);
-        let stroke = Stroke::new((scale * 0.12).clamp(0.6, 1.4), wire);
-        #[allow(clippy::cast_precision_loss, reason = "grid coordinates are far below 2^24 in practice")]
-        for &(x1, y1, x2, y2) in &self.wires {
-            out.push(Shape::line_segment([map(x1 as f32, y1 as f32), map(x2 as f32, y2 as f32)], stroke));
-        }
-        let detailed = self.items.len() <= THUMB_SYMBOLS;
-        for it in &self.items {
-            #[allow(clippy::cast_precision_loss, reason = "grid coordinates are far below 2^24 in practice")]
-            let (mx, my, w, h) = (it.min.0 as f32, it.min.1 as f32, it.size.0 as f32, it.size.1 as f32);
-            let (rw, rh) = if matches!(it.rot, Rotation::R90 | Rotation::R270) { (h, w) } else { (w, h) };
-            let box_rect = Rect::from_min_max(map(mx, my), map(mx + rw, my + rh));
-            if !detailed || scale * w.min(h) < 4.0 {
-                let r = if box_rect.width() < 1.5 || box_rect.height() < 1.5 {
-                    Rect::from_center_size(box_rect.center(), Vec2::splat(1.5))
-                } else {
-                    box_rect
-                };
-                out.push(Shape::rect_filled(r, 0.0, body.gamma_multiply(0.8)));
-                continue;
-            }
-            // Same mapping as the canvas shader (`sym_to_world`).
-            let to_screen = |p: [f32; 2]| {
-                let r = match it.rot {
-                    Rotation::R0 => p,
-                    Rotation::R90 => [h - p[1], p[0]],
-                    Rotation::R180 => [w - p[0], h - p[1]],
-                    Rotation::R270 => [p[1], w - p[0]],
-                };
-                map(mx + r[0], my + r[1])
-            };
-            let mesh = match &it.mac {
-                Some((def, shape, hash)) => {
-                    let verts = crate::icons::macro_mesh(def, shape, *hash);
-                    crate::icons::vertices_mesh(&verts, scale, 1.0, to_screen)
-                }
-                None => crate::icons::build_mesh(it.sym, style, 2, 1.0, scale, to_screen),
-            };
-            if !mesh.is_empty() {
-                out.push(Shape::mesh(mesh));
-            }
-        }
-        out.push(Shape::rect_stroke(rect, 3.0, Stroke::new(1.0, Color32::from_gray(110)), egui::StrokeKind::Inside));
-        out
-    }
-}
+/// Stable identifier of a history node (shown as `#id`; ids grow with time
+/// and are not reused, so dropping old nodes leaves gaps).
+pub type StateId = u32;
 
 struct State {
+    parent: Option<StateId>,
+    /// Oldest first.
+    children: Vec<StateId>,
+    /// Child last visited (the Redo target).
+    resume: Option<StateId>,
     label: String,
     circuit: Arc<Circuit>,
     /// Retained size, for the memory budget.
@@ -218,9 +80,9 @@ struct State {
 }
 
 impl State {
-    fn new(label: String, circuit: Arc<Circuit>, merge_key: Option<&'static str>) -> Self {
+    fn new(parent: Option<StateId>, label: String, circuit: Arc<Circuit>, merge_key: Option<&'static str>) -> Self {
         let weight = circuit.component_count() + circuit.segment_count() + 1;
-        Self { label, circuit, weight, merge_key, thumb: OnceCell::new() }
+        Self { parent, children: Vec::new(), resume: None, label, circuit, weight, merge_key, thumb: OnceCell::new() }
     }
 }
 
@@ -231,10 +93,11 @@ struct Pending {
     merge_key: Option<&'static str>,
 }
 
-/// The undo / redo timeline.
+/// The undo / redo tree.
 pub struct History {
-    states: Vec<State>,
-    cursor: usize,
+    nodes: BTreeMap<StateId, State>,
+    cursor: StateId,
+    next_id: StateId,
     pending: Option<Pending>,
     committed_at: Instant,
     /// Label for the macro-body edit being routed through the root (so the
@@ -245,7 +108,7 @@ pub struct History {
     next_name: Option<String>,
     /// The panel is shown.
     pub open: bool,
-    /// Scroll the panel to the current entry on the next frame.
+    /// Scroll the panel to the current node on the next frame.
     scroll_to_cursor: bool,
 }
 
@@ -274,9 +137,12 @@ impl History {
     /// A history whose only state is `circuit`.
     #[must_use]
     pub fn new(circuit: Arc<Circuit>) -> Self {
+        let mut nodes = BTreeMap::new();
+        nodes.insert(0, State::new(None, "Initial state".into(), circuit, None));
         Self {
-            states: vec![State::new("Initial state".into(), circuit, None)],
+            nodes,
             cursor: 0,
+            next_id: 1,
             pending: None,
             committed_at: Instant::now(),
             hint: None,
@@ -289,22 +155,42 @@ impl History {
     /// Starts over from `circuit` (a project was opened, created or
     /// imported).
     pub fn reset(&mut self, circuit: Arc<Circuit>, label: &str) {
-        self.states = vec![State::new(label.into(), circuit, None)];
+        self.nodes.clear();
+        self.nodes.insert(0, State::new(None, label.into(), circuit, None));
         self.cursor = 0;
+        self.next_id = 1;
         self.pending = None;
         self.hint = None;
         self.next_name = None;
         self.scroll_to_cursor = true;
     }
 
+    fn node(&self, id: StateId) -> &State {
+        // Every id held by `cursor`, `parent` and `children` is in the map.
+        &self.nodes[&id]
+    }
+
+    /// State Undo goes to.
+    #[must_use]
+    fn undo_target(&self) -> Option<StateId> {
+        self.node(self.cursor).parent
+    }
+
+    /// State Redo goes to: the child last visited, else the newest.
+    #[must_use]
+    fn redo_target(&self) -> Option<StateId> {
+        let n = self.node(self.cursor);
+        n.resume.filter(|r| n.children.contains(r)).or_else(|| n.children.last().copied())
+    }
+
     #[must_use]
     pub fn can_undo(&self) -> bool {
-        self.cursor > 0 || self.pending.is_some()
+        self.undo_target().is_some() || self.pending.is_some()
     }
 
     #[must_use]
     pub fn can_redo(&self) -> bool {
-        self.pending.is_none() && self.cursor + 1 < self.states.len()
+        self.pending.is_none() && self.redo_target().is_some()
     }
 
     /// Names the entry the edits of this pass will form.
@@ -337,58 +223,167 @@ impl History {
         }
     }
 
-    /// Closes the current action: the circuit as it is now becomes the newest
-    /// state. Called at the end of every UI pass.
+    /// Closes the current action: the circuit as it is now becomes a new
+    /// child of the current state (a new branch if that state already has
+    /// children). Called at the end of every UI pass.
     pub fn commit(&mut self, circuit: &Arc<Circuit>) {
         let Some(p) = self.pending.take() else { return };
         let label =
             self.next_name.take().unwrap_or(if p.count > 1 { format!("{} (×{})", p.label, p.count) } else { p.label });
-        self.states.truncate(self.cursor + 1);
         let now = Instant::now();
-        let merge = p.merge_key.filter(|k| {
-            self.cursor > 0 && self.states[self.cursor].merge_key == Some(*k) && now - self.committed_at < COALESCE
+        let cur = self.cursor;
+        let merge = p.merge_key.is_some_and(|k| {
+            let n = self.node(cur);
+            n.parent.is_some() && n.children.is_empty() && n.merge_key == Some(k) && now - self.committed_at < COALESCE
         });
-        if merge.is_some() {
-            self.states[self.cursor] = State::new(label, Arc::clone(circuit), p.merge_key);
+        if merge {
+            let parent = self.node(cur).parent;
+            self.nodes.insert(cur, State::new(parent, label, Arc::clone(circuit), p.merge_key));
         } else {
-            self.states.push(State::new(label, Arc::clone(circuit), p.merge_key));
-            self.cursor += 1;
+            let id = self.next_id;
+            self.next_id += 1;
+            self.nodes.insert(id, State::new(Some(cur), label, Arc::clone(circuit), p.merge_key));
+            if let Some(parent) = self.nodes.get_mut(&cur) {
+                parent.children.push(id);
+                parent.resume = Some(id);
+            }
+            self.cursor = id;
         }
         self.committed_at = now;
         self.scroll_to_cursor = true;
         self.trim();
     }
 
-    /// Drops the oldest states while over the entry or memory budget.
-    fn trim(&mut self) {
-        let mut weight: usize = self.states.iter().map(|s| s.weight).sum();
-        let mut drop_n = 0;
-        while drop_n < self.cursor && (self.states.len() - drop_n > MAX_STATES || weight > MAX_WEIGHT) {
-            weight -= self.states[drop_n].weight;
-            drop_n += 1;
+    /// Makes `id` the current state and remembers the path to it, so Redo
+    /// from any ancestor follows it. Returns its circuit (`None`: unknown or
+    /// already current).
+    fn go(&mut self, id: StateId) -> Option<Arc<Circuit>> {
+        if id == self.cursor || !self.nodes.contains_key(&id) {
+            return None;
         }
-        if drop_n > 0 {
-            let gone: Vec<State> = self.states.drain(..drop_n).collect();
-            self.cursor -= drop_n;
-            // Freeing big circuits can take a while: not on the UI thread.
-            if gone.iter().map(|s| s.weight).sum::<usize>() > 20_000 {
-                let _ = std::thread::Builder::new().name("bw-history-drop".into()).spawn(move || drop(gone));
+        self.cursor = id;
+        self.scroll_to_cursor = true;
+        let mut c = id;
+        while let Some(p) = self.node(c).parent {
+            if let Some(n) = self.nodes.get_mut(&p) {
+                n.resume = Some(c);
             }
+            c = p;
+        }
+        Some(Arc::clone(&self.node(id).circuit))
+    }
+
+    /// Drops nodes while over the node or memory budget (see the module
+    /// docs for the order).
+    fn trim(&mut self) {
+        let mut gone = Vec::new();
+        loop {
+            let weight: usize = self.nodes.values().map(|n| n.weight).sum();
+            if self.nodes.len() <= MAX_STATES && weight <= MAX_WEIGHT {
+                break;
+            }
+            let victim = self
+                .nodes
+                .iter()
+                .filter(|(id, n)| {
+                    **id != self.cursor && (n.children.is_empty() || (n.parent.is_none() && n.children.len() == 1))
+                })
+                .map(|(id, _)| *id)
+                .next();
+            let Some(id) = victim else { break };
+            if let Some(n) = self.remove(id) {
+                gone.push(n);
+            }
+        }
+        // Freeing big circuits can take a while: not on the UI thread.
+        if gone.iter().map(|s| s.weight).sum::<usize>() > 20_000 {
+            let _ = std::thread::Builder::new().name("bw-history-drop".into()).spawn(move || drop(gone));
         }
     }
 
-    fn state_circuit(&self, i: usize) -> Option<Arc<Circuit>> {
-        self.states.get(i).map(|s| Arc::clone(&s.circuit))
+    /// Removes a leaf or a root with one child (which becomes the root).
+    fn remove(&mut self, id: StateId) -> Option<State> {
+        let node = self.nodes.remove(&id)?;
+        match node.parent {
+            Some(p) => {
+                if let Some(parent) = self.nodes.get_mut(&p) {
+                    parent.children.retain(|c| *c != id);
+                    if parent.resume == Some(id) {
+                        parent.resume = None;
+                    }
+                }
+            }
+            None => {
+                for c in &node.children {
+                    if let Some(child) = self.nodes.get_mut(c) {
+                        child.parent = None;
+                    }
+                }
+            }
+        }
+        Some(node)
     }
+
+    /// Ancestors of the current state and the state itself.
+    fn active_path(&self) -> HashSet<StateId> {
+        let mut set = HashSet::new();
+        let mut c = Some(self.cursor);
+        while let Some(id) = c {
+            set.insert(id);
+            c = self.node(id).parent;
+        }
+        set
+    }
+
+    /// Rows (one per node, oldest first) and the number of lanes. The oldest
+    /// child continues its parent's lane; later children start new lanes
+    /// to the right, in the lowest lane that is free from the parent's row to
+    /// the end of the new chain.
+    fn layout(&self) -> (Vec<Row>, usize) {
+        let ids: Vec<StateId> = self.nodes.keys().copied().collect();
+        let row_of: HashMap<StateId, usize> = ids.iter().enumerate().map(|(r, id)| (*id, r)).collect();
+        // Last row of the chain that starts at each row (oldest children).
+        let mut chain_end = vec![0; ids.len()];
+        for r in (0..ids.len()).rev() {
+            chain_end[r] = self.node(ids[r]).children.first().map_or(r, |c| chain_end[row_of[c]]);
+        }
+        let mut busy_until: Vec<usize> = Vec::new();
+        let mut rows: Vec<Row> = Vec::with_capacity(ids.len());
+        for (r, id) in ids.iter().enumerate() {
+            let n = self.node(*id);
+            let parent = n.parent.map(|p| row_of[&p]);
+            let inherits = n.parent.is_some_and(|p| self.node(p).children.first() == Some(id));
+            let lane = if let (true, Some(pr)) = (inherits, parent) {
+                rows[pr].lane
+            } else {
+                let from = parent.unwrap_or(r);
+                let free = busy_until.iter().position(|b| *b < from);
+                let lane = free.unwrap_or(busy_until.len());
+                if lane == busy_until.len() {
+                    busy_until.push(0);
+                }
+                busy_until[lane] = chain_end[r];
+                lane
+            };
+            rows.push(Row { id: *id, lane, parent });
+        }
+        (rows, busy_until.len().max(1))
+    }
+}
+
+/// One row of the history graph.
+struct Row {
+    id: StateId,
+    lane: usize,
+    parent: Option<usize>,
 }
 
 impl BitwerkApp {
     /// Undo the last action.
     pub fn undo(&mut self) {
         self.history_commit();
-        if self.history.cursor > 0 {
-            let to = self.history.cursor - 1;
-            let what = self.history.states[self.history.cursor].label.clone();
+        if let Some(to) = self.history.undo_target() {
+            let what = self.history.node(self.history.cursor).label.clone();
             self.history_goto(to);
             self.status = format!("Undid: {what}");
         } else {
@@ -399,10 +394,9 @@ impl BitwerkApp {
     /// Redo the action that was undone.
     pub fn redo(&mut self) {
         self.history_commit();
-        if self.history.cursor + 1 < self.history.states.len() {
-            let to = self.history.cursor + 1;
+        if let Some(to) = self.history.redo_target() {
             self.history_goto(to);
-            let what = self.history.states[to].label.clone();
+            let what = self.history.node(to).label.clone();
             self.status = format!("Redid: {what}");
         } else {
             self.status = "Nothing to redo".into();
@@ -415,24 +409,19 @@ impl BitwerkApp {
         self.history.commit(&circuit);
     }
 
-    /// Makes state `idx` the current circuit.
+    /// Makes state `id` the current circuit.
     ///
     /// The state replaces the root circuit wholesale: the simulator reloads
     /// it (run state is kept, flip-flop state restarts) and the scene is
     /// rebuilt. Macro levels that were open are re-entered as far as their
     /// definitions and instances still exist.
-    pub fn history_goto(&mut self, idx: usize) {
+    pub fn history_goto(&mut self, id: StateId) {
         self.history_commit();
-        let Some(target) = self.history.state_circuit(idx) else { return };
-        if idx == self.history.cursor {
-            return;
-        }
+        let Some(target) = self.history.go(id) else { return };
         let was_inside: Vec<(MacroId, Option<ComponentId>)> = self.levels.iter().map(|l| (l.def, l.inst)).collect();
         let level_camera = self.camera;
 
         self.drop_levels();
-        self.history.cursor = idx;
-        self.history.scroll_to_cursor = true;
         self.circuit = target;
         self.multi.clear();
         self.clear_selection();
@@ -475,13 +464,12 @@ impl BitwerkApp {
         }
     }
 
-    /// The History panel: one compact row per state (`#3  Move component`),
-    /// like the other panels. Hovering a row previews the circuit as it was
-    /// then; clicking it goes there.
+    /// The History panel: the tree of states drawn like a commit graph, one
+    /// row per state (`#3  Move component`). Hovering a row previews the
+    /// circuit as it was then; clicking it goes there.
+    #[allow(clippy::too_many_lines, reason = "one egui panel: header, graph edges, rows")]
     pub fn history_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("History");
-        let n = self.history.states.len();
-        let cursor = self.history.cursor;
         ui.horizontal(|ui| {
             if ui.add_enabled(self.history.can_undo(), egui::Button::new("Undo")).clicked() {
                 self.undo();
@@ -490,47 +478,108 @@ impl BitwerkApp {
                 self.redo();
             }
         });
-        ui.label(format!("{} step{} · at #{cursor}", n - 1, if n == 2 { "" } else { "s" }));
+        let n = self.history.nodes.len();
+        let branches = self.history.nodes.values().filter(|s| s.children.is_empty()).count();
+        ui.label(format!(
+            "{} step{} · {branches} branch{} · at #{}",
+            n - 1,
+            if n == 2 { "" } else { "s" },
+            if branches == 1 { "" } else { "es" },
+            self.history.cursor
+        ));
         ui.separator();
-        let dark = ui.visuals().dark_mode;
-        let style = self.style;
+
+        let (rows, lanes) = self.history.layout();
+        let active = self.history.active_path();
+        let cursor = self.history.cursor;
+        let (dark, style) = (ui.visuals().dark_mode, self.style);
         let row_h = ui.spacing().interact_size.y;
-        let scroll_to = std::mem::take(&mut self.history.scroll_to_cursor);
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let pad = 8.0;
+        #[allow(clippy::cast_precision_loss, reason = "a handful of lanes")]
+        let lane_w = ((ui.available_width() * 0.5 - 2.0 * pad) / lanes as f32).clamp(6.0, 14.0);
+        #[allow(clippy::cast_precision_loss, reason = "a handful of lanes")]
+        let graph_w = lanes as f32 * lane_w + 2.0 * pad;
+
         let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
-        if scroll_to {
+        if std::mem::take(&mut self.history.scroll_to_cursor) {
             // Rows outside the viewport are not built, so scroll by offset.
+            let at = rows.iter().position(|r| r.id == cursor).unwrap_or(0);
             #[allow(clippy::cast_precision_loss, reason = "a few hundred rows at most")]
-            let y = cursor as f32 * (row_h + ui.spacing().item_spacing.y) - ui.available_height() * 0.5;
+            let y = at as f32 * row_h - ui.available_height() * 0.5;
             area = area.vertical_scroll_offset(y.max(0.0));
         }
         let mut jump = None;
-        area.show_rows(ui, row_h, n, |ui, rows| {
-            for i in rows {
-                let state = &self.history.states[i];
-                let text = format!("#{i}  {}", state.label);
-                let text = if i > cursor { egui::RichText::new(text).weak() } else { egui::RichText::new(text) };
-                let resp =
-                    ui.add_sized([ui.available_width(), row_h], egui::Button::selectable(i == cursor, text).truncate());
+        area.show_rows(ui, row_h, rows.len(), |ui, visible| {
+            let top = ui.cursor().top();
+            let left = ui.cursor().left();
+            let width = ui.available_width();
+            #[allow(clippy::cast_precision_loss, reason = "a few hundred rows at most")]
+            let y_of = |r: usize| top + (r as f32 - visible.start as f32 + 0.5) * row_h;
+            #[allow(clippy::cast_precision_loss, reason = "a handful of lanes")]
+            let x_of = |lane: usize| left + pad + (lane as f32 + 0.5) * lane_w;
+            let lane_color = |lane: usize| LANE_COLORS[lane % LANE_COLORS.len()];
+            let painter = ui.painter().clone();
+            // Edges first (dots go on top): from each node up to its parent.
+            for (r, row) in rows.iter().enumerate() {
+                let Some(pr) = row.parent else { continue };
+                if r < visible.start || pr >= visible.end {
+                    continue;
+                }
+                let on_path = active.contains(&row.id);
+                let color = if on_path { lane_color(row.lane) } else { lane_color(row.lane).gamma_multiply(0.45) };
+                let stroke = Stroke::new(if on_path { 2.0 } else { 1.3 }, color);
+                let (xp, xc) = (x_of(rows[pr].lane), x_of(row.lane));
+                painter.line_segment([Pos2::new(xp, y_of(pr)), Pos2::new(xc, y_of(pr))], stroke);
+                painter.line_segment([Pos2::new(xc, y_of(pr)), Pos2::new(xc, y_of(r))], stroke);
+            }
+            for r in visible {
+                let row = &rows[r];
+                let state = self.history.node(row.id);
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, row_h), Sense::click());
+                let on_path = active.contains(&row.id);
+                if row.id == cursor {
+                    painter.rect_filled(rect, 3.0, ui.visuals().selection.bg_fill);
+                } else if resp.hovered() {
+                    painter.rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill);
+                }
+                let center = Pos2::new(x_of(row.lane), rect.center().y);
+                let dot = lane_color(row.lane);
+                if row.id == cursor {
+                    painter.circle_filled(center, 5.5, ui.visuals().strong_text_color());
+                    painter.circle_stroke(center, 5.5, Stroke::new(2.0, dot));
+                } else {
+                    painter.circle_filled(center, 4.0, if on_path { dot } else { dot.gamma_multiply(0.5) });
+                }
+                let text_color = if on_path { ui.visuals().text_color() } else { ui.visuals().weak_text_color() };
+                let galley = painter.layout_no_wrap(
+                    format!("#{}  {}", row.id, state.label),
+                    egui::FontId::proportional(13.0),
+                    text_color,
+                );
+                let text_pos = Pos2::new(left + graph_w + 4.0, rect.center().y - galley.size().y * 0.5);
+                painter.with_clip_rect(rect).galley(text_pos, galley, text_color);
                 resp.clone().on_hover_ui(|ui| {
-                    ui.label(format!("#{i}  {}", state.label));
+                    ui.label(format!("#{}  {}", row.id, state.label));
                     let (rect, _) = ui.allocate_exact_size(PREVIEW_SIZE, Sense::hover());
                     let thumb = state.thumb.get_or_init(|| Thumb::build(&state.circuit));
                     thumb.paint(ui.painter(), rect, style, dark);
                 });
                 if resp.clicked() {
-                    jump = Some(i);
+                    jump = Some(row.id);
                 }
             }
         });
-        if let Some(i) = jump {
-            self.history_goto(i);
-            self.status = format!("Went to #{i}: {}", self.history.states[i].label);
+        if let Some(id) = jump {
+            self.history_goto(id);
+            self.status = format!("Went to #{id}: {}", self.history.node(id).label);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::many_single_char_names, reason = "short test fixtures")]
     use super::*;
     use bw_core::{GridPos, Rotation};
 
@@ -544,94 +593,112 @@ mod tests {
         h.note_edit(&e);
     }
 
+    /// One committed action adding a component at `x`.
+    fn step(c: &mut Arc<Circuit>, h: &mut History, x: i32) -> StateId {
+        add(c, h, x);
+        h.commit(c);
+        h.cursor
+    }
+
+    fn undo(c: &mut Arc<Circuit>, h: &mut History) {
+        let to = h.undo_target().expect("can undo");
+        *c = h.go(to).expect("moves");
+    }
+
     #[test]
-    fn timeline_undo_redo_and_discard() {
+    fn undo_redo_walk_the_chain() {
         let mut c = Arc::new(Circuit::new());
         let mut h = History::new(Arc::clone(&c));
         assert!(!h.can_undo() && !h.can_redo());
-
-        add(&mut c, &mut h, 0);
-        assert!(h.can_undo());
-        h.commit(&c);
-        add(&mut c, &mut h, 10);
-        h.commit(&c);
-        assert_eq!((h.states.len(), h.cursor), (3, 2));
-        assert_eq!(h.states[2].circuit.component_count(), 2);
-
-        // Going back keeps the future; a new action discards it.
-        h.cursor = 1;
-        assert!(h.can_redo());
-        c = h.state_circuit(1).expect("state exists");
-        add(&mut c, &mut h, 20);
-        h.commit(&c);
-        assert_eq!((h.states.len(), h.cursor), (3, 2));
-        assert!(!h.can_redo());
+        let a = step(&mut c, &mut h, 0);
+        let b = step(&mut c, &mut h, 10);
+        assert_eq!((a, b, h.nodes.len()), (1, 2, 3));
+        assert!(h.can_undo() && !h.can_redo());
+        undo(&mut c, &mut h);
+        assert_eq!(c.component_count(), 1);
+        assert_eq!(h.redo_target(), Some(b));
+        undo(&mut c, &mut h);
+        assert_eq!((c.component_count(), h.cursor, h.undo_target()), (0, 0, None));
     }
 
     #[test]
-    fn several_edits_in_one_pass_are_one_entry() {
+    fn a_change_after_going_back_starts_a_branch_and_keeps_the_old_one() {
+        let mut c = Arc::new(Circuit::new());
+        let mut h = History::new(Arc::clone(&c));
+        let a = step(&mut c, &mut h, 0);
+        let b = step(&mut c, &mut h, 10);
+        undo(&mut c, &mut h);
+        let d = step(&mut c, &mut h, 20);
+        // Both branches hang off `a`; nothing was discarded.
+        assert_eq!(h.node(a).children, vec![b, d]);
+        assert_eq!(h.nodes.len(), 4);
+        assert_eq!(h.node(b).circuit.component_count(), 2);
+        // Redo from `a` follows the branch last visited; jumping to the old
+        // branch and back up makes it the default again.
+        h.go(a);
+        assert_eq!(h.redo_target(), Some(d));
+        c = h.go(b).expect("old branch is reachable");
+        assert_eq!(c.component_count(), 2);
+        h.go(a);
+        assert_eq!(h.redo_target(), Some(b));
+    }
+
+    #[test]
+    fn graph_layout_puts_branches_in_their_own_lanes() {
+        let mut c = Arc::new(Circuit::new());
+        let mut h = History::new(Arc::clone(&c));
+        let a = step(&mut c, &mut h, 0);
+        let b = step(&mut c, &mut h, 10);
+        undo(&mut c, &mut h);
+        let d = step(&mut c, &mut h, 20);
+        let e = step(&mut c, &mut h, 30);
+        let (rows, lanes) = h.layout();
+        let lane = |id| rows.iter().find(|r| r.id == id).expect("row").lane;
+        assert_eq!(lanes, 2);
+        assert_eq!([lane(0), lane(a), lane(b)], [0, 0, 0], "the first line stays on the trunk");
+        assert_eq!([lane(d), lane(e)], [1, 1], "the new branch moves right");
+        assert_eq!(rows[usize::try_from(d).expect("small")].parent, Some(1));
+    }
+
+    #[test]
+    fn several_edits_in_one_pass_are_one_node() {
         let mut c = Arc::new(Circuit::new());
         let mut h = History::new(Arc::clone(&c));
         add(&mut c, &mut h, 0);
         add(&mut c, &mut h, 10);
         add(&mut c, &mut h, 20);
         h.commit(&c);
-        assert_eq!(h.states.len(), 2);
-        assert_eq!(h.states[1].label, "Add component (×3)");
+        assert_eq!(h.nodes.len(), 2);
+        assert_eq!(h.node(1).label, "Add component (×3)");
     }
 
     #[test]
-    fn budget_drops_oldest_but_never_the_current() {
+    fn budget_drops_old_nodes_but_never_the_current_path() {
+        let mut c = Arc::new(Circuit::new());
+        let mut h = History::new(Arc::clone(&c));
         const { assert!(MAX_STATES < 220) };
+        for i in 0..220 {
+            step(&mut c, &mut h, i * 10);
+        }
+        assert_eq!(h.nodes.len(), MAX_STATES);
+        assert_eq!(h.node(h.cursor).circuit.component_count(), 220);
+        // The oldest went first and the next one became the root.
+        let root = h.nodes.iter().find(|(_, n)| n.parent.is_none()).map(|(id, _)| *id).expect("a root");
+        assert_eq!(usize::try_from(root).expect("small"), 220 - MAX_STATES + 1);
+    }
+
+    #[test]
+    fn budget_prefers_old_branch_tips_over_the_trunk() {
         let mut c = Arc::new(Circuit::new());
         let mut h = History::new(Arc::clone(&c));
-        for i in 0..220 {
-            add(&mut c, &mut h, i * 10);
-            h.commit(&c);
+        step(&mut c, &mut h, 0);
+        let b = step(&mut c, &mut h, 10);
+        undo(&mut c, &mut h);
+        for i in 0..MAX_STATES {
+            step(&mut c, &mut h, 100 + i32::try_from(i).expect("small") * 10);
         }
-        assert_eq!(h.states.len(), MAX_STATES);
-        assert_eq!(h.cursor, MAX_STATES - 1);
-        assert_eq!(h.states[h.cursor].circuit.component_count(), 220);
-    }
-
-    #[test]
-    fn thumbnail_covers_components_and_handles_empty() {
-        let empty = Thumb::build(&Circuit::new());
-        assert!(empty.hi.x > empty.lo.x && empty.items.is_empty());
-        let mut c = Circuit::new();
-        c.apply(&Edit::AddComponent {
-            kind: ComponentKind::Switch { on: false, mode: bw_core::SwitchMode::Toggle },
-            pos: GridPos::new(5, 7),
-            rotation: Rotation::R0,
-        })
-        .expect("edit applies");
-        let t = Thumb::build(&c);
-        assert_eq!(t.items.len(), 1);
-        assert!(t.lo.x <= 5.0 && t.lo.y <= 7.0);
-    }
-
-    #[test]
-    fn thumbnail_draws_real_symbols_in_every_rotation() {
-        let mut c = Circuit::new();
-        for (i, rot) in [Rotation::R0, Rotation::R90, Rotation::R180, Rotation::R270].into_iter().enumerate() {
-            let x = i32::try_from(i).expect("small") * 8;
-            c.apply(&Edit::AddComponent {
-                kind: ComponentKind::Gate { op: bw_core::GateOp::Or, inputs: 2 },
-                pos: GridPos::new(x, 0),
-                rotation: rot,
-            })
-            .expect("edit applies");
-        }
-        let t = Thumb::build(&c);
-        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0));
-        let shapes = t.shapes(rect, SymbolStyle::Ansi, true);
-        let meshes: Vec<_> =
-            shapes.iter().filter_map(|s| if let Shape::Mesh(m) = s { Some(m) } else { None }).collect();
-        assert_eq!(meshes.len(), 4, "one symbol mesh per gate");
-        for m in meshes {
-            assert!(!m.is_empty());
-            // Inside the thumbnail.
-            assert!(m.vertices.iter().all(|v| rect.expand(2.0).contains(v.pos)), "symbol stays in the frame");
-        }
+        assert!(!h.nodes.contains_key(&b), "the abandoned tip was dropped first");
+        assert!(h.nodes.len() <= MAX_STATES);
+        assert!(h.nodes.contains_key(&h.cursor));
     }
 }
