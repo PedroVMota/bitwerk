@@ -4,7 +4,8 @@
 //! switch changes; every LED, 7-segment and numeric input must agree at
 //! every step (where the original is Z or X, the two-valued export may
 //! show either level). Components are matched by the position of their first pin,
-//! which the export keeps.
+//! which the export keeps up to a shift of the whole circuit (the export
+//! moves a circuit away from the Digital Works page edges).
 
 #![allow(
     clippy::unwrap_used,
@@ -60,10 +61,26 @@ fn observe(c: &Circuit, s: &SimState) -> BTreeMap<(i32, i32), Vec<u8>> {
         .collect()
 }
 
+/// Top-left corner of the switches and displays (by first pin).
+fn corner(c: &Circuit) -> (i32, i32) {
+    by_pin(c, |k| matches!(k, ComponentKind::Switch { .. }) || is_display(k))
+        .keys()
+        .fold((i32::MAX, i32::MAX), |(x, y), &(px, py)| (x.min(px), y.min(py)))
+}
+
+/// The same map with its keys moved by `-d`.
+fn unshift<V>(m: BTreeMap<(i32, i32), V>, d: (i32, i32)) -> BTreeMap<(i32, i32), V> {
+    m.into_iter().map(|((x, y), v)| ((x - d.0, y - d.1), v)).collect()
+}
+
 /// Simulates both circuits with the same deterministic switch changes.
 fn same_behaviour(name: &str, a: &Circuit, b: &Circuit, steps: usize) {
+    // The export may move the whole circuit (page margin): compare
+    // positions relative to that shift.
+    let (ca, cb) = (corner(a), corner(b));
+    let d = if ca.0 == i32::MAX { (0, 0) } else { (cb.0 - ca.0, cb.1 - ca.1) };
     let sa = by_pin(a, |k| matches!(k, ComponentKind::Switch { .. }));
-    let sb = by_pin(b, |k| matches!(k, ComponentKind::Switch { .. }));
+    let sb = unshift(by_pin(b, |k| matches!(k, ComponentKind::Switch { .. })), d);
     assert_eq!(sa.keys().collect::<Vec<_>>(), sb.keys().collect::<Vec<_>>(), "{name}: switch positions");
     assert_eq!(by_pin(a, is_display).len(), by_pin(b, is_display).len(), "{name}: displays");
     let mut x = SimState::new(Netlist::compile(a).unwrap(), a);
@@ -101,7 +118,7 @@ fn same_behaviour(name: &str, a: &Circuit, b: &Circuit, steps: usize) {
         // Where the original floats or is unknown (Z / X), Digital Works,
         // being two-valued, may show anything (e.g. a RAM's data bus
         // carries the written value while writing).
-        let (oa, ob) = (observe(a, &x), observe(b, &y));
+        let (oa, ob) = (observe(a, &x), unshift(observe(b, &y), d));
         assert_eq!(oa.keys().collect::<Vec<_>>(), ob.keys().collect::<Vec<_>>(), "{name}: displays");
         for (k, va) in &oa {
             let vb = &ob[k];
