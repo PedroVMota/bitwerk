@@ -43,6 +43,12 @@ enum Pending {
     ImportDw(Option<PathBuf>),
     /// Open this project file (dropped on the window).
     OpenPath(PathBuf),
+    /// Replace the document with the 100k stress test.
+    Stress,
+    /// Replace the document with the nested-macro stress test.
+    StressMacros,
+    /// Close the window.
+    Quit,
 }
 
 /// Debug-only switches.
@@ -101,6 +107,8 @@ pub struct BitwerkApp {
     step_mode: StepMode,
     tick_rate: f64,
     confirm: Option<Pending>,
+    /// The window may close without asking (confirmed, or nothing to lose).
+    closing: bool,
     debug: DebugOpts,
     pub(crate) menu: Option<NativeMenu>,
     /// The Memory Contents window, if open.
@@ -198,6 +206,7 @@ impl BitwerkApp {
             step_mode: StepMode::HalfCycle,
             tick_rate: 20.0,
             confirm: None,
+            closing: false,
             debug: DebugOpts::default(),
             menu,
             memory_window: None,
@@ -461,7 +470,7 @@ impl BitwerkApp {
             MenuAction::Open => self.guarded(Pending::Open),
             MenuAction::Save => self.save(false),
             MenuAction::SaveAs => self.save(true),
-            MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            MenuAction::Quit => self.guarded(Pending::Quit),
             MenuAction::Run => self.sim.send(Command::Run),
             MenuAction::Stop => self.sim.send(Command::Stop),
             // A focused text field keeps its own undo.
@@ -471,7 +480,7 @@ impl BitwerkApp {
             MenuAction::ToggleHistory => self.history.open = !self.history.open,
             MenuAction::Pause => self.sim.send(Command::Pause),
             MenuAction::Step => self.sim.send(Command::Step(self.step_mode)),
-            MenuAction::StressTest => self.spawn_stress(ctx),
+            MenuAction::StressTest => self.guarded(Pending::Stress),
             MenuAction::ToggleContinuousRepaint => self.debug.continuous_repaint = !self.debug.continuous_repaint,
             MenuAction::Style(style) => self.set_style(style),
             MenuAction::CreateMacro => self.prompt_macro_name(),
@@ -484,7 +493,7 @@ impl BitwerkApp {
             MenuAction::UpLevel => self.go_up(),
             MenuAction::PartsCentre => self.parts.open = !self.parts.open,
             MenuAction::ImportMacro => self.import_macro_file(),
-            MenuAction::StressMacros => self.spawn_stress_macros(ctx),
+            MenuAction::StressMacros => self.guarded(Pending::StressMacros),
             MenuAction::ImportDw => self.guarded(Pending::ImportDw(None)),
             MenuAction::ImportDwFolder => self.import_dw_folder_dialog(),
             MenuAction::ExportDw => self.export_dw_dialog(),
@@ -545,6 +554,12 @@ impl BitwerkApp {
             Pending::ImportDw(None) => self.import_dw_dialog(),
             Pending::ImportDw(Some(path)) => self.import_dw_path(&path),
             Pending::OpenPath(path) => self.open_path(path),
+            Pending::Stress => self.spawn_stress(&self.egui_ctx.clone()),
+            Pending::StressMacros => self.spawn_stress_macros(&self.egui_ctx.clone()),
+            Pending::Quit => {
+                self.closing = true;
+                self.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
     }
 
@@ -819,7 +834,7 @@ impl BitwerkApp {
                     self.guarded(Pending::ImportDw(None));
                 }
                 if ui.button("Stress 100k").clicked() {
-                    self.spawn_stress(ui.ctx());
+                    self.guarded(Pending::Stress);
                 }
             }
         });
@@ -1508,9 +1523,18 @@ impl BitwerkApp {
             .show(ctx, |ui| {
                 ui.label("The current circuit has unsaved changes. Discard them?");
                 ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        // Only goes on when the save succeeded (not cancelled, no error).
+                        self.save(false);
+                        if !self.dirty {
+                            close = true;
+                            self.run_pending(p.clone());
+                        }
+                    }
                     if ui.button("Discard").clicked() {
                         close = true;
-                        self.dirty = false;
+                        // Still unsaved until the action really replaces the
+                        // document (a cancelled file dialog leaves it as it was).
                         self.run_pending(p.clone());
                     }
                     if ui.button("Cancel").clicked() {
@@ -1616,9 +1640,15 @@ impl eframe::App for BitwerkApp {
         }
         if let Some(mut sweep) = self.sweep.take() {
             if sweep.begin_frame(self, frame.info().cpu_usage, self.canvas_size, presented) {
+                self.closing = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             self.sweep = Some(sweep);
+        }
+        // Closing the window with unsaved changes asks first.
+        if self.dirty && !self.closing && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm = Some(Pending::Quit);
         }
         let actions: Vec<MenuAction> = self.menu.as_ref().map(|m| m.poll().collect()).unwrap_or_default();
         for a in actions {
