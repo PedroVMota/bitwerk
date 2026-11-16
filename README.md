@@ -484,7 +484,7 @@ Cada *pull request* para `main` tem de levar **uma** destas etiquetas (ou `no-de
 | `major` | minor (1.2.3 → 1.3.0) |
 | `breaking change` | major (1.2.3 → 2.0.0) |
 
-Quando o PR é integrado na `main`, `.github/workflows/release.yml` calcula a versão a partir da última *tag* `vX.Y.Z`, compila e testa em Linux e Windows (sem macOS), cria a *tag* e a *release* com os pacotes (`.tar.gz` e `.zip`) e `SHA256SUMS.txt`. Um PR com a etiqueta `no-deploy` (que dispensa a etiqueta de versão), um *push* direto, ou um PR sem etiqueta, não gera *release*.
+Quando o PR é integrado na `main`, `.github/workflows/release.yml` calcula a versão a partir da última *tag* `vX.Y.Z`, compila e testa em Linux e Windows (sem macOS), cria a *tag* e a *release* com os pacotes (`.tar.gz` e `.zip`) e `SHA256SUMS.txt`. A CI (`ci.yml`) só corre em PRs com uma etiqueta de versão; sem ela os jobs são ignorados e não gastam *runners*. Um PR com a etiqueta `no-deploy` (que dispensa a etiqueta de versão), um *push* direto, ou um PR sem etiqueta, não gera *release*.
 
 ## Segurança
 
