@@ -1050,22 +1050,22 @@ impl<'t> Exporter<'t> {
         (d, verts)
     }
 
-    /// A helper gate (part of an approximation): drawn as a small gate in
-    /// the box spanned by its pins. Returns (output vertex, input vertices).
+    /// A helper gate (part of an approximation): Digital Works' own gate
+    /// with its output at `out` (inputs at its standard positions; `ins`
+    /// gives their number and top-to-bottom order). Returns (output
+    /// vertex, input vertices in the order of `ins`).
     fn helper(&mut self, gb: &mut Gb, lv: &mut Level, op: u8, ins: &[P], out: P) -> (u32, Vec<u32>) {
         let n = u8::try_from(ins.len()).unwrap_or(2);
         let cls = if op == 6 { Cls::Gate(6, 1) } else { Cls::Gate(op, n) };
-        let x0 = ins.iter().map(|p| p.0).fold(f32::MAX, f32::min);
-        let y0 = ins.iter().map(|p| p.1).chain([out.1]).fold(f32::MAX, f32::min) - 2.0;
-        let y1 = ins.iter().map(|p| p.1).chain([out.1]).fold(f32::MIN, f32::max) + 2.0;
-        let (w, h) = (((out.0 - x0) / PX).max(0.4), ((y1 - y0) / PX).max(0.4));
-        let gx = gate_gx(op, w, h);
-        let drawing = emit(gb, &gx, &|(lx, ly)| (x0 + lx * PX, y0 + ly * PX));
-        let mut pins: Vec<(P, i32, Option<PinRef>)> = vec![(out, 2, None)];
-        pins.extend(ins.iter().map(|&p| (p, 1, None)));
-        let (_, v) = self.custom(gb, lv, cls, &drawing, &pins, Vec::new(), List::Devices);
+        let offsets: &[f32] = if op == 6 { &[0.0] } else { gate_input_offsets(n) };
+        let in_x = if op == 6 { -20.0 } else { -30.0 };
+        let mut pins: Vec<(Option<PinRef>, P, i32, f32)> = vec![(None, (30.0, 0.0), 2, 4.0)];
+        pins.extend(offsets.iter().map(|&dy| (None, (in_x, dy), 1, 4.0)));
+        let centre = (out.0 - 30.0, out.1);
+        let (_, v) = self.standard(gb, lv, None, cls, &pins, centre, Vec::new(), List::Devices, None);
         self.notes.count("helper gates", 1);
-        (v[0], v[1..].to_vec())
+        // Digital Works lists inputs bottom to top; `ins` is top to bottom.
+        (v[0], v[1..].iter().rev().copied().collect())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1142,15 +1142,10 @@ impl<'t> Exporter<'t> {
             }
             ComponentKind::TriState => {
                 self.notes.count("tri-state buffers", 1);
-                let gx = vec![
-                    Gx::Poly(vec![(0.5, 0.75), (3.5, 2.0), (0.5, 3.25)], WHITE),
-                    Gx::Line(vec![(0.0, 2.0), (0.5, 2.0)]),
-                    Gx::Line(vec![(3.5, 2.0), (4.0, 2.0)]),
-                    Gx::Line(vec![(2.0, 0.0), (2.0, 1.25)]),
-                ];
-                let drawing = emit(gb, &gx, &map);
-                let pins = [(pin_px(c, 0), 1, pr(0)), (pin_px(c, 2), 3, pr(2)), (pin_px(c, 1), 1, pr(1))];
-                self.custom(gb, lv, Cls::TriState, &drawing, &pins, Vec::new(), List::Devices);
+                // Digital Works always draws tri-states itself.
+                let pins = [(pr(0), (-20.0, 0.0), 1, 4.0), (pr(2), (20.0, 0.0), 3, 4.0), (pr(1), (0.0, 10.0), 1, 4.0)];
+                let fallback = xf(c, (wf / 2.0, hf / 2.0));
+                self.standard(gb, lv, Some(c), Cls::TriState, &pins, fallback, Vec::new(), List::Devices, None);
             }
             ComponentKind::Switch { on, mode } => {
                 self.notes.count("switches", 1);
@@ -1377,16 +1372,11 @@ impl<'t> Exporter<'t> {
                         }
                     };
                     let at = pin_px(c, our);
-                    let drawing =
-                        emit(gb, &[Gx::Poly(vec![(0.0, -1.0), (2.0, 0.0), (0.0, 1.0)], WHITE)], &|(lx, ly)| {
-                            (at.0 + 5.0 + lx * PX, at.1 + ly * PX)
-                        });
-                    let tpins = [
-                        ((at.0 + 5.0, at.1), 1, Some(p)),
-                        ((at.0 + 15.0, at.1), 3, None),
-                        ((at.0 + 10.0, at.1 - 5.0), 1, None),
-                    ];
-                    let (_, tv) = self.custom(gb, lv, Cls::TriState, &drawing, &tpins, Vec::new(), List::Devices);
+                    let tpins =
+                        [(Some(p), (-20.0, 0.0), 1, 4.0), (None, (20.0, 0.0), 3, 4.0), (None, (0.0, 10.0), 1, 4.0)];
+                    let centre = (at.0 + 25.0, at.1);
+                    let (_, tv) =
+                        self.standard(gb, lv, None, Cls::TriState, &tpins, centre, Vec::new(), List::Devices, None);
                     self.notes.count("helper gates", 1);
                     links.push((tv[1], verts[k]));
                     links.push((en, tv[2]));
@@ -1585,12 +1575,13 @@ impl<'t> Exporter<'t> {
         cur: &mut P,
     ) -> Sig {
         let pts: Vec<P> = (0..ins.len()).map(|k| (cur.0, cur.1 + 10.0 * k as f32)).collect();
-        let out = (cur.0 + 15.0, cur.1 + 5.0 * (ins.len() as f32 - 1.0));
+        // Digital Works' own gate: 60 px wide, inputs up to ±15 px.
+        let out = (cur.0 + 60.0, cur.1 + 20.0);
         let (o, iv) = self.helper(gb, lv, op, &pts, out);
         for (&sig, v) in ins.iter().zip(iv) {
             Self::feed(lv, links, sig, v);
         }
-        cur.1 += 10.0 * ins.len() as f32 + 10.0;
+        cur.1 += 50.0;
         Sig::V(o)
     }
 
