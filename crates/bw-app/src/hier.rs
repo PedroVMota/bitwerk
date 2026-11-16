@@ -176,6 +176,7 @@ impl BitwerkApp {
     /// The model rejected the edit; nothing changed.
     pub fn apply_root_edit(&mut self, edit: Edit) -> Result<Applied, CircuitError> {
         let applied = self.circuit_mut().apply(&edit)?;
+        self.history.note_edit(&edit);
         self.revision += 1;
         let revision = self.revision;
         self.sim.send(Command::Edit { edit, revision });
@@ -207,7 +208,11 @@ impl BitwerkApp {
         let mut def = (**self.circuit.macros().def(def_id).ok_or(CircuitError::NoSuchMacro(def_id))?).clone();
         def.body = body.clone();
         def.sync_pins();
-        self.apply_root_edit(Edit::DefineMacro { id: def_id, def: Arc::new(def) })?;
+        // The entry should say what was done inside, not "Edit macro".
+        self.history.set_hint(Some(edit));
+        let stored = self.apply_root_edit(Edit::DefineMacro { id: def_id, def: Arc::new(def) });
+        self.history.set_hint(None);
+        stored?;
         if let Some(level) = self.levels.last_mut() {
             level.body = Arc::new(body);
             let revision = self.revision;

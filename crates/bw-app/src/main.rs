@@ -25,6 +25,7 @@ mod canvas;
 mod dwexport;
 mod dwimport;
 mod hier;
+mod history;
 mod icons;
 mod kind_props;
 mod macro_props;

@@ -62,6 +62,8 @@ pub struct BitwerkApp {
     pub(crate) path: Option<PathBuf>,
     pub(crate) name: String,
     pub(crate) dirty: bool,
+    /// Undo / redo timeline of the root circuit.
+    pub history: crate::history::History,
 
     // Engines / workers
     pub sim: SimHandle,
@@ -100,7 +102,7 @@ pub struct BitwerkApp {
     tick_rate: f64,
     confirm: Option<Pending>,
     debug: DebugOpts,
-    menu: Option<NativeMenu>,
+    pub(crate) menu: Option<NativeMenu>,
     /// The Memory Contents window, if open.
     pub memory_window: Option<crate::memwin::MemoryWindow>,
     /// Macro levels opened below the root (see `hier`).
@@ -166,8 +168,10 @@ impl BitwerkApp {
         let scene_worker = SceneWorker::spawn(Box::new(move || ctx.request_repaint()))?;
         let menu = NativeMenu::install(&cc.egui_ctx);
 
+        let circuit = Arc::new(Circuit::new());
         let mut app = Self {
-            circuit: Arc::new(Circuit::new()),
+            history: crate::history::History::new(Arc::clone(&circuit)),
+            circuit,
             revision: 0,
             path: None,
             name: "untitled".into(),
@@ -388,6 +392,7 @@ impl BitwerkApp {
         };
         let pins = plan.links.len();
         self.clear_selection();
+        self.history.name_next("Create macro");
         match bw_core::run_macro_plan(&mut Target(self), plan, id) {
             Ok(inst) => {
                 self.selection = Some(inst);
@@ -433,6 +438,7 @@ impl BitwerkApp {
         self.multi.clear();
         self.macro_draft = None;
         self.circuit = Arc::new(circuit);
+        self.history.reset(Arc::clone(&self.circuit), "Initial state");
         self.name = name;
         self.path = path;
         self.dirty = false;
@@ -458,6 +464,11 @@ impl BitwerkApp {
             MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             MenuAction::Run => self.sim.send(Command::Run),
             MenuAction::Stop => self.sim.send(Command::Stop),
+            // A focused text field keeps its own undo.
+            MenuAction::Undo if !ctx.egui_wants_keyboard_input() => self.undo(),
+            MenuAction::Redo if !ctx.egui_wants_keyboard_input() => self.redo(),
+            MenuAction::Undo | MenuAction::Redo => {}
+            MenuAction::ToggleHistory => self.history.open = !self.history.open,
             MenuAction::Pause => self.sim.send(Command::Pause),
             MenuAction::Step => self.sim.send(Command::Step(self.step_mode)),
             MenuAction::StressTest => self.spawn_stress(ctx),
@@ -703,8 +714,30 @@ impl BitwerkApp {
 
     // ---- panels --------------------------------------------------------
 
+    /// Undo / Redo buttons and the History toggle.
+    fn undo_redo_buttons(&mut self, ui: &mut egui::Ui) {
+        let mod_name = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+        if ui
+            .add_enabled(self.history.can_undo(), egui::Button::new("Undo"))
+            .on_hover_text(format!("Undo ({mod_name}+Z)"))
+            .clicked()
+        {
+            self.undo();
+        }
+        if ui
+            .add_enabled(self.history.can_redo(), egui::Button::new("Redo"))
+            .on_hover_text(format!("Redo ({mod_name}+Shift+Z)"))
+            .clicked()
+        {
+            self.redo();
+        }
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui, snap: &bw_sim::Snapshot) {
         ui.horizontal(|ui| {
+            self.undo_redo_buttons(ui);
+            ui.toggle_value(&mut self.history.open, "History").on_hover_text("Steps taken, with a snapshot of each");
+            ui.separator();
             if ui.button("Run").on_hover_text("Run (F9)").clicked() {
                 self.sim.send(Command::Run);
             }
@@ -1324,6 +1357,22 @@ impl BitwerkApp {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
+        // Undo / redo: Cmd+Z / Cmd+Shift+Z on macOS, Ctrl+Z / Ctrl+Shift+Z
+        // (or Ctrl+Y) elsewhere. With the native menu these arrive as menu
+        // accelerators instead.
+        if self.menu.is_none() {
+            use egui::{Key, Modifiers};
+            let (redo, undo) = ctx.input_mut(|i| {
+                let redo = i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)
+                    || i.consume_key(Modifiers::COMMAND, Key::Y);
+                (redo, !redo && i.consume_key(Modifiers::COMMAND, Key::Z))
+            });
+            if redo {
+                self.redo();
+            } else if undo {
+                self.undo();
+            }
+        }
         let (del, esc, rot, f9, f10, f11, f12) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
@@ -1613,6 +1662,9 @@ impl eframe::App for BitwerkApp {
         egui::Panel::right("properties").resizable(true).default_size(250.0).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.properties(ui));
         });
+        if self.history.open {
+            egui::Panel::right("history").resizable(true).default_size(250.0).show(ui, |ui| self.history_panel(ui));
+        }
         crate::parts::show(self, ui);
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let rect = crate::canvas::canvas_ui(self, ui, &snap);
@@ -1630,6 +1682,8 @@ impl eframe::App for BitwerkApp {
         crate::dwimport::drop_hint(&ctx);
         self.confirm_dialog(&ctx);
         self.macro_name_dialog(&ctx);
+        // Everything edited in this pass is one undoable action.
+        self.history_commit();
         if let Some(mut sweep) = self.sweep.take() {
             sweep.end_frame(self);
             self.sweep = Some(sweep);

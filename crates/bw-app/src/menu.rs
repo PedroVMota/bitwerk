@@ -16,6 +16,9 @@ pub enum MenuAction {
     Quit,
     Run,
     Stop,
+    Undo,
+    Redo,
+    ToggleHistory,
     Pause,
     Step,
     StressTest,
@@ -47,6 +50,9 @@ const ITEMS: &[(&str, MenuAction)] = &[
     ("app.quit", MenuAction::Quit),
     ("circuit.run", MenuAction::Run),
     ("circuit.stop", MenuAction::Stop),
+    ("edit.undo", MenuAction::Undo),
+    ("edit.redo", MenuAction::Redo),
+    ("edit.history", MenuAction::ToggleHistory),
     ("circuit.pause", MenuAction::Pause),
     ("circuit.step", MenuAction::Step),
     ("debug.stress", MenuAction::StressTest),
@@ -164,6 +170,16 @@ fn build(ctx: &egui::Context) -> Result<NativeMenu, muda::Error> {
             &item("file.export_dw", "Export as Digital Works 3.0.5 (.dwm)…", None),
         ],
     )?;
+    let edit = Submenu::with_items(
+        "Edit",
+        true,
+        &[
+            &item("edit.undo", "Undo", Some("CmdOrCtrl+Z")),
+            &item("edit.redo", "Redo", Some("CmdOrCtrl+Shift+Z")),
+            &PredefinedMenuItem::separator(),
+            &item("edit.history", "Show / Hide History", Some("CmdOrCtrl+H")),
+        ],
+    )?;
     let unit = CheckMenuItem::with_id("circuit.unit_delay", "Unit Delay Simulation", true, true, None);
     let seq = CheckMenuItem::with_id(
         "circuit.sequential",
@@ -210,7 +226,7 @@ fn build(ctx: &egui::Context) -> Result<NativeMenu, muda::Error> {
             &CheckMenuItem::with_id("debug.repaint", "Continuous Repaint", true, false, None),
         ],
     )?;
-    let menu = Menu::with_items(&[&app_menu, &file, &view, &circuit, &macros, &debug])?;
+    let menu = Menu::with_items(&[&app_menu, &file, &edit, &view, &circuit, &macros, &debug])?;
     menu.init_for_nsapp();
 
     let (tx, rx) = crossbeam_channel::unbounded();

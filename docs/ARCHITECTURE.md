@@ -170,6 +170,7 @@ the `bw-icon` helper ([`src/bin/bw-icon.rs`](../crates/bw-app/src/bin/bw-icon.rs
 | [`main.rs`](../crates/bw-app/src/main.rs) | Window/wgpu options, headless `--export-dwm`, tracing set-up |
 | [`app.rs`](../crates/bw-app/src/app.rs) | `BitwerkApp`: state, start-up command-line options, menu `action` dispatch, open/save, toolbar, palette, properties panel, keyboard shortcuts (`handle_keys`), `commit_full`, `apply_edit`, `prepare_canvas`, per-frame `logic` / `ui` |
 | [`canvas.rs`](../crates/bw-app/src/canvas.rs) | Canvas widget: mouse interaction (select, drag, wire drawing, zoom/pan), egui-wgpu paint callback, `SnapshotLevels` (adapts `Snapshot` to `NetLevels`) |
+| [`history.rs`](../crates/bw-app/src/history.rs) | Undo / redo: `History` (linear timeline of `Arc<Circuit>` snapshots, one per user action, committed at the end of each UI pass; bounded by entries and size), `undo` / `redo` / `history_goto` (swap the root circuit, `commit_full`, re-enter open macro levels) and the History panel with painter-drawn thumbnails. Hooked in `hier::apply_root_edit` (`note_edit`) |
 | [`hier.rs`](../crates/bw-app/src/hier.rs) | Macro hierarchy navigation and edit routing (`apply_root_edit`, `apply_body_edit`, `Command::SetView`) |
 | [`scene_worker.rs`](../crates/bw-app/src/scene_worker.rs) | `bw-scene` thread: full scene builds and dropping retired scenes |
 | [`menu.rs`](../crates/bw-app/src/menu.rs) | Native macOS menu (muda): `MenuAction`, id table, menu construction |
