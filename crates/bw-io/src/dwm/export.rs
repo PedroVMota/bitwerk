@@ -7,13 +7,17 @@
 //! * coordinates are grid units × 5 (the default Digital Works grid), as
 //!   float32 pixels;
 //! * Digital Works stores no rotation. Devices it draws with a stored
-//!   drawing in real files (gates, NOT, tri-state, memories, numeric
-//!   outputs, tags, macros) get a pre-rotated drawing of our symbol and pin
-//!   outlines exactly on our pins. Devices it always draws itself
-//!   (flip-flops, switches, clocks, sequence generators, power / ground,
-//!   LEDs, 7-segment displays) keep Digital Works' own unrotated symbol
-//!   (`x`, `y` only); their pins land on ours where possible, otherwise a
-//!   short wire (*pin stub*) joins them;
+//!   drawing in real files (rotated gates and NOT gates, tri-state,
+//!   memories, numeric outputs, tags, macros) get a pre-rotated drawing of
+//!   our symbol and pin outlines exactly on our pins. Devices it draws
+//!   itself (unrotated gates and NOT gates, flip-flops, switches, clocks,
+//!   sequence generators, power / ground, LEDs, 7-segment displays) keep
+//!   Digital Works' own unrotated symbol (`x`, `y` only) with its standard
+//!   pin positions; their pins land on ours where possible, otherwise a
+//!   short wire (*pin stub*) joins them. Unrotated gates must be written
+//!   this way: Digital Works writes them so itself, and a gate with a
+//!   stored drawing and pins at our spacing does not keep its wires
+//!   attached once it is opened there;
 //! * the wire graph becomes wires (polylines between pins and solders);
 //!   a junction with `n` connections becomes a chain of `n − 2` solders
 //!   (three wires each, as in every real file), a pin with several wires a
@@ -775,6 +779,17 @@ fn outer_order(shape: &MacroShape) -> Vec<Option<u8>> {
     }
 }
 
+/// Vertical offsets (pixels from the centre) of the input pins of Digital
+/// Works' own 2–4-input gates, in its pin order (bottom to top); the
+/// output is at (+30, 0) and the inputs at x = −30.
+fn gate_input_offsets(inputs: u8) -> &'static [f32] {
+    match inputs {
+        2 => &[10.0, -10.0],
+        3 => &[10.0, 0.0, -10.0],
+        _ => &[15.0, 5.0, -5.0, -15.0],
+    }
+}
+
 /// Unrotated offset of DIL pin `num` of a DIL instance.
 fn dil_offset(shape: &MacroShape, num: u8) -> P {
     let n = i32::from(num);
@@ -1082,7 +1097,29 @@ impl<'t> Exporter<'t> {
                 };
                 self.notes.count("gates", 1);
                 let max = if k >= 4 { 2 } else { 4 };
-                if inputs <= max {
+                if inputs <= max && c.rotation == Rotation::R0 {
+                    // Unrotated: Digital Works' own gate (`x`, `y` only),
+                    // as it writes every unrotated gate itself.
+                    let mut pins = vec![(pr(inputs), (30.0, 0.0), 2, 4.0)];
+                    pins.extend(
+                        gate_input_offsets(inputs)
+                            .iter()
+                            .enumerate()
+                            .map(|(j, &dy)| (pr(inputs - 1 - u8::try_from(j).unwrap_or(0)), (-30.0, dy), 1, 4.0)),
+                    );
+                    let fallback = xf(c, (wf / 2.0, hf / 2.0));
+                    self.standard(
+                        gb,
+                        lv,
+                        Some(c),
+                        Cls::Gate(k, inputs),
+                        &pins,
+                        fallback,
+                        Vec::new(),
+                        List::Devices,
+                        None,
+                    );
+                } else if inputs <= max {
                     let drawing = emit(gb, &gate_gx(k, wf, hf), &map);
                     let mut pins = vec![(pin_px(c, inputs), 2, pr(inputs))];
                     pins.extend((0..inputs).map(|i| (pin_px(c, i), 1, pr(i))));
@@ -1090,6 +1127,12 @@ impl<'t> Exporter<'t> {
                 } else {
                     self.wide_gate(gb, lv, links, c, k, inputs);
                 }
+            }
+            ComponentKind::Not if c.rotation == Rotation::R0 => {
+                self.notes.count("NOT gates", 1);
+                let pins = [(pr(1), (30.0, 0.0), 2, 4.0), (pr(0), (-20.0, 0.0), 1, 4.0)];
+                let fallback = xf(c, (wf / 2.0, hf / 2.0));
+                self.standard(gb, lv, Some(c), Cls::Gate(6, 1), &pins, fallback, Vec::new(), List::Devices, None);
             }
             ComponentKind::Not => {
                 self.notes.count("NOT gates", 1);

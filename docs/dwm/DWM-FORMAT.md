@@ -333,6 +333,13 @@ Findings used by the writer (`crates/bw-io/src/dwm/writer.rs`, `export.rs`):
   ground are never stored with `has_graphics`; the exporter keeps their
   standard symbol (`x`, `y` only). Clocks and sequence generators normally
   carry a name label (`has_label`); `False` is valid (LEDs use it).
+- **Gates**: unrotated gates are stored without a drawing (`x`, `y` only),
+  with pins at fixed offsets from the centre: output (+30, 0); inputs at
+  x = −30, bottom to top, y = +10, −10 (2 inputs), +10, 0, −10 (3) or
+  +15, +5, −5, −15 (4); a NOT gate's input at (−20, 0). Only rotated gates
+  carry a drawing. The exporter writes every unrotated gate this way: a
+  gate with a stored drawing and pins elsewhere does not keep its wires
+  attached in Digital Works.
 - **Numeric outputs** always store one digit text per input line (all 13 in
   the package), least significant first, suppressed digits in
   `unk_color_60` (0x808080); the display format is not stored there.

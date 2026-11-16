@@ -222,3 +222,46 @@ fn re_export_is_stable() {
     eprintln!("byte-identical re-exports: {same}/{total}");
     assert_eq!(same, total);
 }
+
+/// Centres of the gates Digital Works draws itself (`x`, `y`, no stored
+/// drawing), sorted.
+fn native_gates(bytes: &[u8]) -> (Vec<(i64, i64)>, usize) {
+    use bw_io::dwm::reader::{Cls, F};
+    let g = dwm::reader::parse(bytes).unwrap();
+    let mut native = Vec::new();
+    let mut drawn = 0;
+    for o in &g.objects {
+        if !matches!(o.cls(), Cls::Gate(..)) {
+            continue;
+        }
+        if o.bool(F::HasGraphics) == Some(false) {
+            native.push((o.f32(F::X).unwrap() as i64, o.f32(F::Y).unwrap() as i64));
+        } else {
+            drawn += 1;
+        }
+    }
+    native.sort_unstable();
+    (native, drawn)
+}
+
+/// Unrotated gates are written as Digital Works' own gates (centre only,
+/// its standard pin positions), as Digital Works writes them itself: a
+/// gate with a stored drawing and pins at bitwerk's spacing does not keep
+/// its wires attached once it is opened in Digital Works.
+#[test]
+fn unrotated_gates_are_native_digital_works_gates() {
+    for path in fixtures() {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let bytes = std::fs::read(&path).unwrap();
+        let (a, _) = dwm::import_project(&bytes, &name).unwrap();
+        let (x, _) = dwm::export_project(&a, &name).unwrap();
+        let (src, src_drawn) = native_gates(&bytes);
+        let (out, out_drawn) = native_gates(&x);
+        // Within a grid step: a few real files have gates off the grid.
+        assert_eq!(src.len(), out.len(), "{name}: native gates");
+        for (s, o) in src.iter().zip(&out) {
+            assert!((s.0 - o.0).abs() < 5 && (s.1 - o.1).abs() < 5, "{name}: gate at {s:?} written at {o:?}");
+        }
+        assert_eq!(src_drawn, out_drawn, "{name}: gates with a stored drawing");
+    }
+}
