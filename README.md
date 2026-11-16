@@ -415,7 +415,7 @@ Medido no mesmo MacBook (release). `make bench` (offscreen, 100k, 1× / 2×) ant
 
 ## Compilar, correr e testar
 
-Requisitos: Rust estável (fixado em `rust-toolchain.toml`, instalado com `rustup`) e uma GPU com Metal, Vulkan ou DirectX 12. O código compila em macOS, Linux e Windows (a CI em `.github/workflows/ci.yml` compila e testa nos três):
+Requisitos: Rust estável (fixado em `rust-toolchain.toml`, instalado com `rustup`) e uma GPU com Metal, Vulkan ou DirectX 12. O código compila em macOS, Linux e Windows (a CI em `.github/workflows/ci.yml` compila e testa em Linux e Windows; o macOS foi retirado da CI por causa do custo, mas o código continua a compilar lá, ver [Versões e *releases*](#versões-e-releases)):
 
 - **macOS:** só o Rust. Backend gráfico Metal; menu nativo na barra de menus (muda).
 - **Linux:** Rust e um compilador C/*linker* (`sudo apt install build-essential pkg-config` em Debian/Ubuntu). Não são precisos pacotes `-dev` de sistema: Wayland, X11, xkbcommon, libdbus, Vulkan e EGL são carregados em tempo de execução, por isso o sistema tem de ter as bibliotecas normais de um ambiente gráfico (`libwayland-client0` ou `libx11-6` + `libxcursor1` + `libxi6` + `libxrandr2`, `libxkbcommon0`/`libxkbcommon-x11-0`, `libdbus-1-3`) e um *driver* Vulkan (`mesa-vulkan-drivers` ou o da NVIDIA) ou GL/EGL. Os diálogos de ficheiro usam o portal XDG (`xdg-desktop-portal` com um *backend* GTK/KDE, ou o `zenity`).
@@ -473,6 +473,18 @@ O executável chama-se `bitwerk`. `bitwerk <ficheiro.bitwerk>` abre um projeto n
 - **Macros:** ver [Macros](#macros-sub-circuitos-hierárquicos). O exemplo `examples/macros-demo.bitwerk` tem um contador de décadas a alimentar um *driver* BCD → 7 segmentos com sete LEDs, um somador de 4 bits com interruptores e LEDs e uma NAND quádrupla em DIL-14 (`bitwerk examples/macros-demo.bitwerk --run`; `--enter 3` abre o contador a correr).
 - **Menu Debug → Spawn Stress Test** (⇧⌘T): gera 100k componentes. O canto superior esquerdo mostra FPS, tempos de frame, o modo de desenho (tudo ou *culling* na GPU) e o progresso do *upload*. **Debug → Continuous Repaint** força o redesenho contínuo para medir.
 - Há exemplos em `examples/half-adder.bitwerk` (cada entrada chega às duas portas por uma junção, com o cruzamento clássico sem ponto), `examples/all-components.bitwerk` (os tipos combinacionais, vários números de entradas e rotações; as entradas A e B correm em barras com uma junção por porta; `bitwerk examples/all-components.bitwerk --style iec` mostra o estilo IEC), `examples/flipflops-memory.bitwerk` e `examples/bus-contention.bitwerk`. O `flipflops-memory` tem um contador **síncrono** de 4 bits feito com JK master-slave: o relógio chega aos quatro flip-flops por uma única linha com uma junção por flip-flop, tal como o *clear* comum; J e K de cada flip-flop estão ligados por uma junção (J = K = 1 no primeiro, Q0 no segundo, Q0·Q1 e Q0·Q1·Q2 no terceiro e no quarto, com duas portas AND). Tem também um barramento tri-state (uma linha vertical com os dois condutores e uma junção em T para o LED) escolhido por um interruptor e um NOT (o interruptor chega aos dois por uma junção), e uma RAM de 16 × 4 endereçada pelo contador (dados de entrada, R/W̄ e C̄S̄ em interruptores; o conteúdo inicial é um padrão que se vê a andar nos LEDs). Com `bitwerk examples/flipflops-memory.bitwerk --run` o contador anda logo, e `--memory-window 18` abre a memória. Um teste do simulador abre este exemplo e confirma que conta 0, 1, …, 15, 0.
+
+### Versões e *releases*
+
+Cada *pull request* para `main` tem de levar **uma** destas etiquetas (verificado por `.github/workflows/pr-labels.yml`):
+
+| Etiqueta | Efeito na versão |
+|---|---|
+| `fix` | patch (1.2.3 → 1.2.4) |
+| `major` | minor (1.2.3 → 1.3.0) |
+| `breaking change` | major (1.2.3 → 2.0.0) |
+
+Quando o PR é integrado na `main`, `.github/workflows/release.yml` calcula a versão a partir da última *tag* `vX.Y.Z`, compila e testa em Linux e Windows (sem macOS), cria a *tag* e a *release* com os pacotes (`.tar.gz` e `.zip`) e `SHA256SUMS.txt`. Um *push* direto, ou um PR sem etiqueta, não gera *release*.
 
 ## Segurança
 

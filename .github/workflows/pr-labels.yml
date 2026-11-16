@@ -1,0 +1,30 @@
+name: PR label
+
+# Every pull request into main must carry exactly one version label. The
+# Release workflow reads it after the merge to pick the next version:
+#   fix             -> patch  (1.2.3 -> 1.2.4)
+#   major           -> minor  (1.2.3 -> 1.3.0)
+#   breaking change -> major  (1.2.3 -> 2.0.0)
+# Make this check "required" in the branch protection of main.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  version-label:
+    name: Version label
+    runs-on: ubuntu-latest
+    steps:
+      - name: Exactly one of fix / major / breaking change
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          n=$(jq '[.[] | select(. == "fix" or . == "major" or . == "breaking change")] | length' <<<"$LABELS")
+          if [ "$n" -ne 1 ]; then
+            echo "::error::Add exactly one label: 'fix', 'major' or 'breaking change' (found $n)."
+            exit 1
+          fi
