@@ -38,12 +38,61 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [workspace.lints.rust]
-unsafe_code = "deny"
+# No unsafe anywhere, and no `#[allow]` can bring it back.
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "warn", priority = -1 }
+keyword_idents = { level = "warn", priority = -1 }
+deprecated_safe = { level = "warn", priority = -1 }
+trivial_numeric_casts = "warn"
+unused_lifetimes = "warn"
+single_use_lifetimes = "warn"
+redundant_lifetimes = "warn"
+unused_import_braces = "warn"
+unused_macro_rules = "warn"
+unused_extern_crates = "warn"
+meta_variable_misuse = "warn"
+explicit_outlives_requirements = "warn"
+macro_use_extern_crate = "warn"
+non_ascii_idents = "warn"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 unwrap_used = "warn"
 expect_used = "warn"
+# Restriction lints with no hits today: they keep it that way. `make lint`
+# turns every warning into an error.
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+mem_forget = "warn"
+get_unwrap = "warn"
+unwrap_in_result = "warn"
+panic_in_result_fn = "warn"
+exit = "warn"
+clone_on_ref_ptr = "warn"
+rc_mutex = "warn"
+mutex_atomic = "warn"
+mutex_integer = "warn"
+infinite_loop = "warn"
+lossy_float_literal = "warn"
+float_cmp_const = "warn"
+verbose_file_reads = "warn"
+create_dir = "warn"
+unused_result_ok = "warn"
+try_err = "warn"
+empty_drop = "warn"
+cfg_not_test = "warn"
+format_push_string = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+fn_to_numeric_cast_any = "warn"
+large_stack_arrays = "warn"
+large_futures = "warn"
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+suspicious_xor_used_as_pow = "warn"
+needless_raw_strings = "warn"
+error_impl_error = "warn"
+pathbuf_init_then_push = "warn"
 
 [profile.release]
 overflow-checks = true

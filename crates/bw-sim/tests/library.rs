@@ -587,7 +587,7 @@ fn counter_4(lib: &Lib) -> MacroDef {
     let clr = b.input("CLR", 0, 12);
     let ffs: Vec<ComponentId> = (0..4).map(|i| b.comp(jkff(), 44, 12 * i)).collect();
     let ands: Vec<ComponentId> = (0..4).map(|i| b.comp(gate(GateOp::And, 2), 24, 12 * i + 8)).collect();
-    let qs: Vec<PinRef> = (0..4).map(|i| b.output(&format!("Q{i}"), 64, 12 * i as i32)).collect();
+    let qs: Vec<PinRef> = (0..4).map(|i| b.output(&format!("Q{i}"), 64, 12 * i)).collect();
     let co = b.output("CO", 64, 50);
     // T_i: EN for bit 0, then EN · Q0 · … chained through AND gates.
     let mut t = en;
@@ -614,7 +614,7 @@ fn decade_counter(lib: &Lib) -> MacroDef {
     let clk = b.input("CLK", 0, 6);
     let clr = b.input("CLR", 0, 12);
     let ffs: Vec<ComponentId> = (0..4).map(|i| b.comp(jkff(), 56, 12 * i)).collect();
-    let qs: Vec<PinRef> = (0..4).map(|i| b.output(&format!("Q{i}"), 76, 12 * i as i32)).collect();
+    let qs: Vec<PinRef> = (0..4).map(|i| b.output(&format!("Q{i}"), 76, 12 * i)).collect();
     let co = b.output("CO", 76, 50);
     let q = |i: usize| pin(ffs[i], 5);
     let qn = |i: usize| pin(ffs[i], 6);
@@ -682,7 +682,7 @@ fn bcd_7seg(lib: &Lib) -> MacroDef {
     b.wire(c, pin(nc, 0));
     b.wire(dd, pin(nd, 0));
     let (nb, nc, nd) = (pin(nb, 1), pin(nc, 1), pin(nd, 1));
-    let term = |b: &mut B, srcs: &[PinRef], y: i32| {
+    let term = |b: &mut B<'_>, srcs: &[PinRef], y: i32| {
         let n = u8::try_from(srcs.len()).unwrap();
         let g = b.comp(gate(GateOp::And, n), 34, y);
         for (k, s) in srcs.iter().enumerate() {
