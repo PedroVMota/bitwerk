@@ -2149,6 +2149,7 @@ pub fn project_graph<'c>(c: &'c Circuit, name: &str) -> R<(Graph, Exporter<'c>)>
     let mut ex = Exporter::new(c.macros());
     let mut gb = Gb::default();
     let root = ex.project_root(&mut gb, c, name)?;
+    keep_on_page(&mut gb.objs, root);
     Ok((Graph { header: header(name, ""), objects: gb.objs, roots: vec![Some(root)], max_depth: 0 }, ex))
 }
 
@@ -2161,8 +2162,91 @@ pub fn macro_graph(table: &MacroTable, id: MacroId) -> R<(Graph, Exporter<'_>)> 
     let mut ex = Exporter::new(table);
     let mut gb = Gb::default();
     let (root, ds) = ex.macro_root(&mut gb, id)?;
+    keep_on_page(&mut gb.objs, root);
     let name = table.get(id).map(|e| e.def.name.clone()).unwrap_or_default();
     Ok((Graph { header: header(&name, &ds), objects: gb.objs, roots: vec![Some(root)], max_depth: 0 }, ex))
+}
+
+/// Smallest distance (px) between the circuit and the top / left edge of
+/// Digital Works' page, which starts at (0, 0): anything above or left of
+/// it is cut off, and a device right at the edge is hard to see. Covers
+/// the bodies Digital Works draws around its own devices' pins.
+pub const PAGE_MARGIN: f32 = 60.0;
+
+/// Moves the circuit of the root object (its devices, tags, inputs,
+/// outputs, solders, wires; not its own icon and template pins, which are
+/// in the template's frame, nor the bodies of embedded macros, which have
+/// their own frame) right / down so that it keeps [`PAGE_MARGIN`] from
+/// the page edges, by whole grid units. A circuit already clear of the
+/// edges does not move, so a re-export of an imported file stays put.
+fn keep_on_page(objs: &mut [Obj], root: u32) {
+    // The root's page: everything reachable from its lists, without
+    // entering a nested macro's body or a pin's partner.
+    let Some(Obj::Rec(_, fields)) = objs.get(root as usize) else { return };
+    let mut stack: Vec<u32> = fields
+        .iter()
+        .filter(|(f, _)| matches!(f, F::Devices | F::Tags | F::Inputs | F::Outputs | F::Solders | F::Wires))
+        .filter_map(|(_, v)| match v {
+            Val::Ref(r) => *r,
+            _ => None,
+        })
+        .collect();
+    let mut seen = vec![false; objs.len()];
+    let mut page = Vec::new();
+    while let Some(r) = stack.pop() {
+        let Some(o) = objs.get(r as usize) else { continue };
+        if std::mem::replace(&mut seen[r as usize], true) {
+            continue;
+        }
+        page.push(r);
+        let nested = o.cls() == Cls::Macro;
+        stack.extend(o.refs().filter_map(|(f, r)| match f {
+            Some(F::Partner | F::MacroPin) => None,
+            Some(F::Devices | F::Tags | F::Inputs | F::Outputs | F::Solders | F::Wires) if nested => None,
+            _ => Some(r),
+        }));
+    }
+    let (mut min_x, mut min_y) = (f32::INFINITY, f32::INFINITY);
+    for &r in &page {
+        match &objs[r as usize] {
+            Obj::Point(x, y) => {
+                min_x = min_x.min(*x);
+                min_y = min_y.min(*y);
+            }
+            o => {
+                if let (Some(x), Some(y)) = (o.f32(F::X), o.f32(F::Y)) {
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                }
+            }
+        }
+    }
+    if !min_x.is_finite() {
+        return;
+    }
+    let shift = |m: f32| if m < PAGE_MARGIN { ((PAGE_MARGIN - m) / PX).ceil() * PX } else { 0.0 };
+    let (dx, dy) = (shift(min_x), shift(min_y));
+    if dx == 0.0 && dy == 0.0 {
+        return;
+    }
+    for &r in &page {
+        match &mut objs[r as usize] {
+            Obj::Point(x, y) => {
+                *x += dx;
+                *y += dy;
+            }
+            Obj::Rec(_, fields) => {
+                for (f, v) in fields.iter_mut() {
+                    match (f, v) {
+                        (F::X, Val::F32(c)) => *c += dx,
+                        (F::Y, Val::F32(c)) => *c += dy,
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Counts of the export, in display order.

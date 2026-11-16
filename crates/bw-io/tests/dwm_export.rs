@@ -449,3 +449,70 @@ fn every_export_conforms_to_digital_works() {
         }
     }
 }
+
+/// Smallest x and y of the root page of a written file: wire points,
+/// solders, the centres of devices Digital Works draws itself and the
+/// drawings and pins of the others.
+fn page_min(bytes: &[u8]) -> (f32, f32) {
+    use bw_io::dwm::reader::F;
+    let g = dwm::reader::parse(bytes).unwrap();
+    let root = g.get(g.roots[0].unwrap()).unwrap();
+    let mut pts: Vec<(f32, f32)> = Vec::new();
+    for f in [F::Devices, F::Tags, F::Inputs, F::Outputs, F::Solders, F::Wires] {
+        for i in g.items(root.r(f)) {
+            let o = g.get(i).unwrap();
+            if let (Some(x), Some(y)) = (o.f32(F::X), o.f32(F::Y)) {
+                pts.push((x, y));
+            }
+            pts.extend(g.points(o.r(F::Points)));
+            for d in g.items(o.r(F::Children)) {
+                pts.extend(g.points(g.get(d).unwrap().r(F::Points)));
+            }
+            for p in g.items(o.r(F::Pins)) {
+                pts.extend(g.points(g.get(p).unwrap().r(F::Points)));
+            }
+        }
+    }
+    pts.iter().fold((f32::INFINITY, f32::INFINITY), |(a, b), &(x, y)| (a.min(x), b.min(y)))
+}
+
+/// Digital Works' page starts at (0, 0) and cuts off anything above or
+/// left of it: every export keeps the circuit at least
+/// [`dwm::export::PAGE_MARGIN`] from those edges (less the 4 px of a pin
+/// outline), wherever it was drawn in bitwerk (negative coordinates
+/// included).
+#[test]
+fn exports_keep_a_margin_from_the_page_edges() {
+    let limit = dwm::export::PAGE_MARGIN - 4.0;
+    let check = |name: &str, bytes: &[u8]| {
+        let (x, y) = page_min(bytes);
+        assert!(x >= limit && y >= limit, "{name}: circuit reaches ({x}, {y}), closer than the page margin");
+    };
+    for path in fixtures() {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let bytes = std::fs::read(&path).unwrap();
+        let (a, _) = dwm::import_project(&bytes, &name).unwrap();
+        check(&name, &dwm::export_project(&a, &name).unwrap().0);
+        if let Ok((m, _)) = dwm::import_macro(&bytes, &name) {
+            check(&name, &dwm::export_macro(&m.table, m.root, &name).unwrap().0);
+        }
+    }
+    for path in examples() {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        check(&name, &dwm::export_project(&bw_io::load_from_path(&path).unwrap(), &name).unwrap().0);
+    }
+    for seed in 0..60u64 {
+        let o = randcirc::Opts { parts: 10 + (seed as usize % 30), rotate: seed % 3 != 0, exact: false, body: false };
+        let c = randcirc::random_project(seed, o);
+        // Also drawn far into negative coordinates.
+        let mut moved = c.clone();
+        let parts: Vec<_> = moved.components().map(|k| (k.id, k.pos)).collect();
+        for (id, pos) in parts {
+            let _ = moved.move_component(id, bw_core::GridPos::new(pos.x - 200, pos.y - 150));
+        }
+        for (k, circuit) in [c, moved].into_iter().enumerate() {
+            let p = bw_io::Project { name: format!("random {seed}/{k}"), circuit };
+            check(&p.name, &dwm::export_project(&p, "r.dwm").unwrap().0);
+        }
+    }
+}
