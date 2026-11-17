@@ -549,7 +549,8 @@ pub fn read_capped(path: &Path) -> Result<Vec<u8>, IoError> {
 /// Serializes a project to a RON string.
 ///
 /// # Errors
-/// Limits exceeded or serializer failure.
+/// Limits exceeded, serializer failure, or a result larger than
+/// [`MAX_FILE_SIZE`] (which [`load_from_bytes`] would refuse).
 pub fn save_to_string(p: &Project) -> Result<String, IoError> {
     check_limits(&p.circuit, &p.name)?;
     let t = p.circuit.macros();
@@ -564,7 +565,14 @@ pub fn save_to_string(p: &Project) -> Result<String, IoError> {
     // Always LF: ron defaults to CRLF on Windows, which would make saved files
     // differ between platforms.
     let cfg = ron::ser::PrettyConfig::new().depth_limit(10).new_line("\n");
-    ron_options().to_string_pretty(&out, cfg).map_err(|e| IoError::Serialize(e.to_string()))
+    let text = ron_options().to_string_pretty(&out, cfg).map_err(|e| IoError::Serialize(e.to_string()))?;
+    check_size(text.len())?;
+    Ok(text)
+}
+
+/// Refuses output the loader would not read back ([`MAX_FILE_SIZE`]).
+fn check_size(len: usize) -> Result<(), IoError> {
+    if len as u64 > MAX_FILE_SIZE { Err(IoError::TooLarge) } else { Ok(()) }
 }
 
 /// Writes a project atomically (temp file in the same directory + rename).
@@ -604,6 +612,13 @@ pub fn write_bytes_atomic(bytes: &[u8], path: &Path) -> Result<(), IoError> {
 mod tests {
     use super::*;
     use bw_core::{ComponentKind, Edit, FlipFlopType, GateOp, GridPos, MemoryType, PinRef, Rotation, WireEnd};
+
+    #[test]
+    fn save_refuses_what_load_refuses() {
+        let max = usize::try_from(MAX_FILE_SIZE).unwrap();
+        assert!(check_size(max).is_ok());
+        assert!(matches!(check_size(max + 1), Err(IoError::TooLarge)));
+    }
 
     fn sample() -> Project {
         let mut c = Circuit::new();
